@@ -417,7 +417,7 @@ describe('K17Machine on-chain', function () {
     const X = 0xc0ffeen
     const BOUNTY2 = 25_000
     const DEADLINE = Number(T0) + 3600
-    const COMMIT_TTL = 600
+    const COMMIT_TTL = 86_400 // a day: must dwarf confirmation latency, see twoStageJobProgram
 
     /** Deploy the two-stage job and run stage 1 with solver A. Returns the stage-2 machine. */
     async function stageTwoReady() {

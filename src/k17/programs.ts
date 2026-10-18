@@ -107,7 +107,14 @@ export function factoringBountyProgram(n: number, bounty: number): string {
  *       CURRENT spender's WHO, so only the committer's address collects.
  * Griefing: a bogus commit would block 2b forever, so a commit may be
  * overwritten once `commitTtl` seconds have passed (an honest committer
- * reveals in the very next transaction, well inside the TTL). Fund lock: if
+ * reveals in the very next transaction, well inside the TTL).
+ * TTL sizing matters: if an honest reveal sits unconfirmed past the TTL, an
+ * observer who read x from that pending reveal can overwrite the commit with
+ * its own and collect. nLockTime cannot be set ahead of real time (miners
+ * enforce it against median time past), so the attacker cannot shorten the
+ * wait, but the TTL must comfortably exceed worst-case confirmation latency:
+ * hours, not minutes. A confirmed reveal HALTs the machine, after which no
+ * overwrite is possible. Fund lock: if
  * TIME reaches `deadline` the program HALTs and the escrow returns to the
  * beneficiary. Each stage-2 transaction first supplies a selector cell:
  * 0 = reveal, anything else = commit.
