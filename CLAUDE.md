@@ -29,7 +29,10 @@ publication belong in this repo.
 
 ## IP notes
 
-- `docs/K17-DEFENSIVE-PUBLICATION.md` is to be published only after the related provisional
-  (script-verify candidate-25) is filed. See that candidate's `PUBLICATION-PLAN.md`.
+- `docs/K17-DEFENSIVE-PUBLICATION.md` is published FIRST (decision 2026-10-18): TDCommons, this
+  repository made public, on-chain hash anchor, each on Dave's explicit go. Do not edit the file;
+  its SHA-256 is recorded in script-verify candidate-25. A US filing stays open for 12 months
+  from the publication date under 35 USC 102(b)(1)(A) and must be made by a registered patent
+  practitioner. See candidate-25 `PUBLICATION-PLAN.md`.
 - nChain US 12,020,249 B2 and continuations read on this architecture. Freedom-to-operate
   opinion required before any commercial use.
