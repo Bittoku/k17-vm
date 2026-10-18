@@ -1,16 +1,17 @@
 /**
  * K17 reference virtual machine (off-chain).
  *
- * This is the executable specification of the K17 machine. Keepers use it to
- * compute the next state before building a spending transaction, and the
- * tests use it to cross-check the on-chain sCrypt interpreter. Its semantics
- * must match `contracts/k17Machine.ts` exactly; the differential test in
- * `tests/k17Machine.test.ts` enforces that.
+ * This is the executable specification of the K17 machine. Keepers and
+ * solvers use it to compute the next state before building a spending
+ * transaction, and the tests use it to cross-check the on-chain sCrypt
+ * interpreter. Its semantics must match `contracts/k17Machine.ts` exactly;
+ * the differential tests in `tests/k17Machine.test.ts` enforce that.
  *
  * All state fields are hex strings or bigints so they can be passed straight
  * into sCrypt contract properties.
  */
 
+import { createHash } from 'crypto'
 import {
     CELL,
     CELL_MOD,
@@ -42,6 +43,54 @@ export interface K17State {
     halted: boolean
 }
 
+/** Per-transaction environment visible to the program. */
+export interface StepEnv {
+    /** nLockTime of the spending transaction (TIME). */
+    lockTime: bigint
+    /** First 4 bytes of the spender's address as a cell (WHO). */
+    who: bigint
+    /** Witness cells supplied in the unlocking script (IN). */
+    witness: bigint[]
+}
+
+/** Build an environment; `lockTime` alone is enough for programs without I/O. */
+export function envOf(
+    lockTime: bigint,
+    who = 0n,
+    witness: bigint[] = []
+): StepEnv {
+    return { lockTime, who, witness }
+}
+
+/**
+ * Outcome of one instruction.
+ *   ok             state advanced
+ *   halted         HALT executed (state.halted = true)
+ *   fault          illegal operation; treated as HALT (state.halted = true)
+ *   need_witness   IN with no witness left: the transaction would be invalid
+ *   verify_failed  VERIFY saw zero: the transaction would be invalid
+ *   yield          YIELD executed: state advanced, cycle ends here
+ */
+export type Status =
+    | 'ok'
+    | 'halted'
+    | 'fault'
+    | 'need_witness'
+    | 'verify_failed'
+    | 'yield'
+
+/** Result of executing one instruction. */
+export interface StepResult {
+    state: K17State
+    status: Status
+    /** Convenience: status is 'fault'. */
+    faulted: boolean
+    /** Witness cells consumed so far (index into env.witness). */
+    witnessIndex: number
+    /** Extra satoshis authorised to the spender so far by BOUNTY. */
+    bountyDue: bigint
+}
+
 /** Build the initial state for a program: empty stacks, zeroed memory. */
 export function initialState(progHex: string): K17State {
     return {
@@ -71,24 +120,51 @@ function setCell(hex: string, index: number, value: bigint): string {
     return hex.slice(0, start) + encodeCell(value) + hex.slice(start + CELL * 2)
 }
 
-/** Result of executing one instruction. */
-export type StepResult = { state: K17State; faulted: boolean }
+/** HASH instruction: first 4 bytes of sha256 over the 4-byte cell, as a cell. */
+export function hashCell(value: bigint): bigint {
+    const digest = createHash('sha256')
+        .update(Buffer.from(encodeCell(value), 'hex'))
+        .digest('hex')
+    return decodeCell(digest.slice(0, CELL * 2))
+}
+
+/** WHO value for an address hash (20-byte hex): its first 4 bytes as a cell. */
+export function whoOf(addressHashHex: string): bigint {
+    return decodeCell(addressHashHex.slice(0, CELL * 2))
+}
 
 /**
  * Execute exactly one instruction.
  *
- * Input: current state and the nLockTime of the transaction performing the
- * cycle (consumed by TIME). Output: the new state. A fault sets `halted` and
- * is reported in `faulted`; it is never thrown.
+ * Input: current state, environment, witness index consumed so far, bounty
+ * authorised so far. Output: new state and status. Faults set `halted`; they
+ * are never thrown. `need_witness` and `verify_failed` leave the state
+ * unchanged and mean the enclosing transaction cannot be valid.
  */
-export function step(s: K17State, lockTime: bigint): StepResult {
-    if (s.halted) return { state: s, faulted: false }
+export function step(
+    s: K17State,
+    env: StepEnv | bigint,
+    witnessIndex = 0,
+    bountyDue = 0n
+): StepResult {
+    const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
+    const unchanged = (status: Status): StepResult => ({
+        state: s,
+        status,
+        faulted: false,
+        witnessIndex,
+        bountyDue,
+    })
+    if (s.halted) return unchanged('halted')
 
     const prog = Buffer.from(s.prog, 'hex')
     const pc = Number(s.pc)
     const fault = (): StepResult => ({
         state: { ...s, halted: true },
+        status: 'fault',
         faulted: true,
+        witnessIndex,
+        bountyDue,
     })
 
     if (pc >= prog.length) return fault()
@@ -106,6 +182,9 @@ export function step(s: K17State, lockTime: bigint): StepResult {
     let mem = s.mem
     let out = s.out
     let halted = false
+    let yielded = false
+    let wi = witnessIndex
+    let bounty = bountyDue
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -254,7 +333,45 @@ export function step(s: K17State, lockTime: bigint): StepResult {
         }
         case Op.TIME: {
             if (dsDepth >= DS_MAX) return fault()
-            push(lockTime % CELL_MOD)
+            push(e.lockTime % CELL_MOD)
+            break
+        }
+        case Op.IN: {
+            if (dsDepth >= DS_MAX) return fault()
+            if (wi >= e.witness.length) return unchanged('need_witness')
+            push(e.witness[wi])
+            wi++
+            break
+        }
+        case Op.VERIFY: {
+            if (dsDepth < 1) return fault()
+            const flag = pop()
+            if (flag === 0n) return unchanged('verify_failed')
+            break
+        }
+        case Op.BOUNTY: {
+            bounty += operand
+            break
+        }
+        case Op.MUL: {
+            if (dsDepth < 2) return fault()
+            const n2 = pop()
+            const n1 = pop()
+            push(n1 * n2)
+            break
+        }
+        case Op.HASH: {
+            if (dsDepth < 1) return fault()
+            push(hashCell(pop()))
+            break
+        }
+        case Op.WHO: {
+            if (dsDepth >= DS_MAX) return fault()
+            push(e.who)
+            break
+        }
+        case Op.YIELD: {
+            yielded = true
             break
         }
         default:
@@ -263,39 +380,88 @@ export function step(s: K17State, lockTime: bigint): StepResult {
 
     return {
         state: { ...s, pc: nextPc, ds, rs, mem, out, halted },
+        status: halted ? 'halted' : yielded ? 'yield' : 'ok',
         faulted: false,
+        witnessIndex: wi,
+        bountyDue: bounty,
     }
 }
 
+/** Result of a whole cycle (K instructions). */
+export interface CycleOutcome {
+    state: K17State
+    /** 'ok' or 'halted' means a valid transaction can be built (a YIELD reports 'ok'). */
+    status: Status
+    witnessUsed: number
+    bountyDue: bigint
+}
+
 /**
- * Execute up to `k` instructions, stopping early once halted.
+ * Execute up to `k` instructions, stopping early once halted or blocked.
  * This mirrors one on-chain cycle transaction with K unrolled steps.
- * Input: state, nLockTime, k. Output: new state.
  */
-export function stepK(s: K17State, lockTime: bigint, k: number): K17State {
+export function stepK(
+    s: K17State,
+    env: StepEnv | bigint,
+    k: number
+): CycleOutcome {
+    const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     let cur = s
-    for (let i = 0; i < k && !cur.halted; i++) {
-        cur = step(cur, lockTime).state
+    let wi = 0
+    let bounty = 0n
+    let status: Status = cur.halted ? 'halted' : 'ok'
+    for (let i = 0; i < k && status === 'ok'; i++) {
+        const r = step(cur, e, wi, bounty)
+        if (r.status === 'need_witness' || r.status === 'verify_failed') {
+            return {
+                state: cur,
+                status: r.status,
+                witnessUsed: wi,
+                bountyDue: bounty,
+            }
+        }
+        cur = r.state
+        wi = r.witnessIndex
+        bounty = r.bountyDue
+        status = r.status === 'fault' ? 'halted' : r.status
     }
-    return cur
+    // A yield is a normal end of cycle from the transaction's point of view.
+    if (status === 'yield') status = 'ok'
+    return { state: cur, status, witnessUsed: wi, bountyDue: bounty }
 }
 
 /**
- * Run until HALT/fault or until `maxSteps` instructions have executed.
- * Input: state, nLockTime, maxSteps. Output: final state and step count.
+ * Run until HALT/fault/block or until `maxSteps` instructions have executed.
+ * Input: state, environment, maxSteps. Output: final state, status, steps.
  */
 export function run(
     s: K17State,
-    lockTime: bigint,
+    env: StepEnv | bigint,
     maxSteps = 100_000
-): { state: K17State; steps: number } {
+): { state: K17State; steps: number; status: Status; bountyDue: bigint } {
+    const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     let cur = s
     let steps = 0
-    while (!cur.halted && steps < maxSteps) {
-        cur = step(cur, lockTime).state
+    let wi = 0
+    let bounty = 0n
+    let status: Status = cur.halted ? 'halted' : 'ok'
+    while (status === 'ok' && steps < maxSteps) {
+        const r = step(cur, e, wi, bounty)
+        if (r.status === 'need_witness' || r.status === 'verify_failed') {
+            return { state: cur, steps, status: r.status, bountyDue: bounty }
+        }
+        cur = r.state
+        wi = r.witnessIndex
+        bounty = r.bountyDue
+        status =
+            r.status === 'fault'
+                ? 'halted'
+                : r.status === 'yield'
+                ? 'ok'
+                : r.status
         steps++
     }
-    return { state: cur, steps }
+    return { state: cur, steps, status, bountyDue: bounty }
 }
 
 /** Decode the output log into a list of cell values. */

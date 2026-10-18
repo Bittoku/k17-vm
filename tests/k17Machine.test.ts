@@ -9,14 +9,16 @@
  */
 import { expect, use } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
-import { bsv } from 'scrypt-ts'
+import { bsv, toByteString } from 'scrypt-ts'
 import { K17Machine } from '../src/contracts/k17Machine'
-import { assemble, Op, OUT_MAX } from '../src/k17/isa'
-import { outputLog, run, initialState } from '../src/k17/vm'
+import { assemble, Op, OUT_MAX, HAS_OPERAND } from '../src/k17/isa'
+import { outputLog, run, initialState, hashCell, whoOf } from '../src/k17/vm'
 import {
     fibonacciProgram,
     countdownProgram,
     heartbeatProgram,
+    factoringBountyProgram,
+    twoStageJobProgram,
 } from '../src/k17/programs'
 import {
     addrOf,
@@ -67,11 +69,19 @@ async function cycle(
     value: bigint,
     lockTime: bigint,
     keeper: bsv.Address,
-    overrides: CycleOverrides = {}
+    overrides: CycleOverrides & {
+        witnessHex?: string
+        keeperArg?: bsv.Address
+    } = {},
+    witness: bigint[] = []
 ): Promise<CycleResult> {
-    const plan = planCycle(m, value, lockTime)
+    const plan = planCycle(m, value, lockTime, keeper, witness)
     const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
-    const { tx, atInputIndex } = await m.methods.step(addrOf(keeper), opts)
+    const { tx, atInputIndex } = await m.methods.step(
+        addrOf(overrides.keeperArg ?? keeper),
+        toByteString(overrides.witnessHex ?? plan.witnessHex),
+        opts
+    )
     const verdict = tx.verifyInputScript(atInputIndex)
     if (!verdict.success) throw new Error(`script failed: ${verdict.error}`)
     return {
@@ -201,9 +211,14 @@ describe('K17Machine on-chain', function () {
         )
         expect(r.plan.reward).to.equal(500n)
 
-        // TIME instruction recorded each cycle's nLockTime in the output log.
+        // TIME recorded each cycle's nLockTime, K/4 loop iterations per cycle.
+        const per = K17Machine.K / 4
         const log = outputLog(r.plan.nextState)
-        expect(log).to.deep.equal([T0, T0 + 60n, T0 + 260n, T0 + 100_260n])
+        const expected: bigint[] = []
+        for (const t of [T0, T0 + 60n, T0 + 260n, T0 + 100_260n]) {
+            for (let i = 0; i < per; i++) expected.push(t)
+        }
+        expect(log).to.deep.equal(expected)
     })
 
     it('rejects a keeper who takes one satoshi too many', async () => {
@@ -262,9 +277,11 @@ describe('K17Machine on-chain', function () {
     })
 
     it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
-        const ops = Object.values(Op).filter(
-            (v) => typeof v === 'number'
-        ) as number[]
+        // IN and VERIFY make a transaction invalid by design, so they are
+        // left out of the random op set; everything else must always verify.
+        const ops = (
+            Object.values(Op).filter((v) => typeof v === 'number') as number[]
+        ).filter((v) => v !== Op.IN && v !== Op.VERIFY)
         let seed = 12345
         const rnd = (n: number) => {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
@@ -275,7 +292,7 @@ describe('K17Machine on-chain', function () {
             for (let i = 0; i < 24; i++) {
                 const op = ops[rnd(ops.length)]
                 bytes.push(op)
-                if (op === Op.LIT || op === Op.IF || op === Op.CALL) {
+                if (HAS_OPERAND.has(op)) {
                     const operand = rnd(40) // small: addresses, offsets, literals
                     bytes.push(operand, 0, 0, 0)
                 }
@@ -295,7 +312,8 @@ describe('K17Machine on-chain', function () {
     })
 
     it('output log cap faults the heartbeat after OUT_MAX cycles worth of entries', async () => {
-        // Each heartbeat loop iteration is 4 instructions = exactly one cycle at K=4.
+        // Each heartbeat loop iteration is 4 instructions: K/4 log entries per cycle.
+        const perCycle = K17Machine.K / 4
         const m = await deploy(heartbeatProgram())
         let cur: K17Machine | undefined = m
         let value = BigInt(FUNDING)
@@ -309,6 +327,143 @@ describe('K17Machine on-chain', function () {
             n++
         }
         expect(cur).to.be.undefined
-        expect(n).to.equal(OUT_MAX + 1)
+        expect(n).to.equal(Math.floor(OUT_MAX / perCycle) + 1)
+    })
+
+    // ------------------------------------------------------------------
+    // Job bounties
+    // ------------------------------------------------------------------
+
+    const P = 65521
+    const Q = 65519
+    const N = P * Q // 4292870399, fits in 32 bits
+    const BOUNTY1 = 40_000
+
+    it('factoring bounty: a solver with the witness collects reward + bounty, beneficiary gets the rest', async () => {
+        const m = await deploy(factoringBountyProgram(N, BOUNTY1))
+        // Cycle 1: a plain keeper runs the leading YIELD only.
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r1.plan.bounty).to.equal(0n)
+        expect(r1.plan.nextState.pc).to.equal(1n)
+        // Cycle 2: solver B supplies p, q and runs the whole stage atomically.
+        const r2 = await cycle(
+            r1.next as K17Machine,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperB,
+            {},
+            [BigInt(P), BigInt(Q)]
+        )
+        expect(r2.plan.halted).to.be.true
+        expect(r2.plan.bounty).to.equal(BigInt(BOUNTY1))
+        expect(r2.plan.reward).to.equal(BigInt(BOUNTY1) + 101n)
+        expect(outputLog(r2.plan.nextState)).to.deep.equal([
+            BigInt(Q),
+            BigInt(P),
+        ])
+        expect(
+            r2.tx.outputs[1].script.toAddress(keeperB.network).toString()
+        ).to.equal(keeperB.toString())
+        expect(BigInt(r2.tx.outputs[1].satoshis)).to.equal(
+            BigInt(BOUNTY1) + 101n
+        )
+        expect(
+            r2.tx.outputs[0].script
+                .toAddress(beneficiaryAddress.network)
+                .toString()
+        ).to.equal(beneficiaryAddress.toString())
+    })
+
+    it('factoring bounty: wrong, overflowing and missing witnesses are rejected', async () => {
+        const m = await deploy(factoringBountyProgram(N, BOUNTY1))
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const staged = r1.next as K17Machine
+        const v = r1.plan.remaining
+        // Off-chain planner refuses a wrong factorisation.
+        await expect(
+            cycle(staged, v, T0 + 2n, keeperB, {}, [3n, 5n])
+        ).to.be.rejectedWith(/witness rejected by VERIFY/)
+        // Factors that only match modulo 2^32 are refused by the 16-bit guards.
+        await expect(
+            cycle(staged, v, T0 + 2n, keeperB, {}, [
+                BigInt(N + 2 ** 32) / 1n,
+                1n,
+            ])
+        ).to.be.rejectedWith(/witness rejected by VERIFY/)
+        // No witness at all: the stage cannot be stepped by a plain keeper.
+        await expect(cycle(staged, v, T0 + 2n, keeperA)).to.be.rejectedWith(
+            /needs a witness/
+        )
+        // On-chain: plan with the right witness, but broadcast a wrong one.
+        await expect(
+            cycle(
+                staged,
+                v,
+                T0 + 2n,
+                keeperB,
+                { witnessHex: '0300000005000000' },
+                [BigInt(P), BigInt(Q)]
+            )
+        ).to.be.rejectedWith(/verify failed/)
+        // On-chain: plan with the right witness, but broadcast none.
+        await expect(
+            cycle(staged, v, T0 + 2n, keeperB, { witnessHex: '' }, [
+                BigInt(P),
+                BigInt(Q),
+            ])
+        ).to.be.rejectedWith(/witness required/)
+    })
+
+    it('two-stage job with commit-reveal: dependent stage, front-runner refused', async () => {
+        const X = 0xc0ffeen
+        const target = hashCell(X ^ BigInt(P))
+        const BOUNTY2 = 25_000
+        const m = await deploy(
+            twoStageJobProgram(N, Number(target), BOUNTY1, BOUNTY2)
+        )
+        let value = BigInt(FUNDING)
+
+        // keeper runs the leading YIELD
+        let r = await cycle(m, value, T0 + 1n, keeperA)
+        value = r.plan.remaining
+        // stage 1: solver A factors N
+        r = await cycle(r.next as K17Machine, value, T0 + 2n, keeperA, {}, [
+            BigInt(P),
+            BigInt(Q),
+        ])
+        expect(r.plan.bounty).to.equal(BigInt(BOUNTY1))
+        value = r.plan.remaining
+        // stage 2a: solver B commits HASH(x XOR WHO_B)
+        const commitment = hashCell(X ^ whoOf(keeperB.toObject().hash))
+        r = await cycle(r.next as K17Machine, value, T0 + 3n, keeperB, {}, [
+            commitment,
+        ])
+        expect(r.plan.bounty).to.equal(0n)
+        value = r.plan.remaining
+        const revealStage = r.next as K17Machine
+
+        // front-runner A sees x in the mempool and tries to reveal as itself
+        await expect(
+            cycle(revealStage, value, T0 + 4n, keeperA, {}, [X])
+        ).to.be.rejectedWith(/witness rejected by VERIFY/)
+        // front-runner A copies B's exact transaction but swaps the payee
+        await expect(
+            cycle(
+                revealStage,
+                value,
+                T0 + 4n,
+                keeperB,
+                { keeperArg: keeperA },
+                [X]
+            )
+        ).to.be.rejectedWith(/verify failed/)
+        // B reveals and collects
+        r = await cycle(revealStage, value, T0 + 4n, keeperB, {}, [X])
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.bounty).to.equal(BigInt(BOUNTY2))
+        expect(outputLog(r.plan.nextState)).to.deep.equal([BigInt(Q), X])
+        expect(
+            r.tx.outputs[1].script.toAddress(keeperB.network).toString()
+        ).to.equal(keeperB.toString())
     })
 })

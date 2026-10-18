@@ -7,11 +7,21 @@
  * encoding, which is why every constant lives here and nowhere else.
  *
  * The ISA is Koopman's Canonical Stack Machine (Stack Computers: The New
- * Wave, 1989, Table 3.1), 17 instructions, plus HALT, 0=, OUT and TIME.
+ * Wave, 1989, Table 3.1), 17 instructions, plus HALT, 0=, OUT, TIME and the
+ * job-bounty extension: IN, VERIFY, BOUNTY, *, HASH, WHO, YIELD.
+ *
+ * YIELD ends the current cycle early. A job stage written as
+ * `YIELD IN ... VERIFY ... BOUNTY n YIELD` therefore executes atomically in
+ * one transaction: whoever supplies the witnesses is the one who collects.
+ *
+ * Two outcomes are NOT faults: IN with no witness left, and VERIFY of zero.
+ * Those make the spending transaction invalid instead, so a program that is
+ * waiting for an answer cannot be killed by a keeper who has none, and a
+ * wrong answer is simply rejected.
  *
  * Encoding
- *   - Program: a byte string. Each instruction is one opcode byte. LIT, IF
- *     and CALL are followed by a 4-byte little-endian unsigned operand.
+ *   - Program: a byte string. Each instruction is one opcode byte. LIT, IF,
+ *     CALL and BOUNTY are followed by a 4-byte little-endian unsigned operand.
  *   - Cell: unsigned 32-bit integer, 4 bytes little-endian. All arithmetic
  *     wraps modulo 2^32.
  *   - Stacks: byte strings of cells, top of stack at the END (highest
@@ -63,10 +73,22 @@ export enum Op {
     ZEQ = 0x12, //    0=     N1 -- FLAG        FLAG = (N1 == 0) ? 1 : 0
     OUT = 0x13, //    OUT    N1 --             append N1 to output log
     TIME = 0x14, //   TIME   -- T              push the transaction nLockTime
+    IN = 0x15, //     IN     -- W              push next witness cell; tx invalid if none
+    VERIFY = 0x16, // VERIFY N1 --             tx invalid if N1 == 0 (not a fault)
+    BOUNTY = 0x17, // BOUNTY --                authorise operand sats extra to the spender
+    MUL = 0x18, //    *      N1 N2 -- N3       N3 = N1 * N2
+    HASH = 0x19, //   HASH   N1 -- H           H = first 4 bytes of sha256(cell(N1))
+    WHO = 0x1a, //    WHO    -- A              A = first 4 bytes of the spender's address
+    YIELD = 0x1b, //  YIELD  --                end this cycle now; next tx resumes after it
 }
 
 /** Opcodes that carry a 4-byte operand. */
-export const HAS_OPERAND: ReadonlySet<Op> = new Set([Op.IF, Op.CALL, Op.LIT])
+export const HAS_OPERAND: ReadonlySet<Op> = new Set([
+    Op.IF,
+    Op.CALL,
+    Op.LIT,
+    Op.BOUNTY,
+])
 
 /** Mnemonic table used by the assembler and the disassembler. */
 export const MNEMONIC: Record<string, Op> = {
@@ -91,6 +113,13 @@ export const MNEMONIC: Record<string, Op> = {
     '0=': Op.ZEQ,
     OUT: Op.OUT,
     TIME: Op.TIME,
+    IN: Op.IN,
+    VERIFY: Op.VERIFY,
+    BOUNTY: Op.BOUNTY,
+    '*': Op.MUL,
+    HASH: Op.HASH,
+    WHO: Op.WHO,
+    YIELD: Op.YIELD,
 }
 
 /**

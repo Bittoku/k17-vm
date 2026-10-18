@@ -11,6 +11,14 @@
  *   3. no satoshis leave the machine except that reward, and
  *   4. the machine is input 0, so two machines can never share one output set.
  *
+ * Job bounties: a program may read witness cells from the unlocking script
+ * (IN), reject the transaction when a check fails (VERIFY), and authorise an
+ * extra payout to the spender (BOUNTY n). YIELD ends a cycle early, so a
+ * stage bracketed by YIELDs executes atomically and the party that supplied
+ * the witnesses is the party that collects the bounty. WHO exposes the first
+ * four bytes of the spender's address so programs can bind commitments to
+ * the eventual payee (commit-reveal against mempool front-running).
+ *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
  * `rewardMax`). Elapsed time is read from nLockTime, which miners enforce as
@@ -40,6 +48,7 @@ import {
     method,
     or,
     prop,
+    sha256,
     slice,
     toByteString,
     xor,
@@ -47,7 +56,7 @@ import {
 
 export class K17Machine extends SmartContract {
     /** Instructions executed per cycle transaction (compile-time constant). */
-    static readonly K = 4
+    static readonly K = 40
 
     /** Cell arithmetic modulus, 2^32. */
     @prop()
@@ -182,17 +191,22 @@ export class K17Machine extends SmartContract {
      * @param keeper address that receives this cycle's reward
      */
     @method()
-    public step(keeper: Addr) {
+    public step(keeper: Addr, witness: ByteString) {
         const progLen = len(this.prog)
+        const witnessLen = len(witness)
+        const who = K17Machine.uncell(slice(keeper, 0n, 4n))
         let pc = this.pc
         let ds = this.ds
         let rs = this.rs
         let mem = this.mem
         let outLog = this.outLog
         let halted = false
+        let yielded = false
+        let wi = 0n
+        let bountyDue = 0n
 
         for (let i = 0; i < K17Machine.K; i++) {
-            if (!halted) {
+            if (!halted && !yielded) {
                 if (pc >= progLen) {
                     halted = true
                 } else {
@@ -200,7 +214,7 @@ export class K17Machine extends SmartContract {
                     let nextPc = pc + 1n
                     let operand = 0n
                     let decodeOk = true
-                    if (op == 14n || op == 15n || op == 17n) {
+                    if (op == 14n || op == 15n || op == 17n || op == 23n) {
                         if (pc + 5n > progLen) {
                             decodeOk = false
                         } else {
@@ -400,6 +414,59 @@ export class K17Machine extends SmartContract {
                                         K17Machine.wrap(this.ctx.locktime)
                                     )
                             }
+                        } else if (op == 21n) {
+                            // IN : -- W   (no witness left => tx invalid, not a fault)
+                            if (n >= K17Machine.DS_MAX_BYTES) {
+                                halted = true
+                            } else {
+                                assert(
+                                    wi + 4n <= witnessLen,
+                                    'witness required'
+                                )
+                                ds = ds + slice(witness, wi, wi + 4n)
+                                wi += 4n
+                            }
+                        } else if (op == 22n) {
+                            // VERIFY : N1 --   (zero => tx invalid, not a fault)
+                            if (n < 4n) {
+                                halted = true
+                            } else {
+                                assert(top != 0n, 'verify failed')
+                                ds = ds1
+                            }
+                        } else if (op == 23n) {
+                            // BOUNTY n
+                            bountyDue += operand
+                        } else if (op == 24n) {
+                            // *
+                            if (n < 8n) {
+                                halted = true
+                            } else {
+                                ds =
+                                    ds2 +
+                                    K17Machine.cell(
+                                        K17Machine.wrap(second * top)
+                                    )
+                            }
+                        } else if (op == 25n) {
+                            // HASH : N1 -- first 4 bytes of sha256(cell(N1))
+                            if (n < 4n) {
+                                halted = true
+                            } else {
+                                ds =
+                                    ds1 +
+                                    slice(sha256(K17Machine.cell(top)), 0n, 4n)
+                            }
+                        } else if (op == 26n) {
+                            // WHO
+                            if (n >= K17Machine.DS_MAX_BYTES) {
+                                halted = true
+                            } else {
+                                ds = ds + K17Machine.cell(who)
+                            }
+                        } else if (op == 27n) {
+                            // YIELD : end the cycle after this instruction
+                            yielded = true
                         } else {
                             // unknown opcode
                             halted = true
@@ -445,7 +512,8 @@ export class K17Machine extends SmartContract {
         assert(elapsed >= 0n, 'time must not go backwards')
 
         const value = this.ctx.utxo.value
-        let reward = this.rewardFor(elapsed)
+        // Keeper reward from the auction plus any bounty the program released.
+        let reward = this.rewardFor(elapsed) + bountyDue
         if (reward > value - 1n) {
             // Never drain the machine below one satoshi.
             reward = value - 1n

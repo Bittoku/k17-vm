@@ -21,8 +21,8 @@ import {
 } from 'scrypt-ts'
 import { randomBytes } from 'crypto'
 import { K17Machine } from './contracts/k17Machine'
-import { K17State, initialState, stepK } from './k17/vm'
-import { MEM_CELLS, CELL } from './k17/isa'
+import { K17State, StepEnv, initialState, stepK, whoOf } from './k17/vm'
+import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -85,12 +85,14 @@ export function assertWellFormed(s: K17State): void {
 export function rewardAt(
     m: K17Machine,
     lockTime: bigint,
-    value: bigint
+    value: bigint,
+    bountyDue = 0n
 ): bigint {
     const elapsed = lockTime - m.lastTime
     if (elapsed < 0n) throw new Error('lockTime before lastTime')
     let r = m.rewardMin + m.slope * elapsed
     if (r > m.rewardMax) r = m.rewardMax
+    r += bountyDue
     if (r > value - 1n) r = value - 1n
     return r
 }
@@ -98,7 +100,12 @@ export function rewardAt(
 /** What one cycle will produce, computed off-chain before broadcasting. */
 export interface CyclePlan {
     halted: boolean
+    /** Total paid to the spender: auction reward plus released bounty. */
     reward: bigint
+    /** Bounty portion of `reward` released by BOUNTY instructions. */
+    bounty: bigint
+    /** Witness cells for the unlocking script (hex). */
+    witnessHex: string
     /** Next contract instance (undefined when halted). */
     next?: K17Machine
     nextState: K17State
@@ -113,15 +120,37 @@ export interface CyclePlan {
 export function planCycle(
     m: K17Machine,
     value: bigint,
-    lockTime: bigint
+    lockTime: bigint,
+    keeper?: bsv.Address,
+    witness: bigint[] = []
 ): CyclePlan {
     const cur = stateOf(m)
     assertWellFormed(cur)
-    const nextState = stepK(cur, lockTime, K17Machine.K)
-    const reward = rewardAt(m, lockTime, value)
+    const env: StepEnv = {
+        lockTime,
+        who: keeper ? whoOf(keeper.toObject().hash) : 0n,
+        witness,
+    }
+    const outcome = stepK(cur, env, K17Machine.K)
+    if (outcome.status === 'need_witness') {
+        throw new Error('cycle needs a witness cell the solver did not supply')
+    }
+    if (outcome.status === 'verify_failed') {
+        throw new Error('witness rejected by VERIFY')
+    }
+    const nextState = outcome.state
+    const reward = rewardAt(m, lockTime, value, outcome.bountyDue)
     const remaining = value - reward
+    const witnessHex = witness.map((w) => encodeCell(w)).join('')
     if (nextState.halted) {
-        return { halted: true, reward, nextState, remaining }
+        return {
+            halted: true,
+            reward,
+            bounty: outcome.bountyDue,
+            nextState,
+            remaining,
+            witnessHex,
+        }
     }
     const next = m.next()
     next.pc = nextState.pc
@@ -130,7 +159,15 @@ export function planCycle(
     next.mem = toByteString(nextState.mem)
     next.outLog = toByteString(nextState.out)
     next.lastTime = lockTime
-    return { halted: false, reward, next, nextState, remaining }
+    return {
+        halted: false,
+        reward,
+        bounty: outcome.bountyDue,
+        next,
+        nextState,
+        remaining,
+        witnessHex,
+    }
 }
 
 /** Options the test harness may override to build deliberately bad txs. */
