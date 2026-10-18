@@ -94,24 +94,37 @@ export function factoringBountyProgram(n: number, bounty: number): string {
 }
 
 /**
- * Two-stage dependent job with commit-reveal against front-running.
+ * Two-stage dependent job with commit-reveal against front-running, with
+ * commit expiry against griefing and a global deadline against fund lock.
  *
  * Stage 1 (factoring, as above) pays bounty1 and stores p in mem[0].
  * Stage 2 asks for x such that HASH(x XOR p) == target; p is only known
  * after stage 1, so stage 2 depends on stage 1's answer. To stop an observer
  * from copying x out of the mempool and re-broadcasting with their own
  * address, stage 2 is split:
- *   2a. solver commits c = HASH(x XOR WHO) and pays nothing yet
- *   2b. solver reveals x; the machine checks HASH(x XOR WHO) == c with the
+ *   2a. a solver commits c = HASH(x XOR WHO); mem[1] = c, mem[2] = TIME
+ *   2b. a solver reveals x; the machine checks HASH(x XOR WHO) == c with the
  *       CURRENT spender's WHO, so only the committer's address collects.
- * Input: N, target, bounty1, bounty2. Output: program hex.
+ * Griefing: a bogus commit would block 2b forever, so a commit may be
+ * overwritten once `commitTtl` seconds have passed (an honest committer
+ * reveals in the very next transaction, well inside the TTL). Fund lock: if
+ * TIME reaches `deadline` the program HALTs and the escrow returns to the
+ * beneficiary. Each stage-2 transaction first supplies a selector cell:
+ * 0 = reveal, anything else = commit.
+ *
+ * Memory: mem[0] = p, mem[1] = commitment, mem[2] = commit time (0 = none).
+ * Input: N, target, bounty1, bounty2, deadline (unix s), commitTtl (s).
+ * Output: program hex.
  */
 export function twoStageJobProgram(
     n: number,
     target: number,
     bounty1: number,
-    bounty2: number
+    bounty2: number,
+    deadline: number,
+    commitTtl: number
 ): string {
+    const SIGN = 0x80000000
     // prettier-ignore
     return assemble([
         // ---- stage 1: factor N, keep p in mem[0]
@@ -126,11 +139,29 @@ export function twoStageJobProgram(
         'OUT',                                       // log q
         'LIT', 0, '!',                               // mem[0] = p
         'YIELD',
-        // ---- stage 2a: commit c = HASH(x XOR WHO); keep c in mem[1]
-        'IN', 'LIT', 1, '!',
+        // ---- stage 2 head: expired? (TIME - deadline has sign bit clear => TIME >= deadline)
+        'stage2:',
+        'TIME', 'LIT', deadline, '-', 'LIT', SIGN, 'AND', '0=',
+        'IF', 'alive',                               // not expired -> alive
+        'HALT',                                      // expired -> refund beneficiary
+        'alive:',
+        'IN', 'IF', 'reveal',                        // selector 0 -> reveal
+        // ---- commit path: allowed if no commit yet or the old one has aged past the TTL
+        'LIT', 2, '@', 'DUP', '0=', 'IF', 'aged',    // commit time != 0 -> check age
+        'DROP', 'LIT', 0, 'IF', 'docommit',          // none yet -> commit
+        'aged:',
+        'TIME', 'SWAP', '-',                         // TIME - commitTime
+        'LIT', commitTtl, '-', 'LIT', SIGN, 'AND', '0=',
+        'VERIFY',                                    // tx invalid while the old commit is fresh
+        'docommit:',
+        'IN', 'LIT', 1, '!',                         // mem[1] = c
+        'TIME', 'LIT', 2, '!',                       // mem[2] = TIME
         'YIELD',
-        // ---- stage 2b: reveal x; bind to the same WHO; check the puzzle
+        'LIT', 0, 'IF', 'stage2',                    // next tx re-enters the head
+        // ---- reveal path
+        'reveal:',
         'IN',                                        // x
+        'LIT', 2, '@', 'VERIFY',                     // there must be a commit
         'DUP', 'WHO', 'XOR', 'HASH', 'LIT', 1, '@', '-', '0=', 'VERIFY', // HASH(x^WHO)==c
         'DUP', 'LIT', 0, '@', 'XOR', 'HASH', 'LIT', target, '-', '0=', 'VERIFY', // HASH(x^p)==target
         'BOUNTY', bounty2,

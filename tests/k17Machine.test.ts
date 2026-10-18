@@ -414,28 +414,44 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/witness required/)
     })
 
-    it('two-stage job with commit-reveal: dependent stage, front-runner refused', async () => {
-        const X = 0xc0ffeen
+    const X = 0xc0ffeen
+    const BOUNTY2 = 25_000
+    const DEADLINE = Number(T0) + 3600
+    const COMMIT_TTL = 600
+
+    /** Deploy the two-stage job and run stage 1 with solver A. Returns the stage-2 machine. */
+    async function stageTwoReady() {
         const target = hashCell(X ^ BigInt(P))
-        const BOUNTY2 = 25_000
         const m = await deploy(
-            twoStageJobProgram(N, Number(target), BOUNTY1, BOUNTY2)
+            twoStageJobProgram(
+                N,
+                Number(target),
+                BOUNTY1,
+                BOUNTY2,
+                DEADLINE,
+                COMMIT_TTL
+            )
         )
         let value = BigInt(FUNDING)
-
-        // keeper runs the leading YIELD
-        let r = await cycle(m, value, T0 + 1n, keeperA)
+        let r = await cycle(m, value, T0 + 1n, keeperA) // leading YIELD
         value = r.plan.remaining
-        // stage 1: solver A factors N
         r = await cycle(r.next as K17Machine, value, T0 + 2n, keeperA, {}, [
             BigInt(P),
             BigInt(Q),
         ])
         expect(r.plan.bounty).to.equal(BigInt(BOUNTY1))
-        value = r.plan.remaining
-        // stage 2a: solver B commits HASH(x XOR WHO_B)
+        return { machine: r.next as K17Machine, value: r.plan.remaining }
+    }
+
+    it('two-stage job with commit-reveal: dependent stage, front-runner refused', async () => {
+        const ready = await stageTwoReady()
+        const machine = ready.machine
+        let value = ready.value
+
+        // stage 2a: solver B commits HASH(x XOR WHO_B); selector 1 = commit
         const commitment = hashCell(X ^ whoOf(keeperB.toObject().hash))
-        r = await cycle(r.next as K17Machine, value, T0 + 3n, keeperB, {}, [
+        let r = await cycle(machine, value, T0 + 3n, keeperB, {}, [
+            1n,
             commitment,
         ])
         expect(r.plan.bounty).to.equal(0n)
@@ -444,7 +460,7 @@ describe('K17Machine on-chain', function () {
 
         // front-runner A sees x in the mempool and tries to reveal as itself
         await expect(
-            cycle(revealStage, value, T0 + 4n, keeperA, {}, [X])
+            cycle(revealStage, value, T0 + 4n, keeperA, {}, [0n, X])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         // front-runner A copies B's exact transaction but swaps the payee
         await expect(
@@ -454,16 +470,73 @@ describe('K17Machine on-chain', function () {
                 T0 + 4n,
                 keeperB,
                 { keeperArg: keeperA },
-                [X]
+                [0n, X]
             )
         ).to.be.rejectedWith(/verify failed/)
         // B reveals and collects
-        r = await cycle(revealStage, value, T0 + 4n, keeperB, {}, [X])
+        r = await cycle(revealStage, value, T0 + 4n, keeperB, {}, [0n, X])
         expect(r.plan.halted).to.be.true
         expect(r.plan.bounty).to.equal(BigInt(BOUNTY2))
         expect(outputLog(r.plan.nextState)).to.deep.equal([BigInt(Q), X])
         expect(
             r.tx.outputs[1].script.toAddress(keeperB.network).toString()
         ).to.equal(keeperB.toString())
+    })
+
+    it('two-stage job: a bogus commit cannot lock the escrow; it expires and is overwritten', async () => {
+        const ready = await stageTwoReady()
+        const machine = ready.machine
+        let value = ready.value
+
+        // griefer A commits garbage
+        let r = await cycle(machine, value, T0 + 10n, keeperA, {}, [1n, 0xbadn])
+        value = r.plan.remaining
+        // B cannot overwrite while the commit is fresh, and cannot reveal against it
+        const commitment = hashCell(X ^ whoOf(keeperB.toObject().hash))
+        await expect(
+            cycle(r.next as K17Machine, value, T0 + 11n, keeperB, {}, [
+                1n,
+                commitment,
+            ])
+        ).to.be.rejectedWith(/witness rejected by VERIFY/)
+        await expect(
+            cycle(r.next as K17Machine, value, T0 + 11n, keeperB, {}, [0n, X])
+        ).to.be.rejectedWith(/witness rejected by VERIFY/)
+        // a plain keeper cannot step stage 2 at all (needs a selector witness)
+        await expect(
+            cycle(r.next as K17Machine, value, T0 + 11n, keeperA)
+        ).to.be.rejectedWith(/needs a witness/)
+        // after the TTL, B overwrites the commit and reveals in the next transaction
+        r = await cycle(
+            r.next as K17Machine,
+            value,
+            T0 + 10n + BigInt(COMMIT_TTL),
+            keeperB,
+            {},
+            [1n, commitment]
+        )
+        value = r.plan.remaining
+        r = await cycle(
+            r.next as K17Machine,
+            value,
+            T0 + 11n + BigInt(COMMIT_TTL),
+            keeperB,
+            {},
+            [0n, X]
+        )
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.bounty).to.equal(BigInt(BOUNTY2))
+    })
+
+    it('two-stage job: past the deadline any keeper can HALT it and the beneficiary is refunded', async () => {
+        const { machine, value } = await stageTwoReady()
+        const r = await cycle(machine, value, BigInt(DEADLINE), keeperA)
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.bounty).to.equal(0n)
+        expect(
+            r.tx.outputs[0].script
+                .toAddress(beneficiaryAddress.network)
+                .toString()
+        ).to.equal(beneficiaryAddress.toString())
     })
 })
