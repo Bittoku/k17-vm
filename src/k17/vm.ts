@@ -12,6 +12,8 @@
  */
 
 import { createHash } from 'crypto'
+import { RabinPubKey, RabinSig, RabinVerifier } from 'scrypt-ts-lib'
+import { toByteString } from 'scrypt-ts'
 import {
     CELL,
     CELL_MOD,
@@ -20,7 +22,9 @@ import {
     MEM_CELLS,
     OUT_MAX,
     Op,
+    ROSTER_MAX,
     RS_MAX,
+    attestMessage,
     decodeCell,
     encodeCell,
 } from './isa'
@@ -51,6 +55,10 @@ export interface StepEnv {
     who: bigint
     /** Witness cells supplied in the unlocking script (IN). */
     witness: bigint[]
+    /** Roster public keys of the machine (SIGVERIFY); zero = empty slot. */
+    roster?: RabinPubKey[]
+    /** The one Rabin signature carried by this transaction (SIGVERIFY). */
+    sig?: RabinSig
 }
 
 /** Build an environment; `lockTime` alone is enough for programs without I/O. */
@@ -60,6 +68,24 @@ export function envOf(
     witness: bigint[] = []
 ): StepEnv {
     return { lockTime, who, witness }
+}
+
+/**
+ * Check a Rabin attestation exactly as the contract does.
+ * Input: tag and value cells, signature, roster public key. Output: true
+ * when `sig` signs attestMessage(tag, value) under `pub`.
+ */
+export function verifyAttestation(
+    tag: bigint,
+    value: bigint,
+    sig: RabinSig,
+    pub: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(attestMessage(tag, value)),
+        sig,
+        pub
+    )
 }
 
 /**
@@ -89,6 +115,8 @@ export interface StepResult {
     witnessIndex: number
     /** Extra satoshis authorised to the spender so far by BOUNTY. */
     bountyDue: bigint
+    /** True once SIGVERIFY has consumed this transaction's signature. */
+    sigUsed: boolean
 }
 
 /** Build the initial state for a program: empty stacks, zeroed memory. */
@@ -137,15 +165,18 @@ export function whoOf(addressHashHex: string): bigint {
  * Execute exactly one instruction.
  *
  * Input: current state, environment, witness index consumed so far, bounty
- * authorised so far. Output: new state and status. Faults set `halted`; they
- * are never thrown. `need_witness` and `verify_failed` leave the state
- * unchanged and mean the enclosing transaction cannot be valid.
+ * authorised so far, whether the cycle's signature is already consumed.
+ * Output: new state and status. Faults set `halted`; they are never thrown.
+ * `need_witness` and `verify_failed` leave the state unchanged and mean the
+ * enclosing transaction cannot be valid (SIGVERIFY reports `need_witness`
+ * when no signature is left and `verify_failed` when it does not check).
  */
 export function step(
     s: K17State,
     env: StepEnv | bigint,
     witnessIndex = 0,
-    bountyDue = 0n
+    bountyDue = 0n,
+    sigUsed = false
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -154,6 +185,7 @@ export function step(
         faulted: false,
         witnessIndex,
         bountyDue,
+        sigUsed,
     })
     if (s.halted) return unchanged('halted')
 
@@ -165,6 +197,7 @@ export function step(
         faulted: true,
         witnessIndex,
         bountyDue,
+        sigUsed,
     })
 
     if (pc >= prog.length) return fault()
@@ -185,6 +218,7 @@ export function step(
     let yielded = false
     let wi = witnessIndex
     let bounty = bountyDue
+    let su = sigUsed
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -374,6 +408,43 @@ export function step(
             yielded = true
             break
         }
+        case Op.MIN: {
+            if (dsDepth < 2) return fault()
+            const n2 = pop()
+            const n1 = pop()
+            push(n1 < n2 ? n1 : n2)
+            break
+        }
+        case Op.MAX: {
+            if (dsDepth < 2) return fault()
+            const n2 = pop()
+            const n1 = pop()
+            push(n1 > n2 ? n1 : n2)
+            break
+        }
+        case Op.DIV: {
+            if (dsDepth < 2) return fault()
+            const n2 = pop()
+            const n1 = pop()
+            if (n2 === 0n) return fault()
+            push(n1 / n2)
+            break
+        }
+        case Op.SIGVERIFY: {
+            // TAG VAL --   tx invalid unless sig signs cell(TAG)||cell(VAL)
+            if (dsDepth < 2) return fault()
+            if (operand >= BigInt(ROSTER_MAX)) return fault()
+            const pub = e.roster?.[Number(operand)] ?? 0n
+            if (pub === 0n) return fault()
+            if (su || !e.sig) return unchanged('need_witness')
+            const value = pop()
+            const tag = pop()
+            if (!verifyAttestation(tag, value, e.sig, pub)) {
+                return unchanged('verify_failed')
+            }
+            su = true
+            break
+        }
         default:
             return fault()
     }
@@ -384,6 +455,7 @@ export function step(
         faulted: false,
         witnessIndex: wi,
         bountyDue: bounty,
+        sigUsed: su,
     }
 }
 
@@ -409,9 +481,10 @@ export function stepK(
     let cur = s
     let wi = 0
     let bounty = 0n
+    let su = false
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty)
+        const r = step(cur, e, wi, bounty, su)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -423,6 +496,7 @@ export function stepK(
         cur = r.state
         wi = r.witnessIndex
         bounty = r.bountyDue
+        su = r.sigUsed
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
@@ -444,15 +518,17 @@ export function run(
     let steps = 0
     let wi = 0
     let bounty = 0n
+    let su = false
     let status: Status = cur.halted ? 'halted' : 'ok'
     while (status === 'ok' && steps < maxSteps) {
-        const r = step(cur, e, wi, bounty)
+        const r = step(cur, e, wi, bounty, su)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return { state: cur, steps, status: r.status, bountyDue: bounty }
         }
         cur = r.state
         wi = r.witnessIndex
         bounty = r.bountyDue
+        su = r.sigUsed
         status =
             r.status === 'fault'
                 ? 'halted'

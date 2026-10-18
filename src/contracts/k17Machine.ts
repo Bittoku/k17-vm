@@ -19,6 +19,13 @@
  * four bytes of the spender's address so programs can bind commitments to
  * the eventual payee (commit-reveal against mempool front-running).
  *
+ * K17+ (DC4CD port): MIN and MAX give fuzzy AND/OR; SIGVERIFY k accepts the
+ * cycle only if the Rabin signature passed in the unlocking script, under the
+ * roster key in slot k, signs the two cells on top of the stack. An
+ * off-chain attester (sensor node, oracle) signs a reading once and any
+ * keeper may relay it; the keeper is paid by the auction, the attester is
+ * trusted only for the reading.
+ *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
  * `rewardMax`). Elapsed time is read from nLockTime, which miners enforce as
@@ -37,6 +44,7 @@
 import {
     Addr,
     ByteString,
+    FixedArray,
     SmartContract,
     Utils,
     and,
@@ -53,6 +61,10 @@ import {
     toByteString,
     xor,
 } from 'scrypt-ts'
+import { RabinPubKey, RabinSig, RabinVerifier } from 'scrypt-ts-lib'
+
+/** Number of attester slots in the roster (compile-time constant). */
+export const ROSTER_SLOTS = 4
 
 export class K17Machine extends SmartContract {
     /** Instructions executed per cycle transaction (compile-time constant). */
@@ -94,6 +106,13 @@ export class K17Machine extends SmartContract {
     /** Reward ceiling in sats. */
     @prop()
     readonly rewardMax: bigint
+    /**
+     * Rabin public keys of the attesters a program may name with
+     * SIGVERIFY k (k in 0..3). Fixed at deployment; a zero entry is an empty
+     * slot and faults any program that references it.
+     */
+    @prop()
+    readonly roster: FixedArray<RabinPubKey, typeof ROSTER_SLOTS>
 
     // ---- mutable machine state ----------------------------------------
 
@@ -122,6 +141,7 @@ export class K17Machine extends SmartContract {
         rewardMin: bigint,
         slope: bigint,
         rewardMax: bigint,
+        roster: FixedArray<RabinPubKey, typeof ROSTER_SLOTS>,
         pc: bigint,
         ds: ByteString,
         rs: ByteString,
@@ -135,6 +155,7 @@ export class K17Machine extends SmartContract {
         this.rewardMin = rewardMin
         this.slope = slope
         this.rewardMax = rewardMax
+        this.roster = roster
         this.pc = pc
         this.ds = ds
         this.rs = rs
@@ -189,12 +210,21 @@ export class K17Machine extends SmartContract {
     /**
      * Advance the machine by K instructions and pay the keeper.
      * @param keeper address that receives this cycle's reward
+     * @param witness cells consumed by IN, concatenated
+     * @param sigS Rabin signature value consumed by SIGVERIFY (0 if none)
+     * @param sigPad Rabin signature padding consumed by SIGVERIFY
      */
     @method()
-    public step(keeper: Addr, witness: ByteString) {
+    public step(
+        keeper: Addr,
+        witness: ByteString,
+        sigS: bigint,
+        sigPad: ByteString
+    ) {
         const progLen = len(this.prog)
         const witnessLen = len(witness)
         const who = K17Machine.uncell(slice(keeper, 0n, 4n))
+        const sig: RabinSig = { s: sigS, padding: sigPad }
         let pc = this.pc
         let ds = this.ds
         let rs = this.rs
@@ -204,6 +234,7 @@ export class K17Machine extends SmartContract {
         let yielded = false
         let wi = 0n
         let bountyDue = 0n
+        let sigUsed = false
 
         for (let i = 0; i < K17Machine.K; i++) {
             if (!halted && !yielded) {
@@ -214,7 +245,13 @@ export class K17Machine extends SmartContract {
                     let nextPc = pc + 1n
                     let operand = 0n
                     let decodeOk = true
-                    if (op == 14n || op == 15n || op == 17n || op == 23n) {
+                    if (
+                        op == 14n ||
+                        op == 15n ||
+                        op == 17n ||
+                        op == 23n ||
+                        op == 30n
+                    ) {
                         if (pc + 5n > progLen) {
                             decodeOk = false
                         } else {
@@ -467,6 +504,57 @@ export class K17Machine extends SmartContract {
                         } else if (op == 27n) {
                             // YIELD : end the cycle after this instruction
                             yielded = true
+                        } else if (op == 28n) {
+                            // MIN
+                            if (n < 8n) {
+                                halted = true
+                            } else {
+                                ds =
+                                    ds2 +
+                                    K17Machine.cell(second < top ? second : top)
+                            }
+                        } else if (op == 29n) {
+                            // MAX
+                            if (n < 8n) {
+                                halted = true
+                            } else {
+                                ds =
+                                    ds2 +
+                                    K17Machine.cell(second > top ? second : top)
+                            }
+                        } else if (op == 31n) {
+                            // /  : unsigned division, zero divisor is a fault
+                            if (n < 8n || top == 0n) {
+                                halted = true
+                            } else {
+                                ds = ds2 + K17Machine.cell(second / top)
+                            }
+                        } else if (op == 30n) {
+                            // SIGVERIFY k : TAG VAL --
+                            // Bad roster index or empty slot: fault. Missing,
+                            // reused or wrong signature: tx invalid.
+                            if (n < 8n || operand >= 4n) {
+                                halted = true
+                            } else {
+                                const pub = this.roster[Number(operand)]
+                                if (pub == 0n) {
+                                    halted = true
+                                } else {
+                                    assert(
+                                        !sigUsed,
+                                        'one attestation per cycle'
+                                    )
+                                    sigUsed = true
+                                    const msg =
+                                        K17Machine.cell(second) +
+                                        K17Machine.cell(top)
+                                    assert(
+                                        RabinVerifier.verifySig(msg, sig, pub),
+                                        'attestation failed'
+                                    )
+                                    ds = ds2
+                                }
+                            }
                         } else {
                             // unknown opcode
                             halted = true

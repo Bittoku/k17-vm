@@ -14,14 +14,24 @@
  * `YIELD IN ... VERIFY ... BOUNTY n YIELD` therefore executes atomically in
  * one transaction: whoever supplies the witnesses is the one who collects.
  *
- * Two outcomes are NOT faults: IN with no witness left, and VERIFY of zero.
- * Those make the spending transaction invalid instead, so a program that is
- * waiting for an answer cannot be killed by a keeper who has none, and a
- * wrong answer is simply rejected.
+ * K17+ adds the DC4CD-port extension: MIN and MAX (fuzzy AND/OR over truth
+ * values), unsigned division (/), and SIGVERIFY k, which accepts a cycle only if the Rabin signature
+ * carried in the unlocking script, under roster key k, signs the two cells
+ * on top of the stack. This is how an off-chain sensor node attests a
+ * reading: the keeper who relays the reading need not be the node that
+ * measured it. One signature per cycle; a second SIGVERIFY in the same
+ * cycle makes the transaction invalid.
+ *
+ * Three outcomes are NOT faults: IN with no witness left, VERIFY of zero,
+ * and SIGVERIFY with a missing or wrong signature. Those make the spending
+ * transaction invalid instead, so a program that is waiting for an answer
+ * cannot be killed by a keeper who has none, and a wrong answer is simply
+ * rejected.
  *
  * Encoding
  *   - Program: a byte string. Each instruction is one opcode byte. LIT, IF,
- *     CALL and BOUNTY are followed by a 4-byte little-endian unsigned operand.
+ *     CALL, BOUNTY and SIGVERIFY are followed by a 4-byte little-endian
+ *     unsigned operand.
  *   - Cell: unsigned 32-bit integer, 4 bytes little-endian. All arithmetic
  *     wraps modulo 2^32.
  *   - Stacks: byte strings of cells, top of stack at the END (highest
@@ -80,6 +90,28 @@ export enum Op {
     HASH = 0x19, //   HASH   N1 -- H           H = first 4 bytes of sha256(cell(N1))
     WHO = 0x1a, //    WHO    -- A              A = first 4 bytes of the spender's address
     YIELD = 0x1b, //  YIELD  --                end this cycle now; next tx resumes after it
+    // ---- K17+ (DC4CD port): attested inputs and fuzzy operators ----
+    MIN = 0x1c, //    MIN    N1 N2 -- N3       N3 = min(N1, N2)   (fuzzy AND)
+    MAX = 0x1d, //    MAX    N1 N2 -- N3       N3 = max(N1, N2)   (fuzzy OR)
+    SIGVERIFY = 0x1e, // SIGVERIFY k  TAG VAL --  tx invalid unless the cycle's Rabin
+    //                  signature, under roster key k, signs cell(TAG)||cell(VAL)
+    DIV = 0x1f, //    /      N1 N2 -- N3       N3 = floor(N1 / N2); fault if N2 == 0
+}
+
+/**
+ * Number of roster slots in the contract. A program may reference roster
+ * indices 0..ROSTER_MAX-1 as the operand of SIGVERIFY; a higher index, or a
+ * slot holding the zero key, is a fault.
+ */
+export const ROSTER_MAX = 4
+
+/**
+ * Message bytes that an attester signs for `TAG VAL SIGVERIFY k`:
+ * cell(TAG) followed by cell(VAL), 8 bytes, as hex. Programs use TAG as a
+ * replay guard (a cycle or sample counter) and VAL as the attested reading.
+ */
+export function attestMessage(tag: bigint, value: bigint): string {
+    return encodeCell(tag) + encodeCell(value)
 }
 
 /** Opcodes that carry a 4-byte operand. */
@@ -88,6 +120,7 @@ export const HAS_OPERAND: ReadonlySet<Op> = new Set([
     Op.CALL,
     Op.LIT,
     Op.BOUNTY,
+    Op.SIGVERIFY,
 ])
 
 /** Mnemonic table used by the assembler and the disassembler. */
@@ -120,6 +153,10 @@ export const MNEMONIC: Record<string, Op> = {
     HASH: Op.HASH,
     WHO: Op.WHO,
     YIELD: Op.YIELD,
+    MIN: Op.MIN,
+    MAX: Op.MAX,
+    SIGVERIFY: Op.SIGVERIFY,
+    '/': Op.DIV,
 }
 
 /**

@@ -27,7 +27,9 @@ import {
     countdownProgram,
     fibonacciProgram,
     heartbeatProgram,
+    attestProgram,
 } from '../src/k17/programs'
+import { newAttester, signReading } from '../src/k17/attest'
 
 describe('K17 ISA encoding', () => {
     it('round-trips cells', () => {
@@ -205,5 +207,103 @@ describe('K17 reference VM', () => {
         )
         expect(s.state.halted).to.be.true
         expect(outputLog(s.state)).to.deep.equal([1n])
+    })
+
+    // ---- K17+ ------------------------------------------------------------
+
+    it('MIN and MAX pick the smaller and larger unsigned cell', () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 7, 'LIT', 3, 'MIN', 'OUT',
+            'LIT', 7, 'LIT', 3, 'MAX', 'OUT',
+            'LIT', 0xffffffff, 'LIT', 1, 'MAX', 'OUT',
+            'HALT',
+        ])
+        const r = run(initialState(prog), 0n)
+        expect(outputLog(r.state)).to.deep.equal([3n, 7n, 0xffffffffn])
+    })
+
+    it('DIV floors unsigned quotients and faults on a zero divisor', () => {
+        const ok = run(
+            initialState(assemble(['LIT', 17, 'LIT', 5, '/', 'OUT', 'HALT'])),
+            0n
+        )
+        expect(outputLog(ok.state)).to.deep.equal([3n])
+        const bad = run(
+            initialState(
+                assemble([
+                    'LIT',
+                    1,
+                    'OUT',
+                    'LIT',
+                    17,
+                    'LIT',
+                    0,
+                    '/',
+                    'OUT',
+                    'HALT',
+                ])
+            ),
+            0n
+        )
+        expect(bad.status).to.equal('halted')
+        expect(outputLog(bad.state)).to.deep.equal([1n])
+    })
+
+    it('SIGVERIFY accepts a roster signature, rejects a wrong one, blocks without one, faults on a bad slot', function () {
+        this.timeout(120_000) // two 3072-bit Rabin key generations
+        const a = newAttester(Buffer.alloc(32, 7))
+        const b = newAttester(Buffer.alloc(32, 8))
+        const roster = [a.pub, b.pub, 0n, 0n]
+        const prog = attestProgram(1)
+        const base = { lockTime: 0n, who: 0n, witness: [5n, 2231n], roster }
+
+        const ok = run(initialState(prog), {
+            ...base,
+            sig: signReading(b, 5n, 2231n),
+        })
+        expect(ok.status).to.equal('halted')
+        expect(outputLog(ok.state)).to.deep.equal([5n, 2231n])
+
+        const wrongKey = run(initialState(prog), {
+            ...base,
+            sig: signReading(a, 5n, 2231n),
+        })
+        expect(wrongKey.status).to.equal('verify_failed')
+
+        const replay = run(initialState(prog), {
+            ...base,
+            witness: [6n, 2231n],
+            sig: signReading(b, 5n, 2231n),
+        })
+        expect(replay.status).to.equal('verify_failed')
+
+        const missing = run(initialState(prog), base)
+        expect(missing.status).to.equal('need_witness')
+
+        const emptySlot = run(initialState(attestProgram(2)), {
+            ...base,
+            sig: signReading(b, 5n, 2231n),
+        })
+        expect(emptySlot.status).to.equal('halted')
+        expect(outputLog(emptySlot.state)).to.deep.equal([])
+    })
+
+    it('a second SIGVERIFY in one cycle invalidates the transaction', function () {
+        this.timeout(120_000)
+        const b = newAttester(Buffer.alloc(32, 9))
+        // prettier-ignore
+        const prog = assemble([
+            'IN', 'IN', 'OVER', 'OVER', 'OVER', 'OVER',
+            'SIGVERIFY', 0, 'SIGVERIFY', 0, 'HALT',
+        ])
+        const r = run(initialState(prog), {
+            lockTime: 0n,
+            who: 0n,
+            witness: [1n, 2n],
+            roster: [b.pub, 0n, 0n, 0n],
+            sig: signReading(b, 1n, 2n),
+        })
+        expect(r.status).to.equal('need_witness')
     })
 })

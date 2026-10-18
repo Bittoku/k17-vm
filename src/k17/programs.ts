@@ -94,6 +94,24 @@ export function factoringBountyProgram(n: number, bounty: number): string {
 }
 
 /**
+ * Attested-input smoke test for SIGVERIFY: read a tag and a value as witness
+ * cells, require roster key `k` to have signed them, log both and halt.
+ * Used by the differential tests; the real relay programs live in k17-dc4cd.
+ * Input: roster index. Output: program hex.
+ */
+export function attestProgram(k: number): string {
+    // prettier-ignore
+    return assemble([
+        'YIELD',
+        'IN', 'IN',                 // tag value
+        'OVER', 'OVER',             // tag value tag value
+        'SIGVERIFY', k,             // tag value
+        'SWAP', 'OUT', 'OUT',       // log tag then value
+        'HALT',
+    ])
+}
+
+/**
  * Two-stage dependent job with commit-reveal against front-running, with
  * commit expiry against griefing and a global deadline against fund lock.
  *

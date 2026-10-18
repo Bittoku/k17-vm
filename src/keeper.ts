@@ -14,15 +14,18 @@
 
 import {
     Addr,
+    FixedArray,
     MethodCallOptions,
     StatefulNext,
     bsv,
     toByteString,
 } from 'scrypt-ts'
 import { randomBytes } from 'crypto'
-import { K17Machine } from './contracts/k17Machine'
+import { RabinPubKey, RabinSig } from 'scrypt-ts-lib'
+import { K17Machine, ROSTER_SLOTS } from './contracts/k17Machine'
 import { K17State, StepEnv, initialState, stepK, whoOf } from './k17/vm'
 import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
+import { NO_SIG } from './k17/attest'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -33,15 +36,31 @@ export interface Economics {
     rewardMax: bigint
 }
 
+/** Roster as the contract wants it: exactly ROSTER_SLOTS keys. */
+export type Roster = FixedArray<RabinPubKey, typeof ROSTER_SLOTS>
+
+/**
+ * Pad a list of attester public keys to a full roster with zero (empty)
+ * slots. Input: up to ROSTER_SLOTS keys. Output: roster.
+ */
+export function rosterOf(keys: RabinPubKey[] = []): Roster {
+    if (keys.length > ROSTER_SLOTS) throw new Error('too many roster keys')
+    const r: RabinPubKey[] = []
+    for (let i = 0; i < ROSTER_SLOTS; i++) r.push(keys[i] ?? 0n)
+    return r as unknown as Roster
+}
+
 /**
  * Create a fresh (not yet deployed) machine for a program.
- * Input: program hex, economics, deployment time (unix seconds).
- * Output: contract instance with empty stacks and zeroed memory.
+ * Input: program hex, economics, deployment time (unix seconds), optional
+ * attester roster. Output: contract instance with empty stacks and zeroed
+ * memory.
  */
 export function newMachine(
     progHex: string,
     econ: Economics,
-    deployTime: bigint
+    deployTime: bigint,
+    roster: Roster = rosterOf()
 ): K17Machine {
     const s = initialState(progHex)
     return new K17Machine(
@@ -50,6 +69,7 @@ export function newMachine(
         econ.rewardMin,
         econ.slope,
         econ.rewardMax,
+        roster,
         s.pc,
         toByteString(s.ds),
         toByteString(s.rs),
@@ -106,6 +126,8 @@ export interface CyclePlan {
     bounty: bigint
     /** Witness cells for the unlocking script (hex). */
     witnessHex: string
+    /** Attestation signature for the unlocking script (NO_SIG when none). */
+    sig: RabinSig
     /** Next contract instance (undefined when halted). */
     next?: K17Machine
     nextState: K17State
@@ -115,14 +137,16 @@ export interface CyclePlan {
 
 /**
  * Compute the plan for a cycle: next state, reward, remaining value.
- * Input: current instance, its UTXO value, nLockTime to use.
+ * Input: current instance, its UTXO value, nLockTime to use, keeper address,
+ * witness cells, optional attestation signature.
  */
 export function planCycle(
     m: K17Machine,
     value: bigint,
     lockTime: bigint,
     keeper?: bsv.Address,
-    witness: bigint[] = []
+    witness: bigint[] = [],
+    sig: RabinSig = NO_SIG
 ): CyclePlan {
     const cur = stateOf(m)
     assertWellFormed(cur)
@@ -130,13 +154,15 @@ export function planCycle(
         lockTime,
         who: keeper ? whoOf(keeper.toObject().hash) : 0n,
         witness,
+        roster: (m.roster as unknown as RabinPubKey[]).slice(),
+        sig: sig.s === 0n ? undefined : sig,
     }
     const outcome = stepK(cur, env, K17Machine.K)
     if (outcome.status === 'need_witness') {
         throw new Error('cycle needs a witness cell the solver did not supply')
     }
     if (outcome.status === 'verify_failed') {
-        throw new Error('witness rejected by VERIFY')
+        throw new Error('witness rejected by VERIFY or SIGVERIFY')
     }
     const nextState = outcome.state
     const reward = rewardAt(m, lockTime, value, outcome.bountyDue)
@@ -150,6 +176,7 @@ export function planCycle(
             nextState,
             remaining,
             witnessHex,
+            sig,
         }
     }
     const next = m.next()
@@ -167,6 +194,7 @@ export function planCycle(
         nextState,
         remaining,
         witnessHex,
+        sig,
     }
 }
 

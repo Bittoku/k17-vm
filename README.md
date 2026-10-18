@@ -2,10 +2,11 @@
 
 A proof of concept of a UTXO-chained stack computer on Bitcoin SV.
 
-One UTXO locked by `K17Machine` is one suspended process of a 28-instruction
-stack machine (Koopman's Canonical Stack Machine from *Stack Computers: The
-New Wave*, 1989, plus HALT, 0=, OUT, TIME and the job-bounty extension IN,
-VERIFY, BOUNTY, *, HASH, WHO, YIELD). Anyone can spend the UTXO. The
+One UTXO locked by `K17Machine` is one suspended process of a 32-instruction
+stack machine (Koopman's Canonical Stack Machine from _Stack Computers: The
+New Wave_, 1989, plus HALT, 0=, OUT, TIME, the job-bounty extension IN,
+VERIFY, BOUNTY, \*, HASH, WHO, YIELD, and the K17+ attested-input extension
+MIN, MAX, /, SIGVERIFY). Anyone can spend the UTXO. The
 spend is valid only if the next output carries the same program with the
 state advanced by exactly K instructions and the spender takes no more than
 the reward that the liveness Dutch auction permits at the transaction's
@@ -16,21 +17,21 @@ Design notes live in the Obsidian vault:
 
 ## Layout
 
-| Path | Purpose |
-|---|---|
-| `src/k17/isa.ts` | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA. |
-| `src/k17/vm.ts` | Off-chain reference VM. Executable specification; keepers use it to compute the next state. |
-| `src/k17/programs.ts` | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job. |
-| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement. |
-| `src/keeper.ts` | Helpers to plan a cycle and build the spending transaction. |
-| `tests/vm.test.ts` | ISA and reference VM tests. |
-| `tests/k17Machine.test.ts` | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter. |
+| Path                          | Purpose                                                                                                         |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `src/k17/isa.ts`              | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA.                   |
+| `src/k17/vm.ts`               | Off-chain reference VM. Executable specification; keepers use it to compute the next state.                     |
+| `src/k17/programs.ts`         | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job. |
+| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement.                                   |
+| `src/keeper.ts`               | Helpers to plan a cycle and build the spending transaction.                                                     |
+| `tests/vm.test.ts`            | ISA and reference VM tests.                                                                                     |
+| `tests/k17Machine.test.ts`    | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter.                            |
 
 ## Requirements
 
 - Node 20 or newer.
 - Docker. The sCrypt compiler ships no Apple Silicon binary, so `npm run
-  compile` runs it in a `linux/arm64` container. On Linux or on Intel macOS
+compile` runs it in a `linux/arm64` container. On Linux or on Intel macOS
   use `npm run compile:native` instead.
 
 ## Commands
@@ -59,15 +60,30 @@ pushes the first four bytes of the spender's address, which lets a program
 bind a commitment to the eventual payee (see `twoStageJobProgram`). K is 40
 so a stage of up to 40 instructions fits in one transaction.
 
+## Attested inputs (K17+)
+
+`TAG VAL SIGVERIFY k` accepts the cycle only if the Rabin signature carried
+in the unlocking script, under the roster key in slot `k` (four slots, fixed
+at deployment), signs the eight bytes `cell(TAG) || cell(VAL)`. A missing or
+wrong signature makes the transaction invalid; an empty slot or a bad index
+is a fault. One signature per cycle. This separates the party that vouches
+for a reading (a sensor node, an oracle) from the party that relays it and
+is paid by the auction. `MIN`, `MAX` and `/` were added for the fuzzy and
+aggregation programs in the companion repository `k17-dc4cd`. Signing
+helpers are in `src/k17/attest.ts`; the verifier is scrypt-ts-lib's
+`RabinVerifier` (3072-bit modulus).
+
 ## Measurements (K = instructions per cycle)
 
-| K | Handlers | Locking script | Cycle transaction |
-|---|---|---|---|
-| 1 | 21 | 9 026 bytes | 9 574 bytes |
-| 4 | 21 | 16 247 bytes | 16 802 bytes |
-| 40 | 28 | 159 003 bytes | about 160 KB |
+| K   | Handlers | Locking script | Cycle transaction |
+| --- | -------- | -------------- | ----------------- |
+| 1   | 21       | 9 026 bytes    | 9 574 bytes       |
+| 4   | 21       | 16 247 bytes   | 16 802 bytes      |
+| 40  | 28       | 159 003 bytes  | about 160 KB      |
+| 40  | 32       | 202 468 bytes  | about 204 KB      |
 
-Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) of script per unrolled
+Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
+of which SIGVERIFY alone is about 0.8 KB) of script per unrolled
 instruction plus about 6.6 KB fixed (preimage verification, state tail with
 a 256-byte memory image, output construction). Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the

@@ -10,6 +10,7 @@
 import { expect, use } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 import { bsv, toByteString } from 'scrypt-ts'
+import { RabinSig } from 'scrypt-ts-lib'
 import { K17Machine } from '../src/contracts/k17Machine'
 import { assemble, Op, OUT_MAX, HAS_OPERAND } from '../src/k17/isa'
 import { outputLog, run, initialState, hashCell, whoOf } from '../src/k17/vm'
@@ -19,15 +20,18 @@ import {
     heartbeatProgram,
     factoringBountyProgram,
     twoStageJobProgram,
+    attestProgram,
 } from '../src/k17/programs'
 import {
     addrOf,
     bindCycleBuilder,
     newMachine,
     planCycle,
+    rosterOf,
     CyclePlan,
     CycleOverrides,
 } from '../src/keeper'
+import { NO_SIG, newAttester, signReading } from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
 use(chaiAsPromised)
 
@@ -72,14 +76,20 @@ async function cycle(
     overrides: CycleOverrides & {
         witnessHex?: string
         keeperArg?: bsv.Address
+        /** Signature to put in the unlocking script instead of the plan's. */
+        sigArg?: RabinSig
     } = {},
-    witness: bigint[] = []
+    witness: bigint[] = [],
+    sig: RabinSig = NO_SIG
 ): Promise<CycleResult> {
-    const plan = planCycle(m, value, lockTime, keeper, witness)
+    const plan = planCycle(m, value, lockTime, keeper, witness, sig)
     const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
+    const sent = overrides.sigArg ?? plan.sig
     const { tx, atInputIndex } = await m.methods.step(
         addrOf(overrides.keeperArg ?? keeper),
         toByteString(overrides.witnessHex ?? plan.witnessHex),
+        sent.s,
+        toByteString(sent.padding),
         opts
     )
     const verdict = tx.verifyInputScript(atInputIndex)
@@ -277,11 +287,12 @@ describe('K17Machine on-chain', function () {
     })
 
     it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
-        // IN and VERIFY make a transaction invalid by design, so they are
-        // left out of the random op set; everything else must always verify.
+        // IN, VERIFY and SIGVERIFY make a transaction invalid by design, so
+        // they are left out of the random op set; everything else must
+        // always verify.
         const ops = (
             Object.values(Op).filter((v) => typeof v === 'number') as number[]
-        ).filter((v) => v !== Op.IN && v !== Op.VERIFY)
+        ).filter((v) => v !== Op.IN && v !== Op.VERIFY && v !== Op.SIGVERIFY)
         let seed = 12345
         const rnd = (n: number) => {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
@@ -538,5 +549,125 @@ describe('K17Machine on-chain', function () {
                 .toAddress(beneficiaryAddress.network)
                 .toString()
         ).to.equal(beneficiaryAddress.toString())
+    })
+
+    // ---- K17+ : MIN / MAX / SIGVERIFY -------------------------------------
+
+    it('MIN, MAX and DIV agree with the reference VM on chain', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 7, 'LIT', 3, 'MIN', 'OUT',
+            'LIT', 7, 'LIT', 3, 'MAX', 'OUT',
+            'LIT', 0xffffffff, 'LIT', 1, 'MIN', 'OUT',
+            'LIT', 17, 'LIT', 5, '/', 'OUT',
+            'LIT', 17, 'LIT', 0, '/', 'OUT',          // faults here
+            'HALT',
+        ])
+        const m = await deploy(prog)
+        const { last } = await runToHalt(m, 1n, keeperA)
+        expect(outputLog(last.plan.nextState)).to.deep.equal([3n, 7n, 1n, 3n])
+    })
+
+    const SEED_A = Buffer.alloc(32, 1)
+    const SEED_B = Buffer.alloc(32, 2)
+    const attesterA = newAttester(SEED_A)
+    const attesterB = newAttester(SEED_B)
+    const ROSTER = rosterOf([attesterA.pub, attesterB.pub])
+
+    /** Deploy the attest smoke program bound to slot `k`. */
+    async function deployAttest(k: number): Promise<K17Machine> {
+        const m = newMachine(attestProgram(k), ECON, T0, ROSTER)
+        await m.connect(getDefaultSigner())
+        await m.deploy(FUNDING)
+        return m
+    }
+
+    it('SIGVERIFY: a reading signed by the roster key is accepted and any keeper may relay it', async () => {
+        const m = await deployAttest(1)
+        let value = BigInt(FUNDING)
+        // cycle 1 runs up to the YIELD
+        let r = await cycle(m, value, T0 + 1n, keeperA)
+        value = r.plan.remaining
+        // attester B signs (tag=5, value=2231); keeper A relays it
+        const sig = signReading(attesterB, 5n, 2231n)
+        r = await cycle(
+            r.next as K17Machine,
+            value,
+            T0 + 2n,
+            keeperA,
+            {},
+            [5n, 2231n],
+            sig
+        )
+        expect(r.plan.halted).to.be.true
+        expect(outputLog(r.plan.nextState)).to.deep.equal([5n, 2231n])
+        console.log(
+            `      attestation cycle tx: ${r.tx.toBuffer().length} bytes`
+        )
+    })
+
+    it('SIGVERIFY: wrong key, altered reading, replayed tag and missing signature are all rejected', async () => {
+        const m = await deployAttest(1)
+        let value = BigInt(FUNDING)
+        const r = await cycle(m, value, T0 + 1n, keeperA)
+        value = r.plan.remaining
+        const next = r.next as K17Machine
+        const good = signReading(attesterB, 5n, 2231n)
+
+        // signed by roster slot 0, program demands slot 1
+        await expect(
+            cycle(
+                next,
+                value,
+                T0 + 2n,
+                keeperA,
+                {},
+                [5n, 2231n],
+                signReading(attesterA, 5n, 2231n)
+            )
+        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        // reading altered after signing
+        await expect(
+            cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2232n], good)
+        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        // old signature replayed under a new tag
+        await expect(
+            cycle(next, value, T0 + 2n, keeperA, {}, [6n, 2231n], good)
+        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        // no signature at all
+        await expect(
+            cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2231n])
+        ).to.be.rejectedWith(/needs a witness/)
+        // the plan is honest but the unlocking script carries a bad signature:
+        // the script interpreter itself must refuse
+        await expect(
+            cycle(
+                next,
+                value,
+                T0 + 2n,
+                keeperA,
+                { sigArg: signReading(attesterA, 5n, 2231n) },
+                [5n, 2231n],
+                good
+            )
+        ).to.be.rejected
+    })
+
+    it('SIGVERIFY: an empty roster slot faults the machine and refunds the beneficiary', async () => {
+        const m = await deployAttest(3)
+        let value = BigInt(FUNDING)
+        let r = await cycle(m, value, T0 + 1n, keeperA)
+        value = r.plan.remaining
+        r = await cycle(
+            r.next as K17Machine,
+            value,
+            T0 + 2n,
+            keeperA,
+            {},
+            [5n, 2231n],
+            signReading(attesterB, 5n, 2231n)
+        )
+        expect(r.plan.halted).to.be.true
+        expect(outputLog(r.plan.nextState)).to.deep.equal([])
     })
 })
