@@ -545,7 +545,9 @@ export class K17Machine extends SmartContract {
                                         'one attestation per cycle'
                                     )
                                     sigUsed = true
+                                    // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
                                     const msg =
+                                        toByteString('4b313741') +
                                         K17Machine.cell(second) +
                                         K17Machine.cell(top)
                                     assert(

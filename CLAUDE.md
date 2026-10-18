@@ -21,7 +21,7 @@ publication belong in this repo.
   `src/k17/attest.ts` signs with the same parameters. One signature per cycle.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  4.9 KB per instruction with the current 32 handlers (202 468 bytes at K=40).
+  4.9 KB per instruction with the current 32 handlers (202 708 bytes at K=40).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile
   here before running its tests.

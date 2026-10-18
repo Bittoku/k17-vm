@@ -106,12 +106,22 @@ export enum Op {
 export const ROSTER_MAX = 4
 
 /**
+ * Domain prefix of every attestation message, ASCII "K17A". It stops a
+ * roster key that also signs other things (oracle feeds, other protocols)
+ * from having those signatures replayed as K17 attestations.
+ */
+export const ATTEST_DOMAIN = '4b313741'
+
+/**
  * Message bytes that an attester signs for `TAG VAL SIGVERIFY k`:
- * cell(TAG) followed by cell(VAL), 8 bytes, as hex. Programs use TAG as a
- * replay guard (a cycle or sample counter) and VAL as the attested reading.
+ * ATTEST_DOMAIN || cell(TAG) || cell(VAL), 12 bytes, as hex. The message is
+ * fixed-length, so the signature padding that follows it cannot move a field
+ * boundary. Programs push TAG as a literal that includes a per-deployment
+ * epoch (so a signature cannot be replayed into another instance with the
+ * same roster) plus the hop or sample index; VAL is the attested reading.
  */
 export function attestMessage(tag: bigint, value: bigint): string {
-    return encodeCell(tag) + encodeCell(value)
+    return ATTEST_DOMAIN + encodeCell(tag) + encodeCell(value)
 }
 
 /** Opcodes that carry a 4-byte operand. */
