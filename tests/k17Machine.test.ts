@@ -242,6 +242,13 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/nSequence|script failed/)
     })
 
+    it('rejects a machine that is not input 0 (output-sharing / sibling double-spend shape)', async () => {
+        const m = await deploy(heartbeatProgram())
+        await expect(
+            cycle(m, BigInt(FUNDING), T0 + 5n, keeperA, { leadingFeeInputs: 1 })
+        ).to.be.rejectedWith(/machine must be input 0/)
+    })
+
     it('a fault releases funds to the beneficiary instead of freezing them', async () => {
         // DROP on an empty stack is a fault on the very first instruction.
         const m = await deploy(assemble(['DROP', 'LIT', 1, 'OUT', 'HALT']))

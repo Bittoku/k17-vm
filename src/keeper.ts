@@ -19,6 +19,7 @@ import {
     bsv,
     toByteString,
 } from 'scrypt-ts'
+import { randomBytes } from 'crypto'
 import { K17Machine } from './contracts/k17Machine'
 import { K17State, initialState, stepK } from './k17/vm'
 import { MEM_CELLS, CELL } from './k17/isa'
@@ -140,6 +141,8 @@ export interface CycleOverrides {
     next?: K17Machine
     /** nSequence for the contract input. */
     sequence?: number
+    /** Put this many fee inputs BEFORE the machine input (attack shape). */
+    leadingFeeInputs?: number
 }
 
 /**
@@ -166,9 +169,23 @@ export function bindCycleBuilder(
     m.bindTxBuilder(
         'step',
         async (current: K17Machine, options: MethodCallOptions<K17Machine>) => {
-            const tx = new bsv.Transaction().addInput(
-                current.buildContractInput(options.fromUTXO)
-            )
+            const tx = new bsv.Transaction()
+            const leading = overrides.leadingFeeInputs ?? 0
+            if (leading > 0) {
+                // Synthetic P2PKH inputs owned by the signer, placed ahead of
+                // the machine. Only used by tests to build the attack shape.
+                const feeAddress = await current.signer.getDefaultAddress()
+                for (let i = 0; i < leading; i++) {
+                    tx.from({
+                        txId: randomBytes(32).toString('hex'),
+                        outputIndex: 0,
+                        script: bsv.Script.fromAddress(feeAddress).toHex(),
+                        satoshis: 100000,
+                    })
+                }
+            }
+            tx.addInput(current.buildContractInput(options.fromUTXO))
+            const atInputIndex = leading
             const nexts: StatefulNext<K17Machine>[] = []
             if (plan.halted || !nextInstance) {
                 tx.addOutput(
@@ -207,9 +224,9 @@ export function bindCycleBuilder(
                 options.changeAddress ||
                     (await current.signer.getDefaultAddress())
             )
-            tx.setInputSequence(0, overrides.sequence ?? 0xfffffffe)
+            tx.setInputSequence(atInputIndex, overrides.sequence ?? 0xfffffffe)
             tx.setLockTime(Number(lockTime))
-            return { tx, atInputIndex: 0, nexts, next: nexts[0] }
+            return { tx, atInputIndex, nexts, next: nexts[0] }
         }
     )
 

@@ -8,7 +8,8 @@
  *      or faulted during those K instructions), and
  *   2. output 1 pays the spender ("keeper") the reward that the liveness
  *      Dutch auction permits at this transaction's nLockTime, and
- *   3. no satoshis leave the machine except that reward.
+ *   3. no satoshis leave the machine except that reward, and
+ *   4. the machine is input 0, so two machines can never share one output set.
  *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
@@ -411,6 +412,24 @@ export class K17Machine extends SmartContract {
                 }
             }
         }
+
+        // ---- anti output-sharing ------------------------------------
+        // Two machines with identical scripts and values could otherwise be
+        // spent together, both accepting one shared state output while the
+        // keeper pockets the second balance as change. Requiring this input
+        // to be input 0 means at most one machine can be spent per tx.
+        const prevouts = this.prevouts
+        assert(
+            hash256(prevouts) == this.ctx.hashPrevouts,
+            'prevouts do not match hashPrevouts'
+        )
+        const selfOutpoint =
+            this.ctx.utxo.outpoint.txid +
+            int2ByteString(this.ctx.utxo.outpoint.outputIndex, 4n)
+        assert(
+            slice(prevouts, 0n, 36n) == selfOutpoint,
+            'machine must be input 0'
+        )
 
         // ---- liveness Dutch auction ----------------------------------
         assert(
