@@ -36,6 +36,7 @@ import {
     readSlot,
     withSlot,
     K17State,
+    deadManDue,
 } from '../src/k17/vm'
 import {
     EMPTY_HASHES,
@@ -2115,5 +2116,75 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         )
         expect(empty.status).to.equal('halted')
         expect(empty.state.rosterRoot).to.equal(tree.root())
+    })
+})
+
+describe('K17 v3.1 dead-man halt', function () {
+    const LAST = 1_760_000_000n
+    const DEAD = 3600n
+    /** Program that needs a witness at its first instruction. */
+    const waitIn = () => initialState(assemble(['IN', 'OUT', 'HALT']))
+    /** Environment at `lockTime` with no witness and the given dead-man. */
+    const envAt = (lockTime: bigint, deadMan?: bigint): StepEnv => ({
+        ...envOf(lockTime),
+        deadMan,
+        lastTime: LAST,
+    })
+
+    it('deadManDue fires at exactly lastTime + deadMan, not one second earlier', () => {
+        expect(deadManDue(envAt(LAST + DEAD - 1n, DEAD))).to.equal(false)
+        expect(deadManDue(envAt(LAST + DEAD, DEAD))).to.equal(true)
+        expect(deadManDue(envAt(LAST + DEAD + 1n, DEAD))).to.equal(true)
+    })
+
+    it('deadManDue is off for deadMan 0, undefined deadMan or undefined lastTime', () => {
+        const far = LAST + 100n * 365n * 86_400n
+        expect(deadManDue(envAt(far, 0n))).to.equal(false)
+        expect(deadManDue(envAt(far))).to.equal(false)
+        expect(deadManDue({ ...envOf(far), deadMan: DEAD })).to.equal(false)
+    })
+
+    it('stepK halts before the first instruction when due, and needs a witness one second earlier', () => {
+        const early = stepK(waitIn(), envAt(LAST + DEAD - 1n, DEAD), 40)
+        expect(early.status).to.equal('need_witness')
+        const due = stepK(waitIn(), envAt(LAST + DEAD, DEAD), 40)
+        expect(due.status).to.equal('halted')
+        expect(due.state.halted).to.equal(true)
+        // nothing executed
+        expect(due.state.pc).to.equal(0n)
+        expect(due.state.ds).to.equal('')
+        expect(due.witnessUsed).to.equal(0)
+        expect(due.bountyDue).to.equal(0n)
+        expect(due.treeOp).to.equal('none')
+        expect(due.payslot).to.equal(undefined)
+    })
+
+    it('run halts with zero steps when due; deadMan 0 never fires', () => {
+        const due = run(waitIn(), envAt(LAST + DEAD, DEAD))
+        expect(due.status).to.equal('halted')
+        expect(due.steps).to.equal(0)
+        expect(due.state.halted).to.equal(true)
+        const off = run(waitIn(), envAt(LAST + 10n * DEAD, 0n))
+        expect(off.status).to.equal('need_witness')
+    })
+
+    it('a machine blocked on MEMBER with an empty tree escapes via the dead-man', () => {
+        const s = initialState(assemble(['MEMBER', 'OUT', 'HALT']))
+        expect(stepK(s, envAt(LAST + 60n, DEAD), 40).status).to.equal(
+            'need_witness'
+        )
+        const due = stepK(s, envAt(LAST + DEAD, DEAD), 40)
+        expect(due.status).to.equal('halted')
+        expect(due.state.rosterRoot).to.equal(EMPTY_HASHES[16])
+    })
+
+    it('a program that would bounty and pay does not when the dead-man fires', () => {
+        const s = initialState(
+            assemble(['BOUNTY', 500, 'VALUE', 'OUT', 'HALT'])
+        )
+        const due = stepK(s, { ...envAt(LAST + DEAD, DEAD), value: 9n }, 40)
+        expect(due.status).to.equal('halted')
+        expect(due.bountyDue).to.equal(0n)
+        expect(outputLog(due.state)).to.deep.equal([])
     })
 })

@@ -14,6 +14,16 @@
  * one Merkle proof of the cycle (`tree` argument of planCycle), which the
  * plan forwards to `step` as leafPre, proof and leafIndex.
  *
+ * Clock rules (v3.1). A cycle that keeps the machine alive must use an
+ * nLockTime at least K17Machine.MIN_STEP (60 s) after the machine's
+ * lastTime; planCycle refuses an earlier one. A cycle that halts (HALT, a
+ * fault, or the dead-man) may use any nLockTime from lastTime on. When the
+ * machine has a dead-man interval (`deadMan` > 0) and nLockTime is at
+ * least lastTime + deadMan, the cycle halts before its first instruction:
+ * it needs no witness, signature or proof, refunds the beneficiary and
+ * pays the keeper its reward (CyclePlan.deadManHalt). Note that the
+ * first cycle after deployment counts from the deployment time.
+ *
  * The functions here are pure plumbing; the economics live in the contract.
  */
 
@@ -33,6 +43,7 @@ import {
     PaySlot,
     StepEnv,
     TreeOp,
+    deadManDue,
     initialState,
     stepK,
     whoOf,
@@ -47,6 +58,12 @@ export interface Economics {
     /** sats per second */
     slope: bigint
     rewardMax: bigint
+    /**
+     * Dead-man interval in seconds (v3.1): a cycle at nLockTime
+     * >= lastTime + deadMan halts the machine and refunds the beneficiary,
+     * whatever the program waits for. Optional; 0 (the default) disables it.
+     */
+    deadMan?: bigint
 }
 
 /** Fixed SIGVERIFY roster as the contract wants it: exactly FIXED_ROSTER_SLOTS keys. */
@@ -88,7 +105,8 @@ export function randomInstanceId(): string {
  * attesters must read `instanceId` from the deployed machine (the contract
  * instance or its locking script) before they sign anything for it.
  * Output: contract instance with empty stacks and the given (default zeroed)
- * memory.
+ * memory. `econ.deadMan` (default 0n, disabled) becomes the immutable
+ * dead-man interval; a negative value, or one in (0, MIN_STEP], throws.
  */
 export function newMachine(
     progHex: string,
@@ -104,6 +122,17 @@ export function newMachine(
         initialMemHex === undefined ? undefined : initialMemHex.toLowerCase(),
         tree
     )
+    const deadMan = econ.deadMan ?? 0n
+    if (deadMan < 0n) throw new Error('deadMan must not be negative')
+    // A cycle that stays alive needs lockTime >= lastTime + MIN_STEP, and
+    // the dead-man fires at lastTime + deadMan; with deadMan <= MIN_STEP no
+    // cycle could ever keep the machine alive. The contract accepts such a
+    // value; the keeper refuses to deploy it.
+    if (deadMan > 0n && deadMan <= K17Machine.MIN_STEP) {
+        throw new Error(
+            `deadMan must be 0 (off) or above MIN_STEP (${K17Machine.MIN_STEP} s)`
+        )
+    }
     const instanceId = instanceIdHex ?? randomInstanceId()
     if (!/^[0-9a-f]{64}$/.test(instanceId)) {
         throw new Error('instance id must be 32 bytes (64 lowercase hex chars)')
@@ -114,6 +143,7 @@ export function newMachine(
         econ.rewardMin,
         econ.slope,
         econ.rewardMax,
+        deadMan,
         roster,
         toByteString(instanceId),
         toByteString(s.sponsorKeyHash),
@@ -213,6 +243,12 @@ export interface CycleTree {
 /** What one cycle will produce, computed off-chain before broadcasting. */
 export interface CyclePlan {
     halted: boolean
+    /**
+     * True when the dead-man fired (v3.1): nLockTime >= lastTime + deadMan
+     * with deadMan > 0, so the cycle halted before its first instruction.
+     * Implies `halted`.
+     */
+    deadManHalt: boolean
     /** Total paid to the spender: auction reward plus released bounty. */
     reward: bigint
     /** Bounty portion of `reward` released by BOUNTY instructions. */
@@ -266,7 +302,10 @@ export interface CyclePlan {
  * proof). A PAYSLOT or PAYLEAF payout has priority over the keeper reward,
  * which shrinks (down to 0) so the payout is paid in full; only
  * N > value - 1 is a fault, as on chain: the plan is halted and carries no
- * payslot.
+ * payslot. The VM gets the instance's deadMan and lastTime, so a due
+ * dead-man gives a halted plan with `deadManHalt` set (v3.1). Throws when
+ * a cycle that stays alive uses a lockTime earlier than lastTime +
+ * K17Machine.MIN_STEP (the contract refuses it; v3.1).
  */
 export function planCycle(
     m: K17Machine,
@@ -300,7 +339,10 @@ export function planCycle(
         value,
         instanceId: m.instanceId,
         tree: treeArg,
+        deadMan: m.deadMan,
+        lastTime: m.lastTime,
     }
+    const deadManHalt = deadManDue(env)
     // The contract faults a machine whose instanceId is not 32 bytes before
     // its first instruction; mirror that here.
     const outcome = /^[0-9a-fA-F]{64}$/.test(m.instanceId)
@@ -330,6 +372,14 @@ export function planCycle(
         nextState = { ...nextState, halted: true }
         payslot = undefined
     }
+    if (lockTime < m.lastTime) throw new Error('lockTime before lastTime')
+    if (!nextState.halted && lockTime < m.lastTime + K17Machine.MIN_STEP) {
+        // The contract asserts the minimum clock advance on the alive path
+        // only; a halting cycle may use any nLockTime from lastTime on.
+        throw new Error(
+            `a cycle that keeps the machine alive needs lockTime >= lastTime + ${K17Machine.MIN_STEP} (MIN_STEP)`
+        )
+    }
     // The slot payout has priority over the auction reward.
     const reward = rewardAt(
         m,
@@ -341,6 +391,7 @@ export function planCycle(
     const remaining = value - reward - (payslot?.sats ?? 0n)
     const witnessHex = witness.map((w) => encodeCell(w)).join('')
     const common = {
+        deadManHalt,
         reward,
         bounty: outcome.bountyDue,
         nextState,

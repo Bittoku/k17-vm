@@ -102,6 +102,33 @@ export interface StepEnv {
      * and the leaf index.
      */
     tree?: { leafPre: string; proof: string; leafIndex: bigint }
+    /**
+     * The machine's dead-man interval in seconds (contract `deadMan`,
+     * v3.1); 0 or undefined disables it. Read by stepK and run only.
+     */
+    deadMan?: bigint
+    /**
+     * nLockTime of the transaction that produced the machine's current
+     * state (contract `lastTime`). Needed with `deadMan`; the dead-man
+     * check is off when it is undefined.
+     */
+    lastTime?: bigint
+}
+
+/**
+ * Whether the dead-man halt fires for this transaction (v3.1), exactly as
+ * the contract checks it at the top of `step`: deadMan > 0 and
+ * lockTime >= lastTime + deadMan.
+ * Input: the cycle's environment. Output: true when the cycle must halt
+ * before its first instruction; false when deadMan or lastTime is unset.
+ */
+export function deadManDue(e: StepEnv): boolean {
+    return (
+        e.deadMan !== undefined &&
+        e.lastTime !== undefined &&
+        e.deadMan > 0n &&
+        e.lockTime >= e.lastTime + e.deadMan
+    )
 }
 
 /** Build an environment; `lockTime` alone is enough for programs without I/O. */
@@ -1165,6 +1192,10 @@ export interface CycleOutcome {
 /**
  * Execute up to `k` instructions, stopping early once halted or blocked.
  * This mirrors one on-chain cycle transaction with K unrolled steps.
+ * When `env` carries `deadMan` and `lastTime` and the dead-man is due
+ * (deadManDue), no instruction runs: the outcome is 'halted' with
+ * `state.halted` set, as on chain (v3.1). The MIN_STEP clock rule is a
+ * transaction rule, not a VM rule; planCycle enforces it.
  */
 export function stepK(
     s: K17State,
@@ -1172,6 +1203,16 @@ export function stepK(
     k: number
 ): CycleOutcome {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
+    // Dead-man halt (v3.1): the cycle halts before its first instruction.
+    if (deadManDue(e)) {
+        return {
+            state: { ...s, halted: true },
+            status: 'halted',
+            witnessUsed: 0,
+            bountyDue: 0n,
+            treeOp: 'none',
+        }
+    }
     let cur = s
     let wi = 0
     let bounty = 0n
@@ -1217,6 +1258,7 @@ export function stepK(
 
 /**
  * Run until HALT/fault/block or until `maxSteps` instructions have executed.
+ * A due dead-man (deadManDue) halts before the first instruction (v3.1).
  * Input: state, environment, maxSteps. Output: final state, status, steps.
  */
 export function run(
@@ -1233,6 +1275,17 @@ export function run(
     member?: BoundMember
 } {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
+    // Dead-man halt (v3.1): nothing executes. `run` uses one environment
+    // for every step, so this is checked once, before the first one.
+    if (deadManDue(e)) {
+        return {
+            state: { ...s, halted: true },
+            steps: 0,
+            status: 'halted',
+            bountyDue: 0n,
+            treeOp: 'none',
+        }
+    }
     let cur = s
     let steps = 0
     let wi = 0

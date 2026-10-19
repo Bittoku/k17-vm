@@ -85,6 +85,13 @@
  * Semantics are defined by `src/k17/isa.ts` and the reference VM in
  * `src/k17/vm.ts`; this file must agree with them exactly.
  *
+ * v3.1 freeze escape: an immutable `deadMan` (seconds, 0 = off) halts the
+ * machine at the top of `step`, before any instruction, witness, signature
+ * or tree check, once nLockTime >= lastTime + deadMan; the cycle then takes
+ * the refund path and pays the keeper its reward. A cycle that keeps the
+ * machine alive must advance the clock by at least MIN_STEP (60 s), so a
+ * keeper cannot pin lastTime; halting cycles are exempt.
+ *
  * Faults (underflow, overflow, bad address, bad opcode, PC overrun, full
  * output log, a second signature instruction) never fail the transaction. They halt the machine so the funds
  * can always be released.
@@ -188,6 +195,17 @@ export class K17Machine extends SmartContract {
     /** Bytes of a payout address hash. */
     @prop()
     static readonly PAYOUT_BYTES: bigint = 20n
+    /**
+     * Minimum clock advance, in seconds, of a cycle that keeps the machine
+     * alive (v3.1): its nLockTime must be at least lastTime + MIN_STEP. A
+     * keeper therefore cannot hold the clock still while it drives the
+     * machine (which would hold off the dead-man halt), and a chain of
+     * unconfirmed cycles cannot run the program with a frozen clock. A
+     * cycle that halts (HALT, a fault or the dead-man) is exempt, so this
+     * rule never blocks a refund.
+     */
+    @prop()
+    static readonly MIN_STEP: bigint = 60n
 
     // ---- immutable program and economics -------------------------------
 
@@ -206,6 +224,17 @@ export class K17Machine extends SmartContract {
     /** Reward ceiling in sats. */
     @prop()
     readonly rewardMax: bigint
+    /**
+     * Dead-man interval in seconds (v3.1); 0 disables it. A cycle whose
+     * nLockTime is at least lastTime + deadMan halts the machine before its
+     * first instruction: it takes the fault path (refund to the
+     * beneficiary, keeper reward paid) and needs no witness, signature or
+     * tree proof. So a machine that waits for a witness nobody supplies
+     * (IN, MEMBER on an empty tree) is refunded after deadMan seconds
+     * without a cycle, instead of being frozen. Fixed at deployment.
+     */
+    @prop()
+    readonly deadMan: bigint
     /**
      * Rabin public keys of the attesters a program may name with
      * SIGVERIFY k (k in 0..3). Fixed at deployment; a zero entry is an empty
@@ -279,6 +308,7 @@ export class K17Machine extends SmartContract {
         rewardMin: bigint,
         slope: bigint,
         rewardMax: bigint,
+        deadMan: bigint,
         roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>,
         instanceId: ByteString,
         sponsorKeyHash: ByteString,
@@ -298,6 +328,7 @@ export class K17Machine extends SmartContract {
         this.rewardMin = rewardMin
         this.slope = slope
         this.rewardMax = rewardMax
+        this.deadMan = deadMan
         this.roster = roster
         this.instanceId = instanceId
         this.sponsorKeyHash = sponsorKeyHash
@@ -458,6 +489,16 @@ export class K17Machine extends SmartContract {
         // A malformed deployment (instanceId not 32 bytes) faults before the
         // first instruction, so its balance is refunded, never frozen.
         let halted = len(this.instanceId) != 32n
+        // Dead-man halt (v3.1): when deadMan seconds have passed since the
+        // last cycle, this cycle halts before its first instruction. treeOp,
+        // verifyNeeded and memberKeyCheck then stay unset, so no witness,
+        // signature or tree check runs and the refund is always spendable.
+        if (
+            this.deadMan > 0n &&
+            this.ctx.locktime >= this.lastTime + this.deadMan
+        ) {
+            halted = true
+        }
         let yielded = false
         let wi = 0n
         let bountyDue = 0n
@@ -1258,6 +1299,12 @@ export class K17Machine extends SmartContract {
                 remaining
             )
         } else {
+            // A cycle that keeps the machine alive must advance the clock by
+            // MIN_STEP seconds (v3.1). The halted branch above is exempt.
+            assert(
+                now >= this.lastTime + K17Machine.MIN_STEP,
+                'a live cycle must advance the clock by MIN_STEP'
+            )
             this.pc = pc
             this.ds = ds
             this.rs = rs

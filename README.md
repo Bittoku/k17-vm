@@ -250,6 +250,12 @@ the transaction invalid.
   chooses which member it proves. Do not use them as a memory address or a
   loop bound without bounding them first (for example with `VERIFY`), as
   for a `SLOT` from `IN`.
+- Clock. A cycle that keeps the machine alive must have nLockTime at least
+  `lastTime + 60` (`MIN_STEP`, v3.1). A cycle that halts (`HALT`, a fault
+  or the dead-man) needs only nLockTime at or after `lastTime`.
+- Dead-man. When the machine has `deadMan` > 0 and nLockTime is at least
+  `lastTime + deadMan`, the cycle halts before its first instruction (v3.1).
+  See "Freeze escape" below.
 - Get `ROUND` from `TIME`, never from `IN`. The keeper controls `IN`. The
   contract does not let nLockTime go backwards. A member admitted in round
   r can be paid in round r + 1 at the earliest, because `PAYLEAF` requires
@@ -277,16 +283,62 @@ interpreter gets smaller or one cycle can carry more than one reading. v1
 is for hundreds of members, one reading per member per round, and rounds of
 a day or more.
 
+## Freeze escape (v3.1)
+
+K17 must never let a program lock the deposit. Before v3.1 two cases broke
+that rule. Both come from the program, not from the relayer:
+
+1. A second signature instruction in one cycle. It was an `assert`, and no
+   witness can satisfy it. It is now a fault (see "Rules for each cycle").
+2. A program that waits for a witness that nobody can supply: `IN` with no
+   relayer that has the data, or `MEMBER` on a tree with no members.
+
+For case 2 the machine has an immutable dead-man interval, `deadMan`, in
+seconds. It is set at deployment (`newMachine(prog, { ...econ, deadMan })`);
+0 (the default) disables it. At the top of `step`, before the instruction
+loop:
+
+```
+if (deadMan > 0 && nLockTime >= lastTime + deadMan) halted = true
+```
+
+The cycle then takes the fault path: the balance goes to the beneficiary
+and the keeper gets its auction reward. No instruction runs, so no witness,
+signature or tree proof is checked. Any keeper can send it. The checks that
+stay are the ones that every cycle has: prevouts, machine at input 0,
+nSequence, nLockTime is a unix time, nLockTime not before `lastTime`, and
+the outputs. The reference VM does the same check in `stepK` and `run` when
+`StepEnv` has `deadMan` and `lastTime`; `planCycle` passes both and sets
+`CyclePlan.deadManHalt`.
+
+Minimum clock advance. `lastTime` is the nLockTime of the last cycle, and
+consensus does not bound nLockTime from below. Without a rule, a keeper that
+can drive the machine could keep `nLockTime = lastTime` on every cycle, so
+the dead-man clock would not move. Thus a cycle that keeps the machine alive
+must advance the clock by `MIN_STEP` = 60 seconds:
+`nLockTime >= lastTime + 60`. The contract asserts this on the alive path
+only; a halting cycle is exempt, so the rule never blocks a refund.
+`planCycle` refuses a live cycle that breaks it. The rule also applies to
+the first cycle: it must be at least 60 seconds after the deployment time.
+`newMachine` refuses a `deadMan` from 1 to 60, because then no cycle could
+stay alive.
+
+Choose `deadMan` long compared with the program's normal interval between
+cycles (for example 30 days for daily rounds). A keeper that pins the clock
+must still win every cycle for `deadMan` seconds and pay the fee of each,
+and the result is only an early refund of the beneficiary's own deposit.
+
 ## Measurements (K = instructions per cycle)
 
-| K   | Handlers                           | Locking script | Cycle transaction |
-| --- | ---------------------------------- | -------------- | ----------------- |
-| 1   | 21                                 | 9 026 bytes    | 9 574 bytes       |
-| 4   | 21                                 | 16 247 bytes   | 16 802 bytes      |
-| 40  | 28                                 | 159 003 bytes  | about 160 KB      |
-| 40  | 32                                 | 202 468 bytes  | about 204 KB      |
-| 40  | 43                                 | 469 386 bytes  | about 470 KB      |
-| 40  | 43 (v3.1, second signature faults) | 469 666 bytes  | about 470 KB      |
+| K   | Handlers                                | Locking script | Cycle transaction |
+| --- | --------------------------------------- | -------------- | ----------------- |
+| 1   | 21                                      | 9 026 bytes    | 9 574 bytes       |
+| 4   | 21                                      | 16 247 bytes   | 16 802 bytes      |
+| 40  | 28                                      | 159 003 bytes  | about 160 KB      |
+| 40  | 32                                      | 202 468 bytes  | about 204 KB      |
+| 40  | 43                                      | 469 386 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, second signature faults)      | 469 666 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, plus dead-man and `MIN_STEP`) | 469 918 bytes  | about 470 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
@@ -307,4 +359,6 @@ obvious optimisation target.
 with a cap in this prototype: `min(rewardMin + slope * elapsed, rewardMax)`.
 The keeper reads elapsed time from nLockTime, which miners enforce as a
 lower bound on block time, so claiming a larger reward means waiting longer
-before the transaction can be mined.
+before the transaction can be mined. Because of `MIN_STEP` (v3.1), the
+smallest reward of a cycle that keeps the machine alive is
+`rewardMin + 60 * slope`.

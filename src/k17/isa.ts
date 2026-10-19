@@ -107,6 +107,14 @@
  * HALT: the machine stops and the contract releases its funds to the
  * beneficiary. Faults never make the spending transaction invalid, because
  * an unspendable program would freeze its funds forever.
+ *
+ * Dead-man halt (v3.1, not an instruction). A machine deployed with
+ * deadMan > 0 halts before its first instruction in any cycle whose
+ * nLockTime is at least lastTime + deadMan, exactly like a fault: refund to
+ * the beneficiary, keeper reward paid, no witness needed. This frees a
+ * program that waits for a witness nobody supplies. A cycle that keeps the
+ * machine alive must advance nLockTime by at least 60 s (MIN_STEP, a
+ * transaction rule enforced by the contract and planCycle, not by the VM).
  */
 
 /** Width of one data cell in bytes. */

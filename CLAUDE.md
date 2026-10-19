@@ -74,8 +74,19 @@ publication belong in this repo.
   member it proves, so both are relayer-chosen. Do not use them as a memory address or a loop
   bound without bounding them first (for example with `VERIFY`), as for `SLOT`.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
+- Freeze escape (v3.1): immutable `deadMan` (seconds, 0 = off; constructor argument after
+  `rewardMax`, `econ.deadMan` in `newMachine`). At the top of `step`, before the loop,
+  `deadMan > 0 && locktime >= lastTime + deadMan` sets `halted`, so the cycle takes the refund
+  path with no witness, signature or tree check. The VM mirrors it in `stepK`/`run` via
+  `StepEnv.deadMan` and `StepEnv.lastTime` (`deadManDue`); `planCycle` passes both and reports
+  `CyclePlan.deadManHalt`.
+- `MIN_STEP` = 60 s: a cycle that keeps the machine alive needs
+  `locktime >= lastTime + MIN_STEP` (an `assert` on the alive path only). Halting cycles are
+  exempt, so a refund is never blocked. It is a transaction rule, not a VM rule: `planCycle`
+  enforces it. Tests must space live cycles at least 60 s apart, the first one 60 s after the
+  deployment time `T0`.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (469 666 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (469 918 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile

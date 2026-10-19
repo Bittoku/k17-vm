@@ -133,19 +133,21 @@ function logSize(message: string): void {
 
 /**
  * Deploy a machine for `prog` and return the live instance.
- * Input: program hex; optional funding (sats), initial memory image hex and
+ * Input: program hex; optional funding (sats), initial memory image hex,
  * roster-tree settings (rosterRoot, sponsorKeyHash; default the empty tree
- * and no sponsor). Output: the deployed contract instance.
+ * and no sponsor) and economics (default ECON, no dead-man).
+ * Output: the deployed contract instance.
  */
 async function deploy(
     prog: string,
     funding: number = FUNDING,
     initialMemHex?: string,
-    tree: { rosterRoot?: string; sponsorKeyHash?: string } = {}
+    tree: { rosterRoot?: string; sponsorKeyHash?: string } = {},
+    econ: typeof ECON & { deadMan?: bigint } = ECON
 ): Promise<K17Machine> {
     const m = newMachine(
         prog,
-        ECON,
+        econ,
         T0,
         rosterOf(),
         initialMemHex,
@@ -255,7 +257,7 @@ describe('K17Machine on-chain', function () {
         const m = await deploy(prog)
         const { cycles, paid, remaining, last } = await runToHalt(
             m,
-            10n,
+            70n,
             keeperA
         )
 
@@ -276,8 +278,8 @@ describe('K17Machine on-chain', function () {
         expect(cycles).to.equal(Math.ceil(ref.steps / K17Machine.K))
         expect(last.plan.halted).to.be.true
         expect(paid + remaining).to.equal(BigInt(FUNDING))
-        // every cycle 10 s apart -> reward 110 each
-        expect(paid).to.equal(110n * BigInt(cycles))
+        // every cycle 70 s apart (MIN_STEP is 60) -> reward 170 each
+        expect(paid).to.equal(170n * BigInt(cycles))
 
         // Final tx: output 0 pays the beneficiary the remainder.
         const out0 = last.tx.outputs[0]
@@ -293,7 +295,7 @@ describe('K17Machine on-chain', function () {
 
     it('exercises CALL/EXIT via the countdown program', async () => {
         const m = await deploy(countdownProgram(4))
-        const { last } = await runToHalt(m, 1n, keeperA)
+        const { last } = await runToHalt(m, K17Machine.MIN_STEP, keeperA)
         expect(outputLog(last.plan.nextState)).to.deep.equal([4n, 3n, 2n, 1n])
     })
 
@@ -301,13 +303,14 @@ describe('K17Machine on-chain', function () {
         const m = await deploy(heartbeatProgram())
         let value = BigInt(FUNDING)
 
-        // Keeper A steps immediately: reward = rewardMin.
-        let r = await cycle(m, value, T0 + 0n, keeperA)
-        expect(r.plan.reward).to.equal(100n)
+        // Keeper A steps as early as a live cycle may (MIN_STEP = 60 s
+        // after deployment): reward = rewardMin + 60.
+        let r = await cycle(m, value, T0 + 60n, keeperA)
+        expect(r.plan.reward).to.equal(160n)
         value = r.plan.remaining
 
         // Keeper A again after 60 s: reward = 100 + 60.
-        r = await cycle(r.next as K17Machine, value, T0 + 60n, keeperA)
+        r = await cycle(r.next as K17Machine, value, T0 + 120n, keeperA)
         expect(r.plan.reward).to.equal(160n)
         expect(
             r.tx.outputs[1].script.toAddress(keeperA.network).toString()
@@ -315,7 +318,7 @@ describe('K17Machine on-chain', function () {
         value = r.plan.remaining
 
         // Keeper A disappears. Keeper B only steps once the reward reaches 300.
-        r = await cycle(r.next as K17Machine, value, T0 + 60n + 200n, keeperB)
+        r = await cycle(r.next as K17Machine, value, T0 + 120n + 200n, keeperB)
         expect(r.plan.reward).to.equal(300n)
         expect(
             r.tx.outputs[1].script.toAddress(keeperB.network).toString()
@@ -326,7 +329,7 @@ describe('K17Machine on-chain', function () {
         r = await cycle(
             r.next as K17Machine,
             value,
-            T0 + 260n + 100_000n,
+            T0 + 320n + 100_000n,
             keeperB
         )
         expect(r.plan.reward).to.equal(500n)
@@ -335,7 +338,7 @@ describe('K17Machine on-chain', function () {
         const per = K17Machine.K / 4
         const log = outputLog(r.plan.nextState)
         const expected: bigint[] = []
-        for (const t of [T0, T0 + 60n, T0 + 260n, T0 + 100_260n]) {
+        for (const t of [T0 + 60n, T0 + 120n, T0 + 320n, T0 + 100_320n]) {
             for (let i = 0; i < per; i++) expected.push(t)
         }
         expect(log).to.deep.equal(expected)
@@ -343,9 +346,9 @@ describe('K17Machine on-chain', function () {
 
     it('rejects a keeper who takes one satoshi too many', async () => {
         const m = await deploy(heartbeatProgram())
-        const plan = planCycle(m, BigInt(FUNDING), T0 + 5n)
+        const plan = planCycle(m, BigInt(FUNDING), T0 + 300n)
         await expect(
-            cycle(m, BigInt(FUNDING), T0 + 5n, keeperA, {
+            cycle(m, BigInt(FUNDING), T0 + 300n, keeperA, {
                 reward: plan.reward + 1n,
             })
         ).to.be.rejectedWith(/outputs mismatch|script failed/)
@@ -353,11 +356,11 @@ describe('K17Machine on-chain', function () {
 
     it('rejects a tampered next state', async () => {
         const m = await deploy(fibonacciProgram(3))
-        const plan = planCycle(m, BigInt(FUNDING), T0 + 5n)
+        const plan = planCycle(m, BigInt(FUNDING), T0 + 300n)
         const forged = (plan.next as K17Machine).next()
         forged.pc = forged.pc + 1n
         await expect(
-            cycle(m, BigInt(FUNDING), T0 + 5n, keeperA, { next: forged })
+            cycle(m, BigInt(FUNDING), T0 + 300n, keeperA, { next: forged })
         ).to.be.rejectedWith(/outputs mismatch|script failed/)
     })
 
@@ -371,7 +374,7 @@ describe('K17Machine on-chain', function () {
             /lockTime before lastTime|time must not go backwards/
         )
         await expect(
-            cycle(next, r.plan.remaining, T0 + 150n, keeperA, {
+            cycle(next, r.plan.remaining, T0 + 200n, keeperA, {
                 sequence: 0xffffffff,
             })
         ).to.be.rejectedWith(/nSequence|script failed/)
@@ -380,14 +383,16 @@ describe('K17Machine on-chain', function () {
     it('rejects a machine that is not input 0 (output-sharing / sibling double-spend shape)', async () => {
         const m = await deploy(heartbeatProgram())
         await expect(
-            cycle(m, BigInt(FUNDING), T0 + 5n, keeperA, { leadingFeeInputs: 1 })
+            cycle(m, BigInt(FUNDING), T0 + 300n, keeperA, {
+                leadingFeeInputs: 1,
+            })
         ).to.be.rejectedWith(/machine must be input 0/)
     })
 
     it('a fault releases funds to the beneficiary instead of freezing them', async () => {
         // DROP on an empty stack is a fault on the very first instruction.
         const m = await deploy(assemble(['DROP', 'LIT', 1, 'OUT', 'HALT']))
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r.plan.halted).to.be.true
         expect(
             r.tx.outputs[0].script
@@ -425,14 +430,25 @@ describe('K17Machine on-chain', function () {
      * has no instruction that may change them), and logHash must still be zero
      * unless the program contains an OUTH instruction (a static check: the
      * fuzz does not trace which instructions ran).
-     * Input: op set, memory image, PRNG seed. Output: none (throws on a
-     * cycle that does not verify or a tree field that changed).
+     * With `deadMan` > 0 the machines are deployed with that dead-man
+     * interval and each cycle advances the clock by MIN_STEP or, at
+     * random, by deadMan, so the dead-man halt also meets random mid-run
+     * states (v3.1).
+     * Input: op set, memory image, PRNG seed, optional deadMan (default
+     * 0n, off). Output: the number of cycles the dead-man halted (throws
+     * on a cycle that does not verify or a tree field that changed).
      */
-    async function fuzz(ops: number[], mem: string, seed: number) {
+    async function fuzz(
+        ops: number[],
+        mem: string,
+        seed: number,
+        deadMan = 0n
+    ) {
         const rnd = (n: number) => {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
             return seed % n
         }
+        let deadManHalts = 0
         for (let p = 0; p < 12; p++) {
             const bytes: number[] = []
             let hasOuth = false
@@ -446,15 +462,20 @@ describe('K17Machine on-chain', function () {
                 }
             }
             const prog = Buffer.from(bytes).toString('hex')
-            const m = await deploy(prog, FUNDING, mem, FUZZ_TREE)
+            const m = await deploy(prog, FUNDING, mem, FUZZ_TREE, {
+                ...ECON,
+                deadMan,
+            })
             expect(m.rosterRoot).to.equal(FUZZ_TREE.rosterRoot)
             expect(m.sponsorKeyHash).to.equal(FUZZ_TREE.sponsorKeyHash)
             let cur: K17Machine | undefined = m
             let value = BigInt(FUNDING)
             let t = T0
             for (let c = 0; c < 6 && cur; c++) {
-                t += 1n
+                t +=
+                    deadMan > 0n && rnd(3) === 0 ? deadMan : K17Machine.MIN_STEP
                 const r = await cycle(cur, value, t, keeperA)
+                if (r.plan.deadManHalt) deadManHalts++
                 value = r.plan.remaining
                 cur = r.next
                 // The VM's next state, halted or not (most random programs
@@ -473,6 +494,7 @@ describe('K17Machine on-chain', function () {
                 }
             }
         }
+        return deadManHalts
     }
 
     it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
@@ -490,6 +512,19 @@ describe('K17Machine on-chain', function () {
                 v !== Op.ENDORSE
         )
         await fuzz(ops, FULL_ROSTER_MEM, 12345)
+    })
+
+    it('differential fuzz with a dead-man: random states halt cleanly when it fires', async () => {
+        const ops = ALL_OPS.filter(
+            (v) =>
+                v !== Op.IN &&
+                v !== Op.VERIFY &&
+                v !== Op.SIGVERIFY &&
+                v !== Op.ATTEST &&
+                v !== Op.ENDORSE
+        )
+        const fired = await fuzz(ops, FULL_ROSTER_MEM, 777, 3600n)
+        expect(fired).to.be.greaterThan(0)
     })
 
     it('differential fuzz on an empty roster: ATTEST and ENDORSE only fault', async () => {
@@ -510,7 +545,7 @@ describe('K17Machine on-chain', function () {
         let t = T0
         let n = 0
         while (cur && n < OUT_MAX + 2) {
-            t += 1n
+            t += K17Machine.MIN_STEP
             const r = await cycle(cur, value, t, keeperA)
             value = r.plan.remaining
             cur = r.next
@@ -532,21 +567,21 @@ describe('K17Machine on-chain', function () {
     it('factoring bounty: a solver with the witness collects reward + bounty, beneficiary gets the rest', async () => {
         const m = await deploy(factoringBountyProgram(N, BOUNTY1))
         // Cycle 1: a plain keeper runs the leading YIELD only.
-        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r1.plan.bounty).to.equal(0n)
         expect(r1.plan.nextState.pc).to.equal(1n)
         // Cycle 2: solver B supplies p, q and runs the whole stage atomically.
         const r2 = await cycle(
             r1.next as K17Machine,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperB,
             {},
             [BigInt(P), BigInt(Q)]
         )
         expect(r2.plan.halted).to.be.true
         expect(r2.plan.bounty).to.equal(BigInt(BOUNTY1))
-        expect(r2.plan.reward).to.equal(BigInt(BOUNTY1) + 101n)
+        expect(r2.plan.reward).to.equal(BigInt(BOUNTY1) + 160n)
         expect(outputLog(r2.plan.nextState)).to.deep.equal([
             BigInt(Q),
             BigInt(P),
@@ -555,7 +590,7 @@ describe('K17Machine on-chain', function () {
             r2.tx.outputs[1].script.toAddress(keeperB.network).toString()
         ).to.equal(keeperB.toString())
         expect(BigInt(r2.tx.outputs[1].satoshis)).to.equal(
-            BigInt(BOUNTY1) + 101n
+            BigInt(BOUNTY1) + 160n
         )
         expect(
             r2.tx.outputs[0].script
@@ -566,22 +601,22 @@ describe('K17Machine on-chain', function () {
 
     it('factoring bounty: wrong, overflowing and missing witnesses are rejected', async () => {
         const m = await deploy(factoringBountyProgram(N, BOUNTY1))
-        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         const staged = r1.next as K17Machine
         const v = r1.plan.remaining
         // Off-chain planner refuses a wrong factorisation.
         await expect(
-            cycle(staged, v, T0 + 2n, keeperB, {}, [3n, 5n])
+            cycle(staged, v, T0 + 120n, keeperB, {}, [3n, 5n])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         // Factors that only match modulo 2^32 are refused by the 16-bit guards.
         await expect(
-            cycle(staged, v, T0 + 2n, keeperB, {}, [
+            cycle(staged, v, T0 + 120n, keeperB, {}, [
                 BigInt(N + 2 ** 32) / 1n,
                 1n,
             ])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         // No witness at all: the stage cannot be stepped by a plain keeper.
-        await expect(cycle(staged, v, T0 + 2n, keeperA)).to.be.rejectedWith(
+        await expect(cycle(staged, v, T0 + 120n, keeperA)).to.be.rejectedWith(
             /needs a witness/
         )
         // On-chain: plan with the right witness, but broadcast a wrong one.
@@ -589,7 +624,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 staged,
                 v,
-                T0 + 2n,
+                T0 + 120n,
                 keeperB,
                 { witnessHex: '0300000005000000' },
                 [BigInt(P), BigInt(Q)]
@@ -597,7 +632,7 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/verify failed/)
         // On-chain: plan with the right witness, but broadcast none.
         await expect(
-            cycle(staged, v, T0 + 2n, keeperB, { witnessHex: '' }, [
+            cycle(staged, v, T0 + 120n, keeperB, { witnessHex: '' }, [
                 BigInt(P),
                 BigInt(Q),
             ])
@@ -623,9 +658,9 @@ describe('K17Machine on-chain', function () {
             )
         )
         let value = BigInt(FUNDING)
-        let r = await cycle(m, value, T0 + 1n, keeperA) // leading YIELD
+        let r = await cycle(m, value, T0 + 60n, keeperA) // leading YIELD
         value = r.plan.remaining
-        r = await cycle(r.next as K17Machine, value, T0 + 2n, keeperA, {}, [
+        r = await cycle(r.next as K17Machine, value, T0 + 120n, keeperA, {}, [
             BigInt(P),
             BigInt(Q),
         ])
@@ -640,7 +675,7 @@ describe('K17Machine on-chain', function () {
 
         // stage 2a: solver B commits HASH(x XOR WHO_B); selector 1 = commit
         const commitment = hashCell(X ^ whoOf(keeperB.toObject().hash))
-        let r = await cycle(machine, value, T0 + 3n, keeperB, {}, [
+        let r = await cycle(machine, value, T0 + 180n, keeperB, {}, [
             1n,
             commitment,
         ])
@@ -650,21 +685,21 @@ describe('K17Machine on-chain', function () {
 
         // front-runner A sees x in the mempool and tries to reveal as itself
         await expect(
-            cycle(revealStage, value, T0 + 4n, keeperA, {}, [0n, X])
+            cycle(revealStage, value, T0 + 240n, keeperA, {}, [0n, X])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         // front-runner A copies B's exact transaction but swaps the payee
         await expect(
             cycle(
                 revealStage,
                 value,
-                T0 + 4n,
+                T0 + 240n,
                 keeperB,
                 { keeperArg: keeperA },
                 [0n, X]
             )
         ).to.be.rejectedWith(/verify failed/)
         // B reveals and collects
-        r = await cycle(revealStage, value, T0 + 4n, keeperB, {}, [0n, X])
+        r = await cycle(revealStage, value, T0 + 240n, keeperB, {}, [0n, X])
         expect(r.plan.halted).to.be.true
         expect(r.plan.bounty).to.equal(BigInt(BOUNTY2))
         expect(outputLog(r.plan.nextState)).to.deep.equal([BigInt(Q), X])
@@ -679,28 +714,31 @@ describe('K17Machine on-chain', function () {
         let value = ready.value
 
         // griefer A commits garbage
-        let r = await cycle(machine, value, T0 + 10n, keeperA, {}, [1n, 0xbadn])
+        let r = await cycle(machine, value, T0 + 600n, keeperA, {}, [
+            1n,
+            0xbadn,
+        ])
         value = r.plan.remaining
         // B cannot overwrite while the commit is fresh, and cannot reveal against it
         const commitment = hashCell(X ^ whoOf(keeperB.toObject().hash))
         await expect(
-            cycle(r.next as K17Machine, value, T0 + 11n, keeperB, {}, [
+            cycle(r.next as K17Machine, value, T0 + 660n, keeperB, {}, [
                 1n,
                 commitment,
             ])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         await expect(
-            cycle(r.next as K17Machine, value, T0 + 11n, keeperB, {}, [0n, X])
+            cycle(r.next as K17Machine, value, T0 + 660n, keeperB, {}, [0n, X])
         ).to.be.rejectedWith(/witness rejected by VERIFY/)
         // a plain keeper cannot step stage 2 at all (needs a selector witness)
         await expect(
-            cycle(r.next as K17Machine, value, T0 + 11n, keeperA)
+            cycle(r.next as K17Machine, value, T0 + 660n, keeperA)
         ).to.be.rejectedWith(/needs a witness/)
         // after the TTL, B overwrites the commit and reveals in the next transaction
         r = await cycle(
             r.next as K17Machine,
             value,
-            T0 + 10n + BigInt(COMMIT_TTL),
+            T0 + 600n + BigInt(COMMIT_TTL),
             keeperB,
             {},
             [1n, commitment]
@@ -709,7 +747,7 @@ describe('K17Machine on-chain', function () {
         r = await cycle(
             r.next as K17Machine,
             value,
-            T0 + 11n + BigInt(COMMIT_TTL),
+            T0 + 660n + BigInt(COMMIT_TTL),
             keeperB,
             {},
             [0n, X]
@@ -743,7 +781,7 @@ describe('K17Machine on-chain', function () {
             'HALT',
         ])
         const m = await deploy(prog)
-        const { last } = await runToHalt(m, 1n, keeperA)
+        const { last } = await runToHalt(m, K17Machine.MIN_STEP, keeperA)
         expect(outputLog(last.plan.nextState)).to.deep.equal([3n, 7n, 1n, 3n])
     })
 
@@ -772,14 +810,14 @@ describe('K17Machine on-chain', function () {
         const m = await deployAttest(1)
         let value = BigInt(FUNDING)
         // cycle 1 runs up to the YIELD
-        let r = await cycle(m, value, T0 + 1n, keeperA)
+        let r = await cycle(m, value, T0 + 60n, keeperA)
         value = r.plan.remaining
         // attester B signs (tag=5, value=2231); keeper A relays it
         const sig = signReading(attesterB, 5n, 2231n)
         r = await cycle(
             r.next as K17Machine,
             value,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [5n, 2231n],
@@ -793,7 +831,7 @@ describe('K17Machine on-chain', function () {
     it('SIGVERIFY: wrong key, altered reading, replayed tag and missing signature are all rejected', async () => {
         const m = await deployAttest(1)
         let value = BigInt(FUNDING)
-        const r = await cycle(m, value, T0 + 1n, keeperA)
+        const r = await cycle(m, value, T0 + 60n, keeperA)
         value = r.plan.remaining
         const next = r.next as K17Machine
         const good = signReading(attesterB, 5n, 2231n)
@@ -803,7 +841,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 next,
                 value,
-                T0 + 2n,
+                T0 + 120n,
                 keeperA,
                 {},
                 [5n, 2231n],
@@ -812,15 +850,15 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // reading altered after signing
         await expect(
-            cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2232n], good)
+            cycle(next, value, T0 + 120n, keeperA, {}, [5n, 2232n], good)
         ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // old signature replayed under a new tag
         await expect(
-            cycle(next, value, T0 + 2n, keeperA, {}, [6n, 2231n], good)
+            cycle(next, value, T0 + 120n, keeperA, {}, [6n, 2231n], good)
         ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // no signature at all
         await expect(
-            cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2231n])
+            cycle(next, value, T0 + 120n, keeperA, {}, [5n, 2231n])
         ).to.be.rejectedWith(/needs a witness/)
         // the plan is honest but the unlocking script carries a bad signature:
         // the script interpreter itself must refuse
@@ -828,7 +866,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 next,
                 value,
-                T0 + 2n,
+                T0 + 120n,
                 keeperA,
                 { sigArg: signReading(attesterA, 5n, 2231n) },
                 [5n, 2231n],
@@ -840,12 +878,12 @@ describe('K17Machine on-chain', function () {
     it('SIGVERIFY: an empty roster slot faults the machine and refunds the beneficiary', async () => {
         const m = await deployAttest(3)
         let value = BigInt(FUNDING)
-        let r = await cycle(m, value, T0 + 1n, keeperA)
+        let r = await cycle(m, value, T0 + 60n, keeperA)
         value = r.plan.remaining
         r = await cycle(
             r.next as K17Machine,
             value,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [5n, 2231n],
@@ -867,7 +905,7 @@ describe('K17Machine on-chain', function () {
         // YIELD keeps the machine alive so the log lands in the state output
         // and the contract's hashOutputs check covers it.
         const m = await deploy(assemble(['VALUE', 'OUT', 'YIELD', 'HALT']))
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r.plan.halted).to.be.false
         expect(outputLog(r.plan.nextState)).to.deep.equal([BigInt(FUNDING)])
         expect((r.next as K17Machine).outLog).to.equal(
@@ -887,7 +925,7 @@ describe('K17Machine on-chain', function () {
     it("PAYSLOT pays the slot's address in output 2 whoever relays", async () => {
         for (const keeper of [keeperA, keeperB]) {
             const m = await deploy(PAY700, FUNDING, SLOT3_MEM)
-            const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeper)
+            const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeper)
             expect(r.plan.halted).to.be.false
             expect(r.plan.payslot).to.deep.equal({
                 slot: 3,
@@ -926,7 +964,7 @@ describe('K17Machine on-chain', function () {
     }
 
     it('PAYSLOT has priority over the keeper reward; only N >= the balance faults', async () => {
-        // FUNDING 1000, auction reward 101 at T0+1.
+        // FUNDING 1000, auction reward 160 at T0+60.
         const small = 1000
         const pay = (n: number) =>
             deploy(
@@ -934,27 +972,27 @@ describe('K17Machine on-chain', function () {
                 small,
                 SLOT3_MEM
             )
-        // 898 leaves room for the full reward and one satoshi.
-        let r = await cycle(await pay(898), BigInt(small), T0 + 1n, keeperA)
-        expect(r.plan.reward).to.equal(101n)
+        // 839 leaves room for the full reward and one satoshi.
+        let r = await cycle(await pay(839), BigInt(small), T0 + 60n, keeperA)
+        expect(r.plan.reward).to.equal(160n)
         expect(r.tx.outputs[0].satoshis).to.equal(1)
-        expect(r.tx.outputs[2].satoshis).to.equal(898)
+        expect(r.tx.outputs[2].satoshis).to.equal(839)
         // 950: the reward shrinks to 49, the slot is paid in full.
-        r = await cycle(await pay(950), BigInt(small), T0 + 1n, keeperA)
+        r = await cycle(await pay(950), BigInt(small), T0 + 60n, keeperA)
         expect(r.plan.reward).to.equal(49n)
         expect(r.tx.outputs[0].satoshis).to.equal(1)
         expect(r.tx.outputs[2].satoshis).to.equal(950)
         // 999: no reward at all (no keeper output); payout is output 1.
-        r = await cycle(await pay(999), BigInt(small), T0 + 1n, keeperA)
+        r = await cycle(await pay(999), BigInt(small), T0 + 60n, keeperA)
         expect(r.plan.reward).to.equal(0n)
         expect(r.plan.halted).to.be.false
         expect(r.tx.outputs[0].satoshis).to.equal(1)
         expect(addressOf(r.tx.outputs[1])).to.equal(payee.toString())
         expect(r.tx.outputs[1].satoshis).to.equal(999)
         // 1000 cannot leave one satoshi: fault, payout dropped, refund.
-        const f = await cycle(await pay(1000), BigInt(small), T0 + 1n, keeperA)
+        const f = await cycle(await pay(1000), BigInt(small), T0 + 60n, keeperA)
         expectFaultRefund(f, BigInt(small))
-        expect(f.plan.remaining).to.equal(899n)
+        expect(f.plan.remaining).to.equal(840n)
     })
 
     it('a late keeper cannot shrink the slot payout, only its own reward', async () => {
@@ -982,7 +1020,7 @@ describe('K17Machine on-chain', function () {
             'LIT', 700, 'LIT', 3, 'PAYSLOT', 'DROP', 'DROP', 'DROP', 'YIELD',
         ])
         const m = await deploy(prog, FUNDING, SLOT3_MEM)
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r.plan.halted).to.be.true
         expect(r.plan.payslot?.sats).to.equal(700n)
         expect(addressOf(r.tx.outputs[0])).to.equal(
@@ -1002,7 +1040,7 @@ describe('K17Machine on-chain', function () {
             FUNDING,
             SLOT3_MEM
         )
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expectFaultRefund(r, BigInt(FUNDING))
     })
 
@@ -1013,7 +1051,7 @@ describe('K17Machine on-chain', function () {
                 FUNDING,
                 SLOT3_MEM
             )
-            const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+            const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
             expect(r.plan.halted).to.be.true
             expect(r.plan.payslot).to.be.undefined
             expect(r.tx.outputs.length).to.equal(3) // beneficiary, keeper, change
@@ -1032,7 +1070,7 @@ describe('K17Machine on-chain', function () {
             'LIT', 1, 'LIT', 3, 'PAYSLOT', 'LIT', 1, 'LIT', 3, 'PAYSLOT', 'YIELD',
         ])
         const m = await deploy(twice, FUNDING, SLOT3_MEM)
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expectFaultRefund(r, BigInt(FUNDING))
         // a malformed (underflowing) second PAYSLOT also drops the payout
         const bad = await deploy(
@@ -1040,7 +1078,7 @@ describe('K17Machine on-chain', function () {
             FUNDING,
             SLOT3_MEM
         )
-        const rb = await cycle(bad, BigInt(FUNDING), T0 + 1n, keeperA)
+        const rb = await cycle(bad, BigInt(FUNDING), T0 + 60n, keeperA)
         expectFaultRefund(rb, BigInt(FUNDING))
     })
 
@@ -1048,7 +1086,7 @@ describe('K17Machine on-chain', function () {
         const below = await deploy(
             assemble(['LIT', 7, 'LIT', 151, '!', 'YIELD'])
         )
-        const r1 = await cycle(below, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r1 = await cycle(below, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r1.plan.halted).to.be.false
         const mem = (r1.next as K17Machine).mem
         expect(mem.slice(151 * 8, 152 * 8)).to.equal(encodeCell(7n))
@@ -1056,7 +1094,7 @@ describe('K17Machine on-chain', function () {
         const into = await deploy(
             assemble(['LIT', 7, 'LIT', 152, '!', 'YIELD'])
         )
-        const r2 = await cycle(into, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r2 = await cycle(into, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r2.plan.halted).to.be.true
         expect(addressOf(r2.tx.outputs[0])).to.equal(
             beneficiaryAddress.toString()
@@ -1139,7 +1177,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1157,7 +1195,7 @@ describe('K17Machine on-chain', function () {
         const r2 = await cycle(
             enrolled,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [READING],
@@ -1209,7 +1247,7 @@ describe('K17Machine on-chain', function () {
         const plan = planCycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             [],
             ATTEST0_SIG(m.instanceId),
@@ -1218,12 +1256,12 @@ describe('K17Machine on-chain', function () {
             }
         )
         await expect(
-            sendPlan(m, plan, T0 + 1n, pubKeyBytes(sponsor.pub).slice(0, 766))
+            sendPlan(m, plan, T0 + 60n, pubKeyBytes(sponsor.pub).slice(0, 766))
         ).to.be.rejectedWith(/key must be 384 bytes/)
         const r = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1241,7 +1279,7 @@ describe('K17Machine on-chain', function () {
         const plan = planCycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             [],
             ATTEST0_SIG(m.instanceId),
@@ -1250,7 +1288,7 @@ describe('K17Machine on-chain', function () {
             }
         )
         await expect(
-            sendPlan(m, plan, T0 + 1n, pubKeyBytes(landowner.pub))
+            sendPlan(m, plan, T0 + 60n, pubKeyBytes(landowner.pub))
         ).to.be.rejectedWith(/key not in roster slot/)
     })
 
@@ -1303,7 +1341,7 @@ describe('K17Machine on-chain', function () {
             planCycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 [],
                 endorsementFor(1n, m.instanceId),
@@ -1322,13 +1360,13 @@ describe('K17Machine on-chain', function () {
         const plan = planCycle(
             into1,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             [],
             endorsementFor(1n, m.instanceId),
             ENDORSE_KEYS
         )
-        await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
+        await expect(sendPlan(m, plan, T0 + 60n)).to.be.rejectedWith(
             /signature check failed/
         )
     })
@@ -1342,7 +1380,7 @@ describe('K17Machine on-chain', function () {
         const a = await cycle(
             emptySlot,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1360,7 +1398,7 @@ describe('K17Machine on-chain', function () {
         const e = await cycle(
             filled,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1383,7 +1421,7 @@ describe('K17Machine on-chain', function () {
             planCycle(
                 b,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 [],
                 ATTEST0_SIG(idA),
@@ -1394,20 +1432,20 @@ describe('K17Machine on-chain', function () {
         const plan = planCycle(
             a,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             [],
             ATTEST0_SIG(idA),
             keys
         )
-        await expect(sendPlan(b, plan, T0 + 1n)).to.be.rejectedWith(
+        await expect(sendPlan(b, plan, T0 + 60n)).to.be.rejectedWith(
             /signature check failed/
         )
         // and B accepts its own signature
         const r = await cycle(
             b,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1440,6 +1478,7 @@ describe('K17Machine on-chain', function () {
             ECON.rewardMin,
             ECON.slope,
             ECON.rewardMax,
+            0n, // deadMan: off
             rosterOf(),
             toByteString('ab'.repeat(31)),
             toByteString(s0.sponsorKeyHash),
@@ -1456,7 +1495,7 @@ describe('K17Machine on-chain', function () {
         await m.connect(getDefaultSigner())
         await m.deploy(FUNDING)
         // cycle() runs verifyInputScript on the refund transaction
-        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         expect(r.plan.halted).to.be.true
         expect(outputLog(r.plan.nextState)).to.deep.equal([]) // no step ran
         expect(addressOf(r.tx.outputs[0])).to.equal(
@@ -1515,7 +1554,7 @@ describe('K17Machine on-chain', function () {
             return cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -1545,7 +1584,7 @@ describe('K17Machine on-chain', function () {
             return cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -1601,7 +1640,7 @@ describe('K17Machine on-chain', function () {
         const r = await cycle(
             b,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -1763,7 +1802,7 @@ describe('K17Machine on-chain', function () {
         expect(m.sponsorKeyHash).to.equal(keyHash(sponsor.pub))
 
         // cycle 1: member A (left child at level 0) attests 2231 and is paid
-        const tA = T0 + 1n
+        const tA = T0 + 60n
         const r1 = await memberCycle(m, BigInt(FUNDING), tA, 'A', tree, 2231n)
         expect(r1.plan.halted).to.be.false
         expect(r1.plan.payslot).to.deep.equal({
@@ -1786,7 +1825,7 @@ describe('K17Machine on-chain', function () {
         expect(outputLog(r1.plan.nextState)).to.deep.equal([0n])
 
         // cycle 2: member B (right child) attests 4242 with a fresh proof
-        const tB = T0 + 2n
+        const tB = T0 + 120n
         const r2 = await memberCycle(
             n1,
             r1.plan.remaining,
@@ -1805,13 +1844,13 @@ describe('K17Machine on-chain', function () {
         const r3 = await memberCycle(
             n2,
             r2.plan.remaining,
-            T0 + 3n,
+            T0 + 180n,
             'A',
             tree,
             7n
         )
         expect(outputLog(r3.plan.nextState)).to.deep.equal([0n, 0n, tA])
-        tree.set(INDEX_A, leafOf('A', T0 + 3n))
+        tree.set(INDEX_A, leafOf('A', T0 + 180n))
         expect((r3.next as K17Machine).rosterRoot).to.equal(tree.root())
     })
 
@@ -1819,15 +1858,22 @@ describe('K17Machine on-chain', function () {
         const tree = twoMemberTree()
         const m = await deployTree(MEMBER_PROG, tree)
         const staleB = tree.proof(INDEX_B)
-        const r1 = await memberCycle(m, BigInt(FUNDING), T0 + 1n, 'A', tree, 1n)
-        tree.set(INDEX_A, leafOf('A', T0 + 1n))
+        const r1 = await memberCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            'A',
+            tree,
+            1n
+        )
+        tree.set(INDEX_A, leafOf('A', T0 + 60n))
         const n1 = r1.next as K17Machine
         const freshB = tree.proof(INDEX_B)
         expect(staleB.proof).to.not.equal(freshB.proof)
 
         // the keeper's planner refuses it (the VM says verify_failed) ...
         await expect(
-            memberCycle(n1, r1.plan.remaining, T0 + 2n, 'B', tree, 2n, staleB)
+            memberCycle(n1, r1.plan.remaining, T0 + 120n, 'B', tree, 2n, staleB)
         ).to.be.rejectedWith(/rejected/)
         // ... and so does the script interpreter: an honest cycle with the
         // fresh proof verifies, the same transaction with the stale proof
@@ -1835,7 +1881,7 @@ describe('K17Machine on-chain', function () {
         const honest = await memberCycle(
             n1,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             'B',
             tree,
             2n
@@ -1866,7 +1912,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [5n],
@@ -1881,7 +1927,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 n1,
                 r1.plan.remaining,
-                T0 + 2n,
+                T0 + 120n,
                 keeperA,
                 {},
                 [round],
@@ -1906,7 +1952,7 @@ describe('K17Machine on-chain', function () {
             const r = await memberCycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 'A',
                 tree,
                 3n
@@ -1950,11 +1996,11 @@ describe('K17Machine on-chain', function () {
             assemble(['LIT', 7, 'OUTH', 'YIELD', 'LASTROUND', 'HALT']),
             tree
         )
-        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
         const n1 = r1.next as K17Machine
         expect(n1.logHash).to.equal(sha256Hex('00'.repeat(32) + encodeCell(7n)))
         expect(n1.rosterRoot).to.equal(tree.root())
-        const r2 = await cycle(n1, r1.plan.remaining, T0 + 2n, keeperA)
+        const r2 = await cycle(n1, r1.plan.remaining, T0 + 120n, keeperA)
         expect(r2.plan.halted).to.be.true
         expect(addressOf(r2.tx.outputs[0])).to.equal(
             beneficiaryAddress.toString()
@@ -1971,7 +2017,7 @@ describe('K17Machine on-chain', function () {
     async function payleafCycle(
         prog: string,
         tree: SparseMerkleTree,
-        lockTime: bigint = T0 + 1n,
+        lockTime: bigint = T0 + 60n,
         funding: number = FUNDING,
         mem?: string,
         bind = true
@@ -2009,7 +2055,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await payleafCycle(
             slotThenLeaf,
             twoMemberTree(),
-            T0 + 1n,
+            T0 + 60n,
             FUNDING,
             SLOT3_MEM
         )
@@ -2027,7 +2073,7 @@ describe('K17Machine on-chain', function () {
         const r = await payleafCycle(
             assemble(['LIT', 500, 'TIME', 'PAYLEAF', 'YIELD']),
             twoMemberTree(),
-            T0 + 1n,
+            T0 + 60n,
             FUNDING,
             undefined,
             false
@@ -2052,7 +2098,7 @@ describe('K17Machine on-chain', function () {
         const plan = planCycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             [],
             NO_SIG,
@@ -2061,8 +2107,8 @@ describe('K17Machine on-chain', function () {
         )
         expect(plan.halted).to.be.true
         expect(plan.payslot).to.be.undefined
-        expect(plan.reward).to.equal(101n)
-        expect(plan.remaining).to.equal(BigInt(FUNDING) - 101n)
+        expect(plan.reward).to.equal(160n)
+        expect(plan.remaining).to.equal(BigInt(FUNDING) - 160n)
         // The same cycle on chain: the refund layout, no output 2.
         const r = await payleafCycle(prog, tree)
         expectFaultRefund(r, BigInt(FUNDING))
@@ -2159,7 +2205,7 @@ describe('K17Machine on-chain', function () {
         const r = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -2231,7 +2277,7 @@ describe('K17Machine on-chain', function () {
             const r = await cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -2269,7 +2315,7 @@ describe('K17Machine on-chain', function () {
             const r = await cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -2336,7 +2382,7 @@ describe('K17Machine on-chain', function () {
         const r = await memberCycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             'A',
             tree,
             reading
@@ -2374,7 +2420,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [5n],
@@ -2384,7 +2430,7 @@ describe('K17Machine on-chain', function () {
         )
         tree.set(INDEX_A, leafOf('A', 5n))
         const n1 = r1.next as K17Machine
-        const t2 = T0 + 2n
+        const t2 = T0 + 120n
         // Honest round-6 plan; the attacks reuse its reward and payout.
         const plan6 = planCycle(
             n1,
@@ -2591,7 +2637,7 @@ describe('K17Machine on-chain', function () {
         expect(m.rosterSeq).to.equal(0n)
 
         // cycle 1: ADMIT at ADMIT_INDEX with lastRound := TIME
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree)
         expect(r1.plan.halted).to.be.false
         expect(r1.plan.treeOp).to.equal('admit')
@@ -2608,7 +2654,7 @@ describe('K17Machine on-chain', function () {
         const r2 = await cycle(
             n1,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [reading],
@@ -2634,7 +2680,7 @@ describe('K17Machine on-chain', function () {
         // at the admission's own nLockTime and accepts it one second later.
         const tree = new SparseMerkleTree()
         const m = await deployTree(SMOKE_PROG(), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree)
         tree.set(ADMIT_INDEX, admittedLeaf(t1))
         const n1 = r1.next as K17Machine
@@ -2675,13 +2721,13 @@ describe('K17Machine on-chain', function () {
         ])
         const wtree = new SparseMerkleTree()
         const w = await deployTree(prog, wtree)
-        const w1 = await admitCycle(w, BigInt(FUNDING), T0 + 1n, wtree, {
+        const w1 = await admitCycle(w, BigInt(FUNDING), T0 + 60n, wtree, {
             witness: [5n],
         })
         wtree.set(ADMIT_INDEX, admittedLeaf(5n))
         const wn1 = w1.next as K17Machine
         expect(wn1.rosterRoot).to.equal(wtree.root())
-        const t2 = T0 + 2n
+        const t2 = T0 + 120n
         const plan6 = planCycle(
             wn1,
             w1.plan.remaining,
@@ -2740,7 +2786,7 @@ describe('K17Machine on-chain', function () {
         )
 
         // cycle 1: admit A (rosterSeq 0 -> 1)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree, {
             witness: [1n],
             sig: sig0,
@@ -2754,7 +2800,7 @@ describe('K17Machine on-chain', function () {
         const r2 = await cycle(
             n1,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [0n],
@@ -2777,7 +2823,7 @@ describe('K17Machine on-chain', function () {
         expect(n2.rosterSeq).to.equal(2n)
 
         // cycle 3: the original admission is stale by rosterSeq
-        const t3 = T0 + 3n
+        const t3 = T0 + 180n
         await expect(
             admitCycle(n2, r2.plan.remaining, t3, tree, {
                 witness: [1n],
@@ -2800,7 +2846,7 @@ describe('K17Machine on-chain', function () {
     it('an admission signed for the wrong rosterSeq is refused', async () => {
         const tree = new SparseMerkleTree()
         const m = await deployTree(SMOKE_PROG(), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const sig1 = admissionSig(
             sponsor,
             1n,
@@ -2821,7 +2867,7 @@ describe('K17Machine on-chain', function () {
     it("interpreter refuses an admission whose keyB is swapped for a stranger's key", async () => {
         const tree = new SparseMerkleTree()
         const m = await deployTree(SMOKE_PROG(), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const plan = planCycle(
             m,
             BigInt(FUNDING),
@@ -2868,7 +2914,7 @@ describe('K17Machine on-chain', function () {
             new Map([[ADMIT_INDEX, admittedLeaf(0n)]])
         )
         const m = await deployTree(SMOKE_PROG(), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const realPath = tree.proof(ADMIT_INDEX)
         const sigB = admissionSig(
             sponsor,
@@ -2952,7 +2998,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [],
@@ -2978,7 +3024,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 n1,
                 r1.plan.remaining,
-                T0 + 2n,
+                T0 + 120n,
                 keeperA,
                 {},
                 [],
@@ -2994,7 +3040,7 @@ describe('K17Machine on-chain', function () {
         const honest = await cycle(
             n1,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [],
@@ -3017,7 +3063,7 @@ describe('K17Machine on-chain', function () {
     it('interpreter refuses an admission signed by a key that is not the sponsor', async () => {
         const tree = new SparseMerkleTree()
         const m = await deployTree(SMOKE_PROG(), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         await expect(
             admitCycle(m, BigInt(FUNDING), t1, tree, { signer: attesterB })
         ).to.be.rejectedWith(/rejected/)
@@ -3058,7 +3104,7 @@ describe('K17Machine on-chain', function () {
             const r = await cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -3140,7 +3186,7 @@ describe('K17Machine on-chain', function () {
             cycle(
                 m,
                 BigInt(FUNDING),
-                T0 + 1n,
+                T0 + 60n,
                 keeperA,
                 {},
                 [],
@@ -3168,7 +3214,7 @@ describe('K17Machine on-chain', function () {
     it('REMOVE of an empty leaf is refused by the planner and the interpreter', async () => {
         const tree = twoMemberTree()
         const m = await deployTree(REMOVE_PROG(TAG_X), tree)
-        const t1 = T0 + 1n
+        const t1 = T0 + 60n
         const emptyPath = tree.proof(ADMIT_INDEX)
         expect(emptyPath.leafPre).to.equal('')
         // the planner refuses it (the VM needs a 120-hex-char preimage) ...
@@ -3270,7 +3316,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [5n],
@@ -3302,7 +3348,7 @@ describe('K17Machine on-chain', function () {
         cycle(
             n1,
             r1.plan.remaining,
-            T0 + 2n,
+            T0 + 120n,
             keeperA,
             {},
             [],
@@ -3396,7 +3442,7 @@ describe('K17Machine on-chain', function () {
         const r1 = await cycle(
             m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
             {},
             [0n],
@@ -3411,7 +3457,7 @@ describe('K17Machine on-chain', function () {
         expect(n1.rosterSeq).to.equal(1n)
 
         // cycle 2: admit A again at INDEX_A, same key and payout (1 -> 2)
-        const t2 = T0 + 2n
+        const t2 = T0 + 120n
         const r2 = await admitCycle(n1, r1.plan.remaining, t2, tree, {
             index: INDEX_A,
             witness: [1n],
@@ -3427,7 +3473,7 @@ describe('K17Machine on-chain', function () {
 
         // cycle 3: the seq-0 removal with a fresh proof is refused by the
         // planner ...
-        const t3 = T0 + 3n
+        const t3 = T0 + 180n
         const removeAt3 = (sig: RabinSig) =>
             cycle(
                 n2,
@@ -3556,5 +3602,196 @@ describe('K17Machine on-chain', function () {
         expectRefundAt(r, BigInt(FUNDING), 26n)
         expect(r.plan.treeOp).to.equal('none')
         expect(r.plan.nextState.rosterSeq).to.equal(0n)
+    })
+
+    // ------------------------------------------------------------------
+    // v3.1: dead-man halt and the 60 s minimum clock advance
+    // ------------------------------------------------------------------
+
+    /** Dead-man interval of the tests below: one hour. */
+    const DEAD_MAN = 3600n
+
+    /**
+     * Deploy `prog` with ECON plus a dead-man interval.
+     * Input: program hex, deadMan (seconds, 0n = off), optional roster
+     * tree settings (default the empty tree and no sponsor).
+     * Output: the deployed contract instance (lastTime = T0).
+     */
+    async function deployDeadMan(
+        prog: string,
+        deadMan: bigint,
+        tree: { rosterRoot?: string; sponsorKeyHash?: string } = {}
+    ): Promise<K17Machine> {
+        const m = newMachine(
+            prog,
+            { ...ECON, deadMan },
+            T0,
+            rosterOf(),
+            undefined,
+            TEST_ID,
+            tree
+        )
+        await m.connect(getDefaultSigner())
+        await m.deploy(FUNDING)
+        return m
+    }
+
+    /** Program that logs one witness cell per cycle: IN OUT YIELD, loop. */
+    const WAIT_IN = assemble(['IN', 'OUT', 'YIELD', 'LIT', 0, 'IF', 0])
+
+    /**
+     * The refund plan a keeper would send for `m` if the dead-man fired:
+     * the dead-man plan at lastTime + DEAD_MAN, which has the same outputs
+     * as at any lockTime from lastTime + 400 on (the reward is capped at
+     * 500). Input: a WAIT_IN machine with deadMan DEAD_MAN and FUNDING
+     * sats. Output: plan.
+     */
+    const deadManPlanFor = (m: K17Machine): CyclePlan =>
+        planCycle(m, BigInt(FUNDING), m.lastTime + DEAD_MAN, keeperA)
+
+    it('v3.1: newMachine stores deadMan and refuses a negative or too short one', () => {
+        expect(newMachine(WAIT_IN, ECON, T0).deadMan).to.equal(0n)
+        expect(
+            newMachine(WAIT_IN, { ...ECON, deadMan: DEAD_MAN }, T0).deadMan
+        ).to.equal(DEAD_MAN)
+        expect(() =>
+            newMachine(WAIT_IN, { ...ECON, deadMan: -1n }, T0)
+        ).to.throw(/negative/)
+        expect(() =>
+            newMachine(WAIT_IN, { ...ECON, deadMan: K17Machine.MIN_STEP }, T0)
+        ).to.throw(/MIN_STEP/)
+    })
+
+    it('v3.1: dead-man fires at exactly lastTime + deadMan on a machine blocked on IN, not one second earlier', async () => {
+        const m = await deployDeadMan(WAIT_IN, DEAD_MAN)
+        // One second early: the program runs and needs a witness.
+        expect(() =>
+            planCycle(m, BigInt(FUNDING), T0 + DEAD_MAN - 1n, keeperA)
+        ).to.throw(/needs a witness/)
+        // The interpreter agrees: the refund layout at T0 + deadMan - 1
+        // is refused because IN asserts a witness.
+        const plan = deadManPlanFor(m)
+        expect(plan.deadManHalt).to.be.true
+        expect(plan.halted).to.be.true
+        await expect(sendPlan(m, plan, T0 + DEAD_MAN - 1n)).to.be.rejectedWith(
+            /witness required/
+        )
+        // At exactly T0 + deadMan: no witness needed, refund plus reward.
+        const r = await cycle(m, BigInt(FUNDING), T0 + DEAD_MAN, keeperA)
+        expect(r.plan.deadManHalt).to.be.true
+        expect(r.plan.reward).to.equal(ECON.rewardMax)
+        expectFaultRefund(r, BigInt(FUNDING))
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(BigInt(r.tx.outputs[1].satoshis)).to.equal(ECON.rewardMax)
+        // nothing ran: the state is the deployed one
+        expect(r.plan.nextState.pc).to.equal(0n)
+        expect(r.plan.nextState.out).to.equal('')
+    })
+
+    it('v3.1: dead-man counts from the last live cycle and never fires when disabled', async () => {
+        // deadMan 0: a year of silence still needs the witness.
+        const off = await deployDeadMan(WAIT_IN, 0n)
+        const late = T0 + 365n * 86_400n
+        expect(() => planCycle(off, BigInt(FUNDING), late, keeperA)).to.throw(
+            /needs a witness/
+        )
+        // The refund layout (taken from a twin machine with a dead-man,
+        // same outputs: capped reward) is refused by the interpreter.
+        const twin = newMachine(
+            WAIT_IN,
+            { ...ECON, deadMan: DEAD_MAN },
+            T0,
+            rosterOf(),
+            undefined,
+            TEST_ID
+        )
+        await expect(
+            sendPlan(off, deadManPlanFor(twin), late)
+        ).to.be.rejectedWith(/witness required/)
+
+        // With a dead-man, a live cycle moves lastTime and so the deadline.
+        const m = await deployDeadMan(WAIT_IN, DEAD_MAN)
+        const t1 = T0 + 600n
+        const r1 = await cycle(m, BigInt(FUNDING), t1, keeperA, {}, [7n])
+        expect(r1.plan.deadManHalt).to.be.false
+        const n1 = r1.next as K17Machine
+        expect(n1.lastTime).to.equal(t1)
+        expect(n1.deadMan).to.equal(DEAD_MAN)
+        // T0 + deadMan is no longer enough ...
+        expect(() =>
+            planCycle(n1, r1.plan.remaining, T0 + DEAD_MAN, keeperA)
+        ).to.throw(/needs a witness/)
+        // ... t1 + deadMan is.
+        const r2 = await cycle(n1, r1.plan.remaining, t1 + DEAD_MAN, keeperA)
+        expect(r2.plan.deadManHalt).to.be.true
+        expectFaultRefund(r2, r1.plan.remaining)
+    })
+
+    it('v3.1: a tree machine blocked on MEMBER with an empty tree escapes via the dead-man', async () => {
+        const prog = assemble(['MEMBER', 'OUT', 'YIELD', 'LIT', 0, 'IF', 0])
+        const m = await deployDeadMan(prog, DEAD_MAN, {
+            sponsorKeyHash: keyHash(sponsor.pub),
+        })
+        expect(m.rosterRoot).to.equal(EMPTY_HASHES[16])
+        // No member exists, so nobody can supply a proof.
+        expect(() =>
+            planCycle(m, BigInt(FUNDING), T0 + 600n, keeperA)
+        ).to.throw(/needs a witness/)
+        // The dead-man cycle carries no tree arguments and still verifies.
+        const r = await cycle(m, BigInt(FUNDING), T0 + DEAD_MAN, keeperA)
+        expect(r.plan.deadManHalt).to.be.true
+        expect(r.plan.treeOp).to.equal('none')
+        expect(r.plan.leafPre).to.equal('')
+        expect(r.plan.proof).to.equal('')
+        expectFaultRefund(r, BigInt(FUNDING))
+    })
+
+    it('v3.1: a live cycle at lastTime + 59 is refused by the planner and the interpreter; + 60 is accepted', async () => {
+        // A program without TIME, so its next state does not depend on the
+        // clock: YIELD, then loop.
+        const prog = assemble(['YIELD', 'LIT', 0, 'IF', 0])
+        const m = await deploy(prog)
+        expect(() => planCycle(m, BigInt(FUNDING), T0 + 59n, keeperA)).to.throw(
+            /MIN_STEP/
+        )
+        // Build the +59 transaction by hand from the honest +60 plan: the
+        // next state with lastTime + 59 and the reward of 59 s.
+        const plan60 = planCycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        const next59 = (plan60.next as K17Machine).next()
+        next59.lastTime = T0 + 59n
+        const reward59 = ECON.rewardMin + 59n * ECON.slope
+        const plan59: CyclePlan = {
+            ...plan60,
+            next: next59,
+            reward: reward59,
+            remaining: BigInt(FUNDING) - reward59,
+        }
+        await expect(sendPlan(m, plan59, T0 + 59n)).to.be.rejectedWith(
+            /MIN_STEP/
+        )
+        // The honest cycle at + 60 verifies and keeps the machine alive.
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        expect(r.plan.halted).to.be.false
+        expect((r.next as K17Machine).lastTime).to.equal(T0 + 60n)
+    })
+
+    it('v3.1: a faulting or halting cycle at lastTime + 0 is accepted (refund path exempt from MIN_STEP)', async () => {
+        // A fault on the first instruction, at the deployment time itself.
+        const bad = await deploy(assemble(['DROP', 'HALT']))
+        const f = await cycle(bad, BigInt(FUNDING), T0, keeperA)
+        expectFaultRefund(f, BigInt(FUNDING))
+        expect(f.plan.reward).to.equal(ECON.rewardMin)
+        // HALT right after a live cycle, at that cycle's own lockTime.
+        const m = await deploy(assemble(['YIELD', 'HALT']))
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        expect(r1.plan.halted).to.be.false
+        const r2 = await cycle(
+            r1.next as K17Machine,
+            r1.plan.remaining,
+            T0 + 60n,
+            keeperA
+        )
+        expect(r2.plan.halted).to.be.true
+        expectFaultRefund(r2, r1.plan.remaining)
     })
 })
