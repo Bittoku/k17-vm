@@ -192,7 +192,10 @@ export interface CyclePlan {
     keyBHex: string
     /** `payout` argument of `step`: the ENDORSE payout or '' (hex). */
     payoutHex: string
-    /** The PAYSLOT payout this cycle (output 2); undefined when none. */
+    /**
+     * The PAYSLOT payout this cycle; undefined when none. Its output follows
+     * the keeper reward output when one exists (output 1 when the reward is 0).
+     */
     payslot?: PaySlot
     /** Next contract instance (undefined when halted). */
     next?: K17Machine
@@ -238,7 +241,17 @@ export function planCycle(
         value,
         instanceId: m.instanceId,
     }
-    const outcome = stepK(cur, env, K17Machine.K)
+    // The contract faults a machine whose instanceId is not 32 bytes before
+    // its first instruction; mirror that here.
+    const outcome = /^[0-9a-fA-F]{64}$/.test(m.instanceId)
+        ? stepK(cur, env, K17Machine.K)
+        : {
+              state: { ...cur, halted: true },
+              status: 'halted' as const,
+              witnessUsed: 0,
+              bountyDue: 0n,
+              payslot: undefined,
+          }
     if (outcome.status === 'need_witness') {
         throw new Error('cycle needs a witness cell the solver did not supply')
     }
@@ -310,7 +323,8 @@ export interface CycleOverrides {
  * outputs out exactly as the contract expects:
  *   output 0: next state, or P2PKH to the beneficiary when halted
  *   output 1: reward to the keeper (omitted when the reward is 0)
- *   output 2: PAYSLOT payout to the slot's address (omitted when none)
+ *   next:     PAYSLOT payout to the slot's address (omitted when none);
+ *             output 2, or output 1 when the reward is 0
  *   then:     change
  * Input: instance, plan, keeper address, overrides. Output: MethodCallOptions
  * to pass to `m.methods.step`.

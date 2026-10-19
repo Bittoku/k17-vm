@@ -502,6 +502,16 @@ describe('K17 VALUE, PAYSLOT and roster write-protection', function () {
         expect(initialState('', '11'.repeat(MEM_CELLS * 4)).mem).to.have.length(
             MEM_CELLS * 8
         )
+        // an uppercase image is stored lowercase, so roster slots compare
+        // the same way as on chain
+        const upper = withSlot(
+            initialState('').mem,
+            2,
+            slotCells('ab'.repeat(32), '12'.repeat(20))
+        ).toUpperCase()
+        const st = initialState('', upper)
+        expect(st.mem).to.equal(upper.toLowerCase())
+        expect(readSlot(st.mem, 2).hashHex).to.equal('ab'.repeat(32))
     })
 })
 

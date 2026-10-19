@@ -137,6 +137,11 @@ witness (keys, signatures) causes makes the transaction invalid.
 A fault that comes later in the cycle, after a `PAYSLOT` that succeeded,
 does not drop that payout.
 
+A program that takes `SLOT` (or `N`) from a witness with `IN` must check
+it with `VERIFY` (in range and filled) before `ATTEST` or `PAYSLOT`. If it
+does not, any keeper can supply a bad slot number, halt the machine with a
+fault, and still collect the auction reward.
+
 The reference VM does not know the balance rules of the contract, so it
 cannot see the last `PAYSLOT` fault. `planCycle` checks it and calculates
 the smaller reward with `rewardAt`, as the contract does.

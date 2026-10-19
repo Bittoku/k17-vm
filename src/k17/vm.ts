@@ -193,7 +193,8 @@ export interface StepResult {
  * Build the initial state for a program: empty stacks, memory zeroed or
  * taken from an optional pre-filled image.
  * Input: program hex; optional memory image hex of exactly MEM_CELLS * CELL * 2
- * characters (throws otherwise). Output: the starting K17State.
+ * characters (throws otherwise; either case, stored lowercase).
+ * Output: the starting K17State.
  */
 export function initialState(progHex: string, memHex?: string): K17State {
     if (
@@ -209,7 +210,9 @@ export function initialState(progHex: string, memHex?: string): K17State {
         pc: 0n,
         ds: '',
         rs: '',
-        mem: memHex ?? '00'.repeat(MEM_CELLS * CELL),
+        // Lowercase so the image matches the contract's byte comparisons
+        // and readSlot's hex comparisons.
+        mem: memHex?.toLowerCase() ?? '00'.repeat(MEM_CELLS * CELL),
         out: '',
         halted: false,
     }

@@ -25,7 +25,8 @@ publication belong in this repo.
   hash cells mean an empty slot. `!` into cell 152 or higher faults; only `ENDORSE` writes
   roster cells. Slot 0 is pre-filled through `newMachine(..., initialMemHex)`.
 - Instance binding: the contract has an immutable 32-byte `instanceId` (random by default in
-  `newMachine`; tests pass a fixed id; `step` asserts its length). ATTEST signs
+  `newMachine`; tests pass a fixed id; any other length faults the machine at its first
+  cycle). ATTEST signs
   `"K17M" || instanceId || cell(TAG) || cell(VAL)`; ENDORSE signs
   `"K17E" || instanceId || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout`. SIGVERIFY
   keeps `"K17A" || cell(TAG) || cell(VAL)`. Attesters read `instanceId` from the deployed
@@ -40,6 +41,9 @@ publication belong in this repo.
   `value - 1 - N` (down to 0), so a keeper cannot make a PAYSLOT fail by waiting. The VM does
   not do the balance check; `planCycle`/`rewardAt` mirror the contract. Keep `assert` for
   signature and key conditions only.
+- A program that takes `SLOT` (or `N`) from a witness must check it with `VERIFY` (in range
+  and filled) before `ATTEST` or `PAYSLOT`; otherwise any keeper can halt the machine with a
+  bad slot number and still collect the auction reward.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
   9 KB per instruction with the current 36 handlers (365 326 bytes at K=40). A cycle that

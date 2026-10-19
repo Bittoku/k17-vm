@@ -9,7 +9,7 @@
  */
 import { expect, use } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
-import { bsv, toByteString } from 'scrypt-ts'
+import { bsv, int2ByteString, toByteString } from 'scrypt-ts'
 import { RabinSig } from 'scrypt-ts-lib'
 import { K17Machine } from '../src/contracts/k17Machine'
 import {
@@ -345,22 +345,19 @@ describe('K17Machine on-chain', function () {
         ).to.equal(beneficiaryAddress.toString())
     })
 
-    it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
-        // IN, VERIFY, SIGVERIFY, ATTEST and ENDORSE make a transaction
-        // invalid by design, so they are left out of the random op set;
-        // everything else (PAYSLOT and VALUE included: they only fault or
-        // succeed) must always verify.
-        const ops = (
-            Object.values(Op).filter((v) => typeof v === 'number') as number[]
-        ).filter(
-            (v) =>
-                v !== Op.IN &&
-                v !== Op.VERIFY &&
-                v !== Op.SIGVERIFY &&
-                v !== Op.ATTEST &&
-                v !== Op.ENDORSE
-        )
-        let seed = 12345
+    /** Every opcode value of the ISA. */
+    const ALL_OPS = Object.values(Op).filter(
+        (v) => typeof v === 'number'
+    ) as number[]
+
+    /**
+     * Differential fuzz: deploy 12 random 24-instruction programs over `ops`
+     * with memory image `mem` and step each up to 6 cycles; every cycle goes
+     * through cycle(), so every one must pass verifyInputScript.
+     * Input: op set, memory image, PRNG seed. Output: none (throws on a
+     * cycle that does not verify).
+     */
+    async function fuzz(ops: number[], mem: string, seed: number) {
         const rnd = (n: number) => {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
             return seed % n
@@ -376,8 +373,7 @@ describe('K17Machine on-chain', function () {
                 }
             }
             const prog = Buffer.from(bytes).toString('hex')
-            // every roster slot filled, so random PAYSLOTs can succeed
-            const m = await deploy(prog, FUNDING, FULL_ROSTER_MEM)
+            const m = await deploy(prog, FUNDING, mem)
             let cur: K17Machine | undefined = m
             let value = BigInt(FUNDING)
             let t = T0
@@ -388,6 +384,32 @@ describe('K17Machine on-chain', function () {
                 cur = r.next
             }
         }
+    }
+
+    it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
+        // IN, VERIFY, SIGVERIFY, ATTEST and ENDORSE can make a transaction
+        // invalid by design, so they are left out of the random op set;
+        // everything else (PAYSLOT and VALUE included: they only fault or
+        // succeed) must always verify. Every roster slot is filled, so
+        // random PAYSLOTs can succeed.
+        const ops = ALL_OPS.filter(
+            (v) =>
+                v !== Op.IN &&
+                v !== Op.VERIFY &&
+                v !== Op.SIGVERIFY &&
+                v !== Op.ATTEST &&
+                v !== Op.ENDORSE
+        )
+        await fuzz(ops, FULL_ROSTER_MEM, 12345)
+    })
+
+    it('differential fuzz on an empty roster: ATTEST and ENDORSE only fault', async () => {
+        // With every roster slot empty, every ATTEST and ENDORSE path faults
+        // before it needs a key or a signature, so they join the op set.
+        const ops = ALL_OPS.filter(
+            (v) => v !== Op.IN && v !== Op.VERIFY && v !== Op.SIGVERIFY
+        )
+        await fuzz(ops, '00'.repeat(MEM_CELLS * CELL), 54321)
     })
 
     it('output log cap faults the heartbeat after OUT_MAX cycles worth of entries', async () => {
@@ -1327,14 +1349,182 @@ describe('K17Machine on-chain', function () {
         }
     })
 
-    it('step refuses a machine whose instance id is not 32 bytes', async () => {
-        // Bypass newMachine's check to build a malformed instance.
-        const m = newMachine(heartbeatProgram(), ECON, T0, rosterOf())
-        ;(m as unknown as { instanceId: string }).instanceId = 'ab'.repeat(31)
+    it('a machine whose instance id is not 32 bytes faults and refunds the beneficiary', async () => {
+        // Built with the constructor directly: newMachine refuses such an id.
+        const s0 = initialState(heartbeatProgram())
+        const m = new K17Machine(
+            toByteString(s0.prog),
+            ECON.beneficiary,
+            ECON.rewardMin,
+            ECON.slope,
+            ECON.rewardMax,
+            rosterOf(),
+            toByteString('ab'.repeat(31)),
+            s0.pc,
+            toByteString(s0.ds),
+            toByteString(s0.rs),
+            toByteString(s0.mem),
+            toByteString(s0.out),
+            T0
+        )
         await m.connect(getDefaultSigner())
         await m.deploy(FUNDING)
-        await expect(
-            cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
-        ).to.be.rejectedWith(/instanceId must be 32 bytes/)
+        // cycle() runs verifyInputScript on the refund transaction
+        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r.plan.halted).to.be.true
+        expect(outputLog(r.plan.nextState)).to.deep.equal([]) // no step ran
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - r.plan.reward
+        )
+    })
+
+    // ---- tampered unlocking scripts, judged by the script interpreter ----
+
+    /**
+     * Replace one data push in the unlocking script of input `inputIndex`
+     * and re-attach the script, so the Bitcoin script interpreter (not the
+     * scrypt-ts JS evaluation) judges the change.
+     * Input: transaction, input index, hex of the push to replace (must
+     * match exactly one non-empty push), hex of the new push.
+     * Output: none (mutates tx). Throws when the push is not found once.
+     */
+    function tamperPush(
+        tx: bsv.Transaction,
+        inputIndex: number,
+        fromHex: string,
+        toHex: string
+    ): void {
+        const input = tx.inputs[inputIndex]
+        const chunks = input.script.chunks
+        const hits = chunks
+            .map((c, i) =>
+                c.buf && c.buf.toString('hex') === fromHex ? i : -1
+            )
+            .filter((i) => i >= 0)
+        if (hits.length !== 1) {
+            throw new Error(
+                `push ${fromHex.slice(0, 16)}... found ${hits.length} times`
+            )
+        }
+        const replacement = new bsv.Script('')
+        replacement.add(Buffer.from(toHex, 'hex'))
+        const rebuilt = new bsv.Script('')
+        chunks.forEach((c, i) => {
+            rebuilt.chunks.push(i === hits[0] ? replacement.chunks[0] : c)
+        })
+        input.setScript(rebuilt)
+    }
+
+    /** Assert that the script interpreter refuses input `i` of `tx`. */
+    function expectScriptRefused(tx: bsv.Transaction, i = 0): void {
+        expect(tx.verifyInputScript(i).success).to.equal(false)
+    }
+
+    it('interpreter refuses a tampered keyA on an honest ATTEST cycle (wrong key, 383 bytes)', async () => {
+        const honest = async () => {
+            const m = await deploy(ATTEST0, FUNDING, SPONSOR_MEM)
+            return cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                ATTEST0_SIG(m.instanceId),
+                {
+                    attestKey: sponsor.pub,
+                }
+            )
+        }
+        const keyA = pubKeyBytes(sponsor.pub)
+        const wrong = await honest()
+        expect(wrong.tx.verifyInputScript(0).success).to.equal(true)
+        tamperPush(wrong.tx, 0, keyA, pubKeyBytes(landowner.pub))
+        expectScriptRefused(wrong.tx)
+        const short = await honest()
+        tamperPush(short.tx, 0, keyA, keyA.slice(0, 766))
+        expectScriptRefused(short.tx)
+    })
+
+    it('interpreter refuses a swapped payout or keyB on an honest ENDORSE cycle', async () => {
+        const honest = async () => {
+            const m = await deploy(
+                enrolAndAttestProgram(TAG_E, TAG_A, BOUNTY),
+                FUNDING,
+                SPONSOR_MEM
+            )
+            return cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                endorsementFor(1n, m.instanceId),
+                ENDORSE_KEYS
+            )
+        }
+        const payoutSwap = await honest()
+        tamperPush(payoutSwap.tx, 0, LANDOWNER_PAYOUT, '22'.repeat(20))
+        expectScriptRefused(payoutSwap.tx)
+        const keyBSwap = await honest()
+        tamperPush(
+            keyBSwap.tx,
+            0,
+            pubKeyBytes(landowner.pub),
+            pubKeyBytes(sponsor.pub)
+        )
+        expectScriptRefused(keyBSwap.tx)
+    })
+
+    it('interpreter refuses an ATTEST signature made for instance A on instance B', async () => {
+        const idA = 'aa'.repeat(32)
+        const idB = 'bb'.repeat(32)
+        // pick a tag whose two signatures have distinct, non-empty paddings,
+        // so each push is unique in the unlocking script
+        let tag = 5
+        const sigsFor = (t: number) => ({
+            a: signReadingFor(sponsor, idA, BigInt(t), 2231n),
+            b: signReadingFor(sponsor, idB, BigInt(t), 2231n),
+        })
+        let sigs = sigsFor(tag)
+        while (
+            sigs.a.padding === '' ||
+            sigs.b.padding === '' ||
+            sigs.a.padding === sigs.b.padding
+        ) {
+            sigs = sigsFor(++tag)
+        }
+        const prog = assemble([
+            'LIT',
+            tag,
+            'LIT',
+            2231,
+            'LIT',
+            0,
+            'ATTEST',
+            'YIELD',
+        ])
+        const b = newMachine(prog, ECON, T0, rosterOf(), SPONSOR_MEM, idB)
+        await b.connect(getDefaultSigner())
+        await b.deploy(FUNDING)
+        const r = await cycle(
+            b,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            sigs.b,
+            {
+                attestKey: sponsor.pub,
+            }
+        )
+        tamperPush(r.tx, 0, int2ByteString(sigs.b.s), int2ByteString(sigs.a.s))
+        tamperPush(r.tx, 0, sigs.b.padding, sigs.a.padding)
+        expectScriptRefused(r.tx)
     })
 })

@@ -8,9 +8,10 @@
  *      or faulted during those K instructions), and
  *   2. output 1 pays the spender ("keeper") the reward that the liveness
  *      Dutch auction permits at this transaction's nLockTime, and
- *   3. output 2 pays the roster slot named by PAYSLOT, if the cycle ran one,
- *      and no satoshis leave the machine except the reward and that payout,
- *      and
+ *   3. the payout output pays the roster slot named by PAYSLOT, if the cycle
+ *      ran one; it follows the keeper reward output when one exists (it is
+ *      output 1 when the reward is 0), and no satoshis leave the machine
+ *      except the reward and that payout, and
  *   4. the machine is input 0, so two machines can never share one output set.
  *
  * Job bounties: a program may read witness cells from the unlocking script
@@ -152,7 +153,8 @@ export class K17Machine extends SmartContract {
      * 32-byte id of this machine instance (random by default, see
      * newMachine). ATTEST and ENDORSE messages include it, so a signature
      * made for one machine cannot be replayed into another machine that
-     * shares a roster key. `step` refuses any other length.
+     * shares a roster key. Any other length faults the machine at its
+     * first cycle (refund to the beneficiary).
      */
     @prop()
     readonly instanceId: ByteString
@@ -276,7 +278,6 @@ export class K17Machine extends SmartContract {
         keyB: ByteString,
         payout: ByteString
     ) {
-        assert(len(this.instanceId) == 32n, 'instanceId must be 32 bytes')
         const progLen = len(this.prog)
         const value = this.ctx.utxo.value
         const witnessLen = len(witness)
@@ -287,7 +288,9 @@ export class K17Machine extends SmartContract {
         let rs = this.rs
         let mem = this.mem
         let outLog = this.outLog
-        let halted = false
+        // A malformed deployment (instanceId not 32 bytes) faults before the
+        // first instruction, so its balance is refunded, never frozen.
+        let halted = len(this.instanceId) != 32n
         let yielded = false
         let wi = 0n
         let bountyDue = 0n
