@@ -1532,6 +1532,7 @@ describe('K17 v3 ADMIT and REMOVE', function () {
             admitEnv(tree),
             40
         )
+        expect(first.status).to.equal('ok')
         tree.set(NEW_INDEX, newcomerLeaf(ADMIT_ROUND))
         const payEnv = (): StepEnv => ({
             ...envOf(0n),
@@ -1631,6 +1632,7 @@ describe('K17 v3 ADMIT and REMOVE', function () {
             'attestKey',
             'endorseKey',
             'payout',
+            'instanceId',
         ]) {
             const r = stepK(
                 s,
@@ -1649,6 +1651,94 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         )
         // second ADMIT: a member/admin op was already bound, so it faults
         expect(twice.status).to.equal('halted')
+        expect(twice.treeOp).to.equal('admit')
+        expect(twice.state.pc).to.equal(21n)
+    })
+
+    it('ADMIT with the signature already used this cycle is need_witness', () => {
+        const tree = buildTree()
+        const s = {
+            ...machine(['ADMIT', 'HALT'], tree.root()),
+            ds: encodeCell(TAG) + encodeCell(ADMIT_ROUND),
+        }
+        const r = step(s, admitEnv(tree), 0, 0n, true)
+        expect(r.status).to.equal('need_witness')
+        expect(r.state).to.equal(s)
+    })
+
+    it('ADMIT over a filled slot with an empty preimage and its real siblings is verify_failed', () => {
+        const tree = buildTree()
+        const s = machine(ADMIT_PROG, tree.root())
+        const r = stepK(
+            s,
+            admitEnv(tree, OLD_INDEX, 0n, {
+                tree: { ...tree.proof(OLD_INDEX), leafPre: '' },
+            }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+        expect(r.state.rosterRoot).to.equal(tree.root())
+        expect(r.state.rosterSeq).to.equal(0n)
+    })
+
+    describe('substitution under one genuine sponsor signature', () => {
+        const OTHER_EMPTY_INDEX = 777
+        const attack = (
+            extra: (tree: SparseMerkleTree) => Partial<StepEnv>,
+            program: (string | number)[] = ADMIT_PROG
+        ) => {
+            const tree = buildTree()
+            const r = stepK(
+                machine(program, tree.root()),
+                admitEnv(tree, NEW_INDEX, 0n, extra(tree)),
+                40
+            )
+            expect(r.status).to.equal('verify_failed')
+            expect(r.state.rosterRoot).to.equal(tree.root())
+            expect(r.state.rosterSeq).to.equal(0n)
+        }
+        it('swapped endorseKey', () =>
+            attack(() => ({ endorseKey: stranger.pub })))
+        it('swapped payout', () => attack(() => ({ payout: '78'.repeat(20) })))
+        it('swapped proof and leafIndex to another empty index', () =>
+            attack((tree) => ({ tree: tree.proof(OTHER_EMPTY_INDEX) })))
+        it('different TAG on the stack', () =>
+            attack(() => ({}), ['LIT', 6, 'LIT', 6, 'ADMIT', 'HALT']))
+        it('attestKey is the sponsor but a stranger produced the signature', () =>
+            attack(() => ({
+                sig: signAdmission(
+                    stranger,
+                    ID,
+                    TAG,
+                    0n,
+                    BigInt(NEW_INDEX),
+                    newcomer.pub,
+                    NEW_PAYOUT
+                ),
+            })))
+    })
+
+    it('an uppercase payout is rejected even under a signature that covers it', () => {
+        const tree = buildTree()
+        const upper = NEW_PAYOUT.replace(/7/g, 'A')
+        const r = stepK(
+            machine(ADMIT_PROG, tree.root()),
+            admitEnv(tree, NEW_INDEX, 0n, {
+                payout: upper,
+                sig: signAdmission(
+                    sponsor,
+                    ID,
+                    TAG,
+                    0n,
+                    BigInt(NEW_INDEX),
+                    newcomer.pub,
+                    upper
+                ),
+            }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+        expect(r.state.rosterRoot).to.equal(tree.root())
     })
 
     it('ADMIT faults on a short stack', () => {
