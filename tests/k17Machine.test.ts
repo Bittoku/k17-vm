@@ -2796,4 +2796,124 @@ describe('K17Machine on-chain', function () {
         await runOnce(['LIT', 1, 'ADMIT', 'YIELD'])
         await runOnce(['REMOVE', 'YIELD'])
     })
+
+    /** Program for the REMOVE tamper tests: remove, yield, halt. */
+    const REMOVE_PROG = (tag: number): string =>
+        assemble(['LIT', tag, 'REMOVE', 'YIELD', 'HALT'])
+
+    /**
+     * Removal signature of the TEST_ID instance at rosterSeq 0.
+     * Input: signer, tag, leaf index, leaf hash hex. Output: Rabin signature.
+     */
+    const removalSig = (
+        signer: Attester,
+        tag: number,
+        index: number,
+        leafHashHex: string
+    ): RabinSig =>
+        signRemoval(
+            signer,
+            TEST_ID,
+            BigInt(tag),
+            0n,
+            BigInt(index),
+            leafHashHex
+        )
+
+    it('interpreter refuses a REMOVE signed by a key that is not the sponsor', async () => {
+        const leafHashA = leafHashOf(leafOf('A', 0n))
+        // a tag for which the sponsor's and attesterB's signatures over the
+        // same removeMessage have unique, non-empty pushes
+        let tag = 2000
+        while (
+            !swappable(
+                removalSig(sponsor, tag, INDEX_A, leafHashA),
+                removalSig(attesterB, tag, INDEX_A, leafHashA)
+            )
+        ) {
+            tag++
+        }
+        const tree = twoMemberTree()
+        const m = await deployTree(REMOVE_PROG(tag), tree)
+        const removeA = (signer: Attester) =>
+            cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                removalSig(signer, tag, INDEX_A, leafHashA),
+                { attestKey: signer.pub },
+                tree.proof(INDEX_A)
+            )
+        await expect(removeA(attesterB)).to.be.rejectedWith(/rejected/)
+        // attesterB's signature verifies under attesterB's key, so only
+        // sha256(keyA) == sponsorKeyHash can refuse the swapped cycle.
+        const honest = await removeA(sponsor)
+        const sigS = honest.plan.sig
+        const sigB = removalSig(attesterB, tag, INDEX_A, leafHashA)
+        tamperPush(
+            honest.tx,
+            0,
+            pubKeyBytes(sponsor.pub),
+            pubKeyBytes(attesterB.pub)
+        )
+        tamperPush(honest.tx, 0, int2ByteString(sigS.s), int2ByteString(sigB.s))
+        tamperPush(honest.tx, 0, sigS.padding, sigB.padding)
+        expectScriptRefused(honest.tx)
+    })
+
+    it('REMOVE of an empty leaf is refused (leaf preimage must be 60 bytes)', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(REMOVE_PROG(TAG_X), tree)
+        const t1 = T0 + 1n
+        const emptyPath = tree.proof(ADMIT_INDEX)
+        expect(emptyPath.leafPre).to.equal('')
+        // the planner refuses it (the VM needs a 120-hex-char preimage) ...
+        await expect(
+            cycle(
+                m,
+                BigInt(FUNDING),
+                t1,
+                keeperA,
+                {},
+                [],
+                removalSig(sponsor, TAG_X, ADMIT_INDEX, '00'.repeat(32)),
+                { attestKey: sponsor.pub },
+                emptyPath
+            )
+        ).to.be.rejectedWith(/rejected/)
+        // ... and so does the interpreter. Start from an honest removal of
+        // A (same time, same reward), then present the empty index with
+        // leafPre '' and its real path. The old-root walk accepts the empty
+        // leaf. The sponsor signs the message that a contract without the
+        // length check would build (leaf hash sha256("K17L")), and the
+        // outputs carry the root it would compute (unchanged) and
+        // rosterSeq 1. Only the leafPre length check can refuse it.
+        const planA = planCycle(
+            m,
+            BigInt(FUNDING),
+            t1,
+            keeperA,
+            [],
+            removalSig(sponsor, TAG_X, INDEX_A, leafHashOf(leafOf('A', 0n))),
+            { attestKey: sponsor.pub },
+            tree.proof(INDEX_A)
+        )
+        expect(
+            (await buildStepTx(m, planA, t1, '')).verifyInputScript(0).success
+        ).to.equal(true)
+        const emptyNext = (planA.next as K17Machine).next()
+        emptyNext.rosterRoot = toByteString(tree.root())
+        emptyNext.rosterSeq = 1n
+        const emptyPlan: CyclePlan = {
+            ...planA,
+            sig: removalSig(sponsor, TAG_X, ADMIT_INDEX, sha256Hex('4b31374c')),
+            leafPre: '',
+            proof: emptyPath.proof,
+            leafIndex: BigInt(ADMIT_INDEX),
+        }
+        expectScriptRefused(await buildStepTx(m, emptyPlan, t1, '', emptyNext))
+    })
 })
