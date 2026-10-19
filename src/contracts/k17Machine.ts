@@ -299,6 +299,13 @@ export class K17Machine extends SmartContract {
         let payslotSats = 0n
         // Placeholder until PAYSLOT runs; only read when payslotUsed.
         let payslotAddr: Addr = this.beneficiary
+        // SIGVERIFY, ATTEST and ENDORSE record the message and key here
+        // instead of calling RabinVerifier themselves. sigUsed allows one
+        // signature per cycle, so one verification after the unrolled loop
+        // covers it and the verifier appears once in the script.
+        let verifyNeeded = false
+        let verifyMsg = toByteString('')
+        let verifyKey: RabinPubKey = 0n
 
         for (let i = 0; i < K17Machine.K; i++) {
             if (!halted && !yielded) {
@@ -328,13 +335,6 @@ export class K17Machine extends SmartContract {
                     if (!decodeOk) {
                         halted = true
                     } else {
-                        // SIGVERIFY, ATTEST and ENDORSE set these instead of
-                        // calling RabinVerifier themselves; the one check
-                        // after the handlers keeps a single verifier per
-                        // unrolled step in the script.
-                        let verifyNeeded = false
-                        let verifyMsg = toByteString('')
-                        let verifyKey: RabinPubKey = 0n
                         const n = len(ds)
                         const r = len(rs)
                         // Top two data cells, valid only when n >= 8.
@@ -799,23 +799,20 @@ export class K17Machine extends SmartContract {
                             halted = true
                         }
 
-                        if (verifyNeeded) {
-                            assert(
-                                RabinVerifier.verifySig(
-                                    verifyMsg,
-                                    sig,
-                                    verifyKey
-                                ),
-                                'signature check failed'
-                            )
-                        }
-
                         if (!halted) {
                             pc = nextPc
                         }
                     }
                 }
             }
+        }
+
+        // ---- the cycle's one signature --------------------------------
+        if (verifyNeeded) {
+            assert(
+                RabinVerifier.verifySig(verifyMsg, sig, verifyKey),
+                'signature check failed'
+            )
         }
 
         // ---- anti output-sharing ------------------------------------

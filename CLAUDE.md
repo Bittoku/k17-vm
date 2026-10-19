@@ -46,7 +46,7 @@ publication belong in this repo.
   bad slot number and still collect the auction reward.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  9 KB per instruction with the current 36 handlers (365 326 bytes at K=40). A cycle that
+  9 KB per instruction with the current 36 handlers (360 044 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile
