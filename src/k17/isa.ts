@@ -48,7 +48,11 @@
  * occupies cells 152..255 and programs use cells 0..151.
  *
  * Roster instructions (stack effects; semantics arrive with the machine):
- *   ATTEST  (0x20)  see the v2 machine; verifies an attested reading
+ *   ATTEST  (0x20)  TAG VAL SLOT --  verifies, with the key the transaction supplies,
+ *                   that the key's hash equals roster slot SLOT's hash and that its Rabin
+ *                   signature covers cell(TAG)||cell(VAL); faults on underflow, SLOT >=
+ *                   ROSTER_SLOTS or an empty slot; invalid transaction without a witness,
+ *                   with a second signature in one cycle, or on a hash or signature mismatch
  *   ENDORSE (0x21)  see the v2 machine; verifies a roster endorsement
  *   PAYSLOT (0x22)  N SLOT --  pays N sats to roster slot SLOT's payout; faults on
  *                   underflow, SLOT >= ROSTER_SLOTS or an empty slot; a second

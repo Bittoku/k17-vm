@@ -29,6 +29,7 @@ import {
     stepK,
     outputLog,
     envOf,
+    StepEnv,
     hashCell,
     readSlot,
     withSlot,
@@ -51,7 +52,7 @@ import {
     payoutOf,
 } from '../src/k17/attest'
 import { RabinVerifier } from 'scrypt-ts-lib'
-import { bsv, toByteString } from 'scrypt-ts'
+import { bsv, toByteString, Utils } from 'scrypt-ts'
 
 describe('K17 ISA encoding', () => {
     it('round-trips cells', () => {
@@ -490,5 +491,112 @@ describe('K17 roster key encoding and endorsement', function () {
                 endorser.pub
             )
         ).to.equal(false)
+    })
+})
+
+describe('K17 ATTEST against a roster slot', function () {
+    this.timeout(120_000)
+    const attester = newAttester(Buffer.alloc(32, 21))
+    const stranger = newAttester(Buffer.alloc(32, 22))
+    const payout = 'ab'.repeat(20)
+    const prog = assemble(['LIT', 5, 'LIT', 2231, 'LIT', 1, 'ATTEST', 'HALT'])
+    /** Single-step until an instruction does not return 'ok'; returns that StepResult. */
+    const stepUntilStop = (
+        start: ReturnType<typeof initialState>,
+        env: StepEnv
+    ) => {
+        let cur = start
+        for (;;) {
+            const r = step(cur, env)
+            if (r.status !== 'ok') return r
+            cur = r.state
+        }
+    }
+    const installed = () => {
+        const s = initialState(prog)
+        return {
+            ...s,
+            mem: withSlot(s.mem, 1, slotCells(keyHash(attester.pub), payout)),
+        }
+    }
+
+    it('encodes keys as the contract will read them', function () {
+        expect(
+            Utils.fromLEUnsigned(toByteString(pubKeyBytes(attester.pub)))
+        ).to.equal(attester.pub)
+    })
+
+    it('accepts the slot key signing the reading and pops the three cells', function () {
+        const r = run(installed(), {
+            ...envOf(0n),
+            sig: signReading(attester, 5n, 2231n),
+            attestKey: attester.pub,
+        })
+        expect(r.status).to.equal('halted')
+        expect(r.state.ds).to.equal('')
+    })
+
+    it('rejects a key whose hash is not the slot hash', function () {
+        const r = run(installed(), {
+            ...envOf(0n),
+            sig: signReading(stranger, 5n, 2231n),
+            attestKey: stranger.pub,
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('rejects a signature over a different value', function () {
+        const r = run(installed(), {
+            ...envOf(0n),
+            sig: signReading(attester, 5n, 2232n),
+            attestKey: attester.pub,
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('faults on an empty slot and on a slot beyond the roster', function () {
+        const env = {
+            ...envOf(0n),
+            sig: signReading(attester, 5n, 2231n),
+            attestKey: attester.pub,
+        }
+        expect(stepUntilStop(initialState(prog), env).faulted).to.equal(true)
+        const high = assemble(['LIT', 5, 'LIT', 2231, 'LIT', 8, 'ATTEST'])
+        expect(stepUntilStop(initialState(high), env).faulted).to.equal(true)
+        const shallow = assemble(['LIT', 2231, 'LIT', 1, 'ATTEST'])
+        expect(stepUntilStop(initialState(shallow), env).faulted).to.equal(true)
+    })
+
+    it('needs a witness without a signature or a key, or after one is used', function () {
+        const sig = signReading(attester, 5n, 2231n)
+        expect(
+            run(installed(), { ...envOf(0n), attestKey: attester.pub }).status
+        ).to.equal('need_witness')
+        expect(run(installed(), { ...envOf(0n), sig }).status).to.equal(
+            'need_witness'
+        )
+        const twice = assemble([
+            'LIT',
+            5,
+            'LIT',
+            2231,
+            'LIT',
+            1,
+            'ATTEST',
+            'LIT',
+            5,
+            'LIT',
+            2231,
+            'LIT',
+            1,
+            'ATTEST',
+            'HALT',
+        ])
+        const s = initialState(twice)
+        const r = run(
+            { ...s, mem: installed().mem },
+            { ...envOf(0n), sig, attestKey: attester.pub }
+        )
+        expect(r.status).to.equal('need_witness')
     })
 })

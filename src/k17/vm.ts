@@ -32,6 +32,7 @@ import {
     encodeCell,
     slotOffset,
 } from './isa'
+import { keyHash } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
 export interface K17State {
@@ -63,6 +64,8 @@ export interface StepEnv {
     roster?: RabinPubKey[]
     /** The one Rabin signature carried by this transaction (SIGVERIFY). */
     sig?: RabinSig
+    /** The Rabin public key `sig` is made under (ATTEST); its hash must match the slot. */
+    attestKey?: RabinPubKey
     /** Balance of the machine output being spent, in satoshis (VALUE); default 0. */
     value?: bigint
 }
@@ -513,6 +516,29 @@ export function step(
             const value = pop()
             const tag = pop()
             if (!verifyAttestation(tag, value, e.sig, pub)) {
+                return unchanged('verify_failed')
+            }
+            su = true
+            break
+        }
+        case Op.ATTEST: {
+            // TAG VAL SLOT --   the environment's key must hash to the slot's
+            // key hash and its signature must cover cell(TAG)||cell(VAL)
+            if (dsDepth < 3) return fault()
+            const slot = cellAt(ds, dsDepth - 1)
+            if (slot >= BigInt(ROSTER_SLOTS)) return fault()
+            const entry = readSlot(mem, Number(slot))
+            if (entry.empty) return fault()
+            if (su || !e.sig || e.attestKey === undefined) {
+                return unchanged('need_witness')
+            }
+            if (keyHash(e.attestKey) !== entry.hashHex) {
+                return unchanged('verify_failed')
+            }
+            pop()
+            const value = pop()
+            const tag = pop()
+            if (!verifyAttestation(tag, value, e.sig, e.attestKey)) {
                 return unchanged('verify_failed')
             }
             su = true
