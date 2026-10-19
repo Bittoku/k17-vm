@@ -45,7 +45,7 @@ import {
     bindCycleBuilder,
     newMachine,
     planCycle,
-    defaultInstanceId,
+    randomInstanceId,
     rosterOf,
     CyclePlan,
     CycleKeys,
@@ -78,6 +78,9 @@ const ECON = {
     rewardMax: 500n,
 }
 
+/** Fixed instance id for deterministic tests (newMachine defaults to random). */
+const TEST_ID = '5a'.repeat(32)
+
 /** Memory image with every roster slot filled (for the differential fuzz). */
 const FULL_ROSTER_MEM = [0, 1, 2, 3, 4, 5, 6, 7].reduce(
     (mem, slot) =>
@@ -103,7 +106,7 @@ async function deploy(
     funding: number = FUNDING,
     initialMemHex?: string
 ): Promise<K17Machine> {
-    const m = newMachine(prog, ECON, T0, rosterOf(), initialMemHex)
+    const m = newMachine(prog, ECON, T0, rosterOf(), initialMemHex, TEST_ID)
     await m.connect(getDefaultSigner())
     await m.deploy(funding)
     return m
@@ -641,7 +644,14 @@ describe('K17Machine on-chain', function () {
 
     /** Deploy the attest smoke program bound to slot `k`. */
     async function deployAttest(k: number): Promise<K17Machine> {
-        const m = newMachine(attestProgram(k), ECON, T0, ROSTER)
+        const m = newMachine(
+            attestProgram(k),
+            ECON,
+            T0,
+            ROSTER,
+            undefined,
+            TEST_ID
+        )
         await m.connect(getDefaultSigner())
         await m.deploy(FUNDING)
         return m
@@ -1303,13 +1313,28 @@ describe('K17Machine on-chain', function () {
         expect(r.plan.halted).to.be.false
     })
 
-    it('newMachine derives the default instance id and rejects a malformed one', () => {
-        const m = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
-        expect(m.instanceId).to.equal(
-            defaultInstanceId(ATTEST0, SPONSOR_MEM, T0)
-        )
-        expect(() =>
-            newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM, 'ab')
-        ).to.throw(/32 bytes/)
+    it('newMachine draws a random instance id and rejects a malformed one', () => {
+        const m1 = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
+        const m2 = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
+        expect(m1.instanceId).to.match(/^[0-9a-f]{64}$/)
+        // identical deployments in the same second still differ
+        expect(m1.instanceId).to.not.equal(m2.instanceId)
+        expect(randomInstanceId()).to.match(/^[0-9a-f]{64}$/)
+        for (const bad of ['ab', 'AB'.repeat(32), 'zz'.repeat(32)]) {
+            expect(() =>
+                newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM, bad)
+            ).to.throw(/64 lowercase hex/)
+        }
+    })
+
+    it('step refuses a machine whose instance id is not 32 bytes', async () => {
+        // Bypass newMachine's check to build a malformed instance.
+        const m = newMachine(heartbeatProgram(), ECON, T0, rosterOf())
+        ;(m as unknown as { instanceId: string }).instanceId = 'ab'.repeat(31)
+        await m.connect(getDefaultSigner())
+        await m.deploy(FUNDING)
+        await expect(
+            cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        ).to.be.rejectedWith(/instanceId must be 32 bytes/)
     })
 })

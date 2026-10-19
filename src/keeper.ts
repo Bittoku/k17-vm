@@ -20,7 +20,7 @@ import {
     bsv,
     toByteString,
 } from 'scrypt-ts'
-import { createHash, randomBytes } from 'crypto'
+import { randomBytes } from 'crypto'
 import { RabinPubKey, RabinSig } from 'scrypt-ts-lib'
 import { K17Machine, FIXED_ROSTER_SLOTS } from './contracts/k17Machine'
 import {
@@ -59,19 +59,12 @@ export function rosterOf(keys: RabinPubKey[] = []): Roster {
 }
 
 /**
- * Default instance id of a machine: sha256 over the program bytes, the
- * initial memory image and cell(deployTime).
- * Input: program hex, memory image hex (MEM_CELLS cells), deployment time.
- * Output: 64 lowercase hex chars.
+ * Fresh random instance id for a new machine. Random rather than derived
+ * from the deployment, so two identical deployments never share an id.
+ * Input: none. Output: 64 lowercase hex chars (32 random bytes).
  */
-export function defaultInstanceId(
-    progHex: string,
-    memHex: string,
-    deployTime: bigint
-): string {
-    return createHash('sha256')
-        .update(Buffer.from(progHex + memHex + encodeCell(deployTime), 'hex'))
-        .digest('hex')
+export function randomInstanceId(): string {
+    return randomBytes(32).toString('hex')
 }
 
 /**
@@ -79,8 +72,12 @@ export function defaultInstanceId(
  * Input: program hex, economics, deployment time (unix seconds), optional
  * fixed SIGVERIFY roster, optional initial memory image (MEM_CELLS cells as
  * hex, e.g. with memory roster slot 0 pre-filled; see `withSlot`), optional
- * 32-byte instance id hex (default `defaultInstanceId`; ATTEST and ENDORSE
- * signatures bind it). Throws if the instance id is not 32 bytes.
+ * 32-byte instance id as 64 lowercase hex chars (default: randomInstanceId;
+ * pass a fixed id for deterministic tests). Throws unless the id is exactly
+ * 64 lowercase hex chars.
+ * ATTEST and ENDORSE signatures bind the instance id, and it is random, so
+ * attesters must read `instanceId` from the deployed machine (the contract
+ * instance or its locking script) before they sign anything for it.
  * Output: contract instance with empty stacks and the given (default zeroed)
  * memory.
  */
@@ -96,11 +93,9 @@ export function newMachine(
         progHex,
         initialMemHex === undefined ? undefined : initialMemHex.toLowerCase()
     )
-    const instanceId = (
-        instanceIdHex ?? defaultInstanceId(progHex, s.mem, deployTime)
-    ).toLowerCase()
+    const instanceId = instanceIdHex ?? randomInstanceId()
     if (!/^[0-9a-f]{64}$/.test(instanceId)) {
-        throw new Error('instance id must be 32 bytes (64 hex chars)')
+        throw new Error('instance id must be 32 bytes (64 lowercase hex chars)')
     }
     return new K17Machine(
         toByteString(progHex),

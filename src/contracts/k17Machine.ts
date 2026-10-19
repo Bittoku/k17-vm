@@ -149,9 +149,10 @@ export class K17Machine extends SmartContract {
     @prop()
     readonly roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>
     /**
-     * 32-byte id of this machine instance. ATTEST and ENDORSE messages
-     * include it, so a signature made for one machine cannot be replayed
-     * into another machine that shares a roster key.
+     * 32-byte id of this machine instance (random by default, see
+     * newMachine). ATTEST and ENDORSE messages include it, so a signature
+     * made for one machine cannot be replayed into another machine that
+     * shares a roster key. `step` refuses any other length.
      */
     @prop()
     readonly instanceId: ByteString
@@ -275,6 +276,7 @@ export class K17Machine extends SmartContract {
         keyB: ByteString,
         payout: ByteString
     ) {
+        assert(len(this.instanceId) == 32n, 'instanceId must be 32 bytes')
         const progLen = len(this.prog)
         const value = this.ctx.utxo.value
         const witnessLen = len(witness)
