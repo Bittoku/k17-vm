@@ -8,7 +8,9 @@
  *      or faulted during those K instructions), and
  *   2. output 1 pays the spender ("keeper") the reward that the liveness
  *      Dutch auction permits at this transaction's nLockTime, and
- *   3. no satoshis leave the machine except that reward, and
+ *   3. output 2 pays the roster slot named by PAYSLOT, if the cycle ran one,
+ *      and no satoshis leave the machine except the reward and that payout,
+ *      and
  *   4. the machine is input 0, so two machines can never share one output set.
  *
  * Job bounties: a program may read witness cells from the unlocking script
@@ -25,6 +27,13 @@
  * off-chain attester (sensor node, oracle) signs a reading once and any
  * keeper may relay it; the keeper is paid by the auction, the attester is
  * trusted only for the reading.
+ *
+ * v2 machine: the top of memory (cells ROSTER_BASE..MEM_CELLS-1) holds
+ * ROSTER_SLOTS_MEM roster slots of SLOT_CELLS cells each (32-byte key hash,
+ * then 20-byte payout address hash). The region is write-protected: STORE
+ * into it faults. VALUE pushes the balance of the machine output being
+ * spent. PAYSLOT n k pays n sats to slot k's payout address in output 2;
+ * one PAYSLOT per cycle, and the balance must keep at least one satoshi.
  *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
@@ -63,8 +72,12 @@ import {
 } from 'scrypt-ts'
 import { RabinPubKey, RabinSig, RabinVerifier } from 'scrypt-ts-lib'
 
-/** Number of attester slots in the roster (compile-time constant). */
-export const ROSTER_SLOTS = 4
+/**
+ * Number of attester slots in the fixed SIGVERIFY roster (compile-time
+ * constant). Not to be confused with the ISA's ROSTER_SLOTS, the number of
+ * memory roster slots.
+ */
+export const FIXED_ROSTER_SLOTS = 4
 
 export class K17Machine extends SmartContract {
     /** Instructions executed per cycle transaction (compile-time constant). */
@@ -88,6 +101,15 @@ export class K17Machine extends SmartContract {
     /** nLockTime values at or above this are unix timestamps, not heights. */
     @prop()
     static readonly UNIX_TIME_MIN: bigint = 500000000n
+    /** First memory cell of the write-protected roster region (ISA ROSTER_BASE). */
+    @prop()
+    static readonly ROSTER_BASE: bigint = 152n
+    /** Number of memory roster slots (ISA ROSTER_SLOTS). */
+    @prop()
+    static readonly ROSTER_SLOTS_MEM: bigint = 8n
+    /** Cells per memory roster slot: 8 key-hash cells, 5 payout cells (ISA SLOT_CELLS). */
+    @prop()
+    static readonly SLOT_CELLS: bigint = 13n
 
     // ---- immutable program and economics -------------------------------
 
@@ -112,7 +134,7 @@ export class K17Machine extends SmartContract {
      * slot and faults any program that references it.
      */
     @prop()
-    readonly roster: FixedArray<RabinPubKey, typeof ROSTER_SLOTS>
+    readonly roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>
 
     // ---- mutable machine state ----------------------------------------
 
@@ -141,7 +163,7 @@ export class K17Machine extends SmartContract {
         rewardMin: bigint,
         slope: bigint,
         rewardMax: bigint,
-        roster: FixedArray<RabinPubKey, typeof ROSTER_SLOTS>,
+        roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>,
         pc: bigint,
         ds: ByteString,
         rs: ByteString,
@@ -213,15 +235,30 @@ export class K17Machine extends SmartContract {
      * @param witness cells consumed by IN, concatenated
      * @param sigS Rabin signature value consumed by SIGVERIFY (0 if none)
      * @param sigPad Rabin signature padding consumed by SIGVERIFY
+     * @param keyA Rabin key (pubKeyBytes form) that signs for ATTEST or
+     *        sponsors for ENDORSE; empty when unused (no handler reads it yet)
+     * @param keyB new member's Rabin key (pubKeyBytes form) for ENDORSE;
+     *        empty when unused
+     * @param payout new member's 20-byte payout address hash for ENDORSE;
+     *        empty when unused
      */
     @method()
     public step(
         keeper: Addr,
         witness: ByteString,
         sigS: bigint,
-        sigPad: ByteString
+        sigPad: ByteString,
+        // keyA, keyB and payout are part of the v2 interface; ATTEST and
+        // ENDORSE will read them.
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        keyA: ByteString,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        keyB: ByteString,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        payout: ByteString
     ) {
         const progLen = len(this.prog)
+        const value = this.ctx.utxo.value
         const witnessLen = len(witness)
         const who = K17Machine.uncell(slice(keeper, 0n, 4n))
         const sig: RabinSig = { s: sigS, padding: sigPad }
@@ -235,6 +272,10 @@ export class K17Machine extends SmartContract {
         let wi = 0n
         let bountyDue = 0n
         let sigUsed = false
+        let payslotUsed = false
+        let payslotSats = 0n
+        // Placeholder until PAYSLOT runs; only read when payslotUsed.
+        let payslotAddr: Addr = this.beneficiary
 
         for (let i = 0; i < K17Machine.K; i++) {
             if (!halted && !yielded) {
@@ -282,8 +323,8 @@ export class K17Machine extends SmartContract {
                             // HALT
                             halted = true
                         } else if (op == 1n) {
-                            // !  : N1 ADDR --
-                            if (n < 8n || top >= K17Machine.MEM_CELLS) {
+                            // !  : N1 ADDR --   the roster region is write-protected
+                            if (n < 8n || top >= K17Machine.ROSTER_BASE) {
                                 halted = true
                             } else {
                                 mem =
@@ -557,8 +598,52 @@ export class K17Machine extends SmartContract {
                                     ds = ds2
                                 }
                             }
+                        } else if (op == 34n) {
+                            // PAYSLOT : N SLOT --
+                            // Underflow, bad slot or empty slot: fault.
+                            // A second PAYSLOT this cycle: tx invalid.
+                            if (n < 8n || top >= K17Machine.ROSTER_SLOTS_MEM) {
+                                halted = true
+                            } else {
+                                const slotByte =
+                                    (K17Machine.ROSTER_BASE +
+                                        top * K17Machine.SLOT_CELLS) *
+                                    4n
+                                if (
+                                    slice(mem, slotByte, slotByte + 32n) ==
+                                    toByteString(
+                                        '0000000000000000000000000000000000000000000000000000000000000000'
+                                    )
+                                ) {
+                                    halted = true
+                                } else {
+                                    assert(
+                                        !payslotUsed,
+                                        'one PAYSLOT per cycle'
+                                    )
+                                    payslotUsed = true
+                                    payslotSats = second
+                                    payslotAddr = Addr(
+                                        slice(
+                                            mem,
+                                            slotByte + 32n,
+                                            slotByte + 52n
+                                        )
+                                    )
+                                    ds = ds2
+                                }
+                            }
+                        } else if (op == 35n) {
+                            // VALUE : -- V
+                            if (n >= K17Machine.DS_MAX_BYTES) {
+                                halted = true
+                            } else {
+                                ds =
+                                    ds + K17Machine.cell(K17Machine.wrap(value))
+                            }
                         } else {
-                            // unknown opcode
+                            // unknown opcode (ATTEST and ENDORSE are not yet
+                            // handled on chain and fault here)
                             halted = true
                         }
 
@@ -601,20 +686,26 @@ export class K17Machine extends SmartContract {
         const elapsed = now - this.lastTime
         assert(elapsed >= 0n, 'time must not go backwards')
 
-        const value = this.ctx.utxo.value
         // Keeper reward from the auction plus any bounty the program released.
         let reward = this.rewardFor(elapsed) + bountyDue
         if (reward > value - 1n) {
             // Never drain the machine below one satoshi.
             reward = value - 1n
         }
+        if (payslotSats > 0n) {
+            assert(
+                value - reward - payslotSats >= 1n,
+                'balance too low for PAYSLOT'
+            )
+        }
+        const remaining = value - reward - payslotSats
 
         // ---- outputs -------------------------------------------------
         let outputs = toByteString('')
         if (halted) {
             outputs = Utils.buildPublicKeyHashOutput(
                 this.beneficiary,
-                value - reward
+                remaining
             )
         } else {
             this.pc = pc
@@ -623,10 +714,13 @@ export class K17Machine extends SmartContract {
             this.mem = mem
             this.outLog = outLog
             this.lastTime = now
-            outputs = this.buildStateOutput(value - reward)
+            outputs = this.buildStateOutput(remaining)
         }
         if (reward > 0n) {
             outputs += Utils.buildPublicKeyHashOutput(keeper, reward)
+        }
+        if (payslotUsed) {
+            outputs += Utils.buildPublicKeyHashOutput(payslotAddr, payslotSats)
         }
         outputs += this.buildChangeOutput()
         assert(hash256(outputs) == this.ctx.hashOutputs, 'outputs mismatch')

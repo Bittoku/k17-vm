@@ -12,8 +12,24 @@ import chaiAsPromised from 'chai-as-promised'
 import { bsv, toByteString } from 'scrypt-ts'
 import { RabinSig } from 'scrypt-ts-lib'
 import { K17Machine } from '../src/contracts/k17Machine'
-import { assemble, Op, OUT_MAX, HAS_OPERAND } from '../src/k17/isa'
-import { outputLog, run, initialState, hashCell, whoOf } from '../src/k17/vm'
+import {
+    assemble,
+    Op,
+    OUT_MAX,
+    HAS_OPERAND,
+    MEM_CELLS,
+    CELL,
+    encodeCell,
+    slotCells,
+} from '../src/k17/isa'
+import {
+    outputLog,
+    run,
+    initialState,
+    hashCell,
+    whoOf,
+    withSlot,
+} from '../src/k17/vm'
 import {
     fibonacciProgram,
     countdownProgram,
@@ -29,9 +45,16 @@ import {
     planCycle,
     rosterOf,
     CyclePlan,
+    CycleKeys,
     CycleOverrides,
 } from '../src/keeper'
-import { NO_SIG, newAttester, signReading } from '../src/k17/attest'
+import {
+    NO_SIG,
+    newAttester,
+    signReading,
+    keyHash,
+    payoutOf,
+} from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
 use(chaiAsPromised)
 
@@ -49,11 +72,19 @@ const ECON = {
     rewardMax: 500n,
 }
 
-/** Deploy a machine for `prog` and return the live instance. */
-async function deploy(prog: string): Promise<K17Machine> {
-    const m = newMachine(prog, ECON, T0)
+/**
+ * Deploy a machine for `prog` and return the live instance.
+ * Input: program hex; optional funding (sats) and initial memory image hex.
+ * Output: the deployed contract instance.
+ */
+async function deploy(
+    prog: string,
+    funding: number = FUNDING,
+    initialMemHex?: string
+): Promise<K17Machine> {
+    const m = newMachine(prog, ECON, T0, rosterOf(), initialMemHex)
     await m.connect(getDefaultSigner())
-    await m.deploy(FUNDING)
+    await m.deploy(funding)
     return m
 }
 
@@ -67,6 +98,8 @@ interface CycleResult {
 /**
  * Perform one cycle at `lockTime` with `keeper`, verify the script with the
  * interpreter, and return the next instance (undefined once halted).
+ * `witness`, `sig` and `keys` are forwarded to planCycle; the plan's key and
+ * payout byte strings (empty unless `keys` sets them) go to `step`.
  */
 async function cycle(
     m: K17Machine,
@@ -80,9 +113,10 @@ async function cycle(
         sigArg?: RabinSig
     } = {},
     witness: bigint[] = [],
-    sig: RabinSig = NO_SIG
+    sig: RabinSig = NO_SIG,
+    keys: CycleKeys = {}
 ): Promise<CycleResult> {
-    const plan = planCycle(m, value, lockTime, keeper, witness, sig)
+    const plan = planCycle(m, value, lockTime, keeper, witness, sig, keys)
     const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
     const sent = overrides.sigArg ?? plan.sig
     const { tx, atInputIndex } = await m.methods.step(
@@ -90,6 +124,9 @@ async function cycle(
         toByteString(overrides.witnessHex ?? plan.witnessHex),
         sent.s,
         toByteString(sent.padding),
+        toByteString(plan.keyAHex),
+        toByteString(plan.keyBHex),
+        toByteString(plan.payoutHex),
         opts
     )
     const verdict = tx.verifyInputScript(atInputIndex)
@@ -669,5 +706,168 @@ describe('K17Machine on-chain', function () {
         )
         expect(r.plan.halted).to.be.true
         expect(outputLog(r.plan.nextState)).to.deep.equal([])
+    })
+
+    // ------------------------------------------------------------------
+    // v2 machine: VALUE, PAYSLOT, roster write-protection
+    // ------------------------------------------------------------------
+
+    /** Address of a cell's P2PKH output, for comparisons. */
+    const addressOf = (out: bsv.Transaction.Output): string =>
+        out.script.toAddress(beneficiaryAddress.network).toString()
+
+    it('VALUE agrees with the UTXO value', async () => {
+        // YIELD keeps the machine alive so the log lands in the state output
+        // and the contract's hashOutputs check covers it.
+        const m = await deploy(assemble(['VALUE', 'OUT', 'YIELD', 'HALT']))
+        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r.plan.halted).to.be.false
+        expect(outputLog(r.plan.nextState)).to.deep.equal([BigInt(FUNDING)])
+        expect((r.next as K17Machine).outLog).to.equal(
+            toByteString(encodeCell(BigInt(FUNDING)))
+        )
+    })
+
+    const [, , , payee] = randomPrivateKey()
+    /** Memory image with roster slot 3 naming attester A and paying `payee`. */
+    const SLOT3_MEM = withSlot(
+        '00'.repeat(MEM_CELLS * CELL),
+        3,
+        slotCells(keyHash(attesterA.pub), payoutOf(payee))
+    )
+    const PAY700 = assemble(['LIT', 700, 'LIT', 3, 'PAYSLOT', 'YIELD'])
+
+    it("PAYSLOT pays the slot's address in output 2 whoever relays", async () => {
+        for (const keeper of [keeperA, keeperB]) {
+            const m = await deploy(PAY700, FUNDING, SLOT3_MEM)
+            const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeper)
+            expect(r.plan.halted).to.be.false
+            expect(r.plan.payslot).to.deep.equal({
+                slot: 3,
+                payoutHex: payoutOf(payee),
+                sats: 700n,
+            })
+            // out0: state with the balance less reward and payout
+            expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+                BigInt(FUNDING) - r.plan.reward - 700n
+            )
+            expect(r.plan.remaining).to.equal(
+                BigInt(FUNDING) - r.plan.reward - 700n
+            )
+            // out1: the relaying keeper's reward
+            expect(addressOf(r.tx.outputs[1])).to.equal(keeper.toString())
+            expect(BigInt(r.tx.outputs[1].satoshis)).to.equal(r.plan.reward)
+            // out2: the slot's payout address
+            expect(addressOf(r.tx.outputs[2])).to.equal(payee.toString())
+            expect(r.tx.outputs[2].satoshis).to.equal(700)
+        }
+    })
+
+    it('PAYSLOT that the balance cannot cover is refused', async () => {
+        // FUNDING 1000, reward 101 at T0+1: 898 leaves one satoshi, 899 none.
+        const small = 1000
+        const ok = await deploy(
+            assemble(['LIT', 898, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+            small,
+            SLOT3_MEM
+        )
+        const r = await cycle(ok, BigInt(small), T0 + 1n, keeperA)
+        expect(r.plan.reward).to.equal(101n)
+        expect(r.tx.outputs[0].satoshis).to.equal(1)
+        expect(r.tx.outputs[2].satoshis).to.equal(898)
+
+        const broke = await deploy(
+            assemble(['LIT', 899, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+            small,
+            SLOT3_MEM
+        )
+        await expect(
+            cycle(broke, BigInt(small), T0 + 1n, keeperA)
+        ).to.be.rejectedWith(/balance too low/)
+    })
+
+    it('PAYSLOT on an empty or out-of-range slot faults and refunds the beneficiary', async () => {
+        for (const slot of [2, 8]) {
+            const m = await deploy(
+                assemble(['LIT', 700, 'LIT', slot, 'PAYSLOT', 'YIELD']),
+                FUNDING,
+                SLOT3_MEM
+            )
+            const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+            expect(r.plan.halted).to.be.true
+            expect(r.plan.payslot).to.be.undefined
+            expect(r.tx.outputs.length).to.equal(3) // beneficiary, keeper, change
+            expect(addressOf(r.tx.outputs[0])).to.equal(
+                beneficiaryAddress.toString()
+            )
+            expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+                BigInt(FUNDING) - r.plan.reward
+            )
+        }
+    })
+
+    it('a second PAYSLOT in one cycle invalidates the transaction', async () => {
+        const twice = assemble([
+            'LIT',
+            1,
+            'LIT',
+            3,
+            'PAYSLOT',
+            'LIT',
+            1,
+            'LIT',
+            3,
+            'PAYSLOT',
+            'YIELD',
+        ])
+        const m = await deploy(twice, FUNDING, SLOT3_MEM)
+        // The reference VM refuses to plan it.
+        expect(() => planCycle(m, BigInt(FUNDING), T0 + 1n, keeperA)).to.throw(
+            /needs a witness/
+        )
+        // Build the spend from a one-PAYSLOT plan: the contract must refuse.
+        const once = newMachine(
+            assemble(['LIT', 1, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+            ECON,
+            T0,
+            rosterOf(),
+            SLOT3_MEM
+        )
+        const plan = planCycle(once, BigInt(FUNDING), T0 + 1n, keeperA)
+        const opts = bindCycleBuilder(m, plan, keeperA, T0 + 1n)
+        await expect(
+            m.methods.step(
+                addrOf(keeperA),
+                toByteString(''),
+                0n,
+                toByteString(''),
+                toByteString(''),
+                toByteString(''),
+                toByteString(''),
+                opts
+            )
+        ).to.be.rejectedWith(/one PAYSLOT per cycle/)
+    })
+
+    it('STORE into the roster faults and refunds; STORE below it advances', async () => {
+        const below = await deploy(
+            assemble(['LIT', 7, 'LIT', 151, '!', 'YIELD'])
+        )
+        const r1 = await cycle(below, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r1.plan.halted).to.be.false
+        const mem = (r1.next as K17Machine).mem
+        expect(mem.slice(151 * 8, 152 * 8)).to.equal(encodeCell(7n))
+
+        const into = await deploy(
+            assemble(['LIT', 7, 'LIT', 152, '!', 'YIELD'])
+        )
+        const r2 = await cycle(into, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r2.plan.halted).to.be.true
+        expect(addressOf(r2.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r2.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - r2.plan.reward
+        )
     })
 })

@@ -7,7 +7,7 @@
  *   2. runs the reference VM for K instructions,
  *   3. works out the reward the Dutch auction allows at the chosen nLockTime,
  *   4. builds the spending transaction: state (or beneficiary payout), reward
- *      to itself, change.
+ *      to itself, the PAYSLOT payout (if the cycle made one), change.
  *
  * The functions here are pure plumbing; the economics live in the contract.
  */
@@ -22,10 +22,17 @@ import {
 } from 'scrypt-ts'
 import { randomBytes } from 'crypto'
 import { RabinPubKey, RabinSig } from 'scrypt-ts-lib'
-import { K17Machine, ROSTER_SLOTS } from './contracts/k17Machine'
-import { K17State, StepEnv, initialState, stepK, whoOf } from './k17/vm'
+import { K17Machine, FIXED_ROSTER_SLOTS } from './contracts/k17Machine'
+import {
+    K17State,
+    PaySlot,
+    StepEnv,
+    initialState,
+    stepK,
+    whoOf,
+} from './k17/vm'
 import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
-import { NO_SIG } from './k17/attest'
+import { NO_SIG, pubKeyBytes } from './k17/attest'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -36,33 +43,40 @@ export interface Economics {
     rewardMax: bigint
 }
 
-/** Roster as the contract wants it: exactly ROSTER_SLOTS keys. */
-export type Roster = FixedArray<RabinPubKey, typeof ROSTER_SLOTS>
+/** Fixed SIGVERIFY roster as the contract wants it: exactly FIXED_ROSTER_SLOTS keys. */
+export type Roster = FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>
 
 /**
- * Pad a list of attester public keys to a full roster with zero (empty)
- * slots. Input: up to ROSTER_SLOTS keys. Output: roster.
+ * Pad a list of attester public keys to a full fixed (SIGVERIFY) roster with
+ * zero (empty) slots. Input: up to FIXED_ROSTER_SLOTS keys. Output: roster.
  */
 export function rosterOf(keys: RabinPubKey[] = []): Roster {
-    if (keys.length > ROSTER_SLOTS) throw new Error('too many roster keys')
+    if (keys.length > FIXED_ROSTER_SLOTS)
+        throw new Error('too many roster keys')
     const r: RabinPubKey[] = []
-    for (let i = 0; i < ROSTER_SLOTS; i++) r.push(keys[i] ?? 0n)
+    for (let i = 0; i < FIXED_ROSTER_SLOTS; i++) r.push(keys[i] ?? 0n)
     return r as unknown as Roster
 }
 
 /**
  * Create a fresh (not yet deployed) machine for a program.
  * Input: program hex, economics, deployment time (unix seconds), optional
- * attester roster. Output: contract instance with empty stacks and zeroed
+ * fixed SIGVERIFY roster, optional initial memory image (MEM_CELLS cells as
+ * hex, e.g. with memory roster slot 0 pre-filled; see `withSlot`).
+ * Output: contract instance with empty stacks and the given (default zeroed)
  * memory.
  */
 export function newMachine(
     progHex: string,
     econ: Economics,
     deployTime: bigint,
-    roster: Roster = rosterOf()
+    roster: Roster = rosterOf(),
+    initialMemHex?: string
 ): K17Machine {
-    const s = initialState(progHex)
+    const s = initialState(
+        progHex,
+        initialMemHex === undefined ? undefined : initialMemHex.toLowerCase()
+    )
     return new K17Machine(
         toByteString(progHex),
         econ.beneficiary,
@@ -117,6 +131,19 @@ export function rewardAt(
     return r
 }
 
+/**
+ * Keys and payout the transaction supplies for ATTEST and ENDORSE. All
+ * optional; a cycle that uses neither instruction passes `{}`.
+ */
+export interface CycleKeys {
+    /** Rabin key the cycle's signature is made under (ATTEST, ENDORSE sponsor). */
+    attestKey?: RabinPubKey
+    /** New member's Rabin key (ENDORSE). */
+    endorseKey?: RabinPubKey
+    /** New member's 20-byte payout as 40 lowercase hex chars (ENDORSE). */
+    payoutHex?: string
+}
+
 /** What one cycle will produce, computed off-chain before broadcasting. */
 export interface CyclePlan {
     halted: boolean
@@ -128,17 +155,33 @@ export interface CyclePlan {
     witnessHex: string
     /** Attestation signature for the unlocking script (NO_SIG when none). */
     sig: RabinSig
+    /** `keyA` argument of `step`: pubKeyBytes(attestKey) or '' (hex). */
+    keyAHex: string
+    /** `keyB` argument of `step`: pubKeyBytes(endorseKey) or '' (hex). */
+    keyBHex: string
+    /** `payout` argument of `step`: the ENDORSE payout or '' (hex). */
+    payoutHex: string
+    /** The PAYSLOT payout this cycle (output 2); undefined when none. */
+    payslot?: PaySlot
     /** Next contract instance (undefined when halted). */
     next?: K17Machine
     nextState: K17State
-    /** Satoshis in the state output or the beneficiary payout. */
+    /**
+     * Satoshis in the state output or the beneficiary payout: value less
+     * reward less the PAYSLOT payout.
+     */
     remaining: bigint
 }
 
 /**
- * Compute the plan for a cycle: next state, reward, remaining value.
- * Input: current instance, its UTXO value, nLockTime to use, keeper address,
- * witness cells, optional attestation signature.
+ * Compute the plan for a cycle: next state, reward, PAYSLOT payout,
+ * remaining value.
+ * Input: current instance, its UTXO value (also what VALUE pushes), nLockTime
+ * to use, keeper address, witness cells, optional signature, optional keys
+ * and payout for ATTEST/ENDORSE. Output: the CyclePlan. Throws when the cycle
+ * cannot form a valid transaction (missing or rejected witness, signature,
+ * key, or a second PAYSLOT). A PAYSLOT the balance cannot cover is not caught
+ * here; the contract refuses it ('balance too low for PAYSLOT').
  */
 export function planCycle(
     m: K17Machine,
@@ -146,7 +189,8 @@ export function planCycle(
     lockTime: bigint,
     keeper?: bsv.Address,
     witness: bigint[] = [],
-    sig: RabinSig = NO_SIG
+    sig: RabinSig = NO_SIG,
+    keys: CycleKeys = {}
 ): CyclePlan {
     const cur = stateOf(m)
     assertWellFormed(cur)
@@ -156,6 +200,10 @@ export function planCycle(
         witness,
         roster: (m.roster as unknown as RabinPubKey[]).slice(),
         sig: sig.s === 0n ? undefined : sig,
+        attestKey: keys.attestKey,
+        endorseKey: keys.endorseKey,
+        payout: keys.payoutHex,
+        value,
     }
     const outcome = stepK(cur, env, K17Machine.K)
     if (outcome.status === 'need_witness') {
@@ -166,18 +214,25 @@ export function planCycle(
     }
     const nextState = outcome.state
     const reward = rewardAt(m, lockTime, value, outcome.bountyDue)
-    const remaining = value - reward
+    const payslot = outcome.payslot
+    const remaining = value - reward - (payslot?.sats ?? 0n)
     const witnessHex = witness.map((w) => encodeCell(w)).join('')
+    const common = {
+        reward,
+        bounty: outcome.bountyDue,
+        nextState,
+        remaining,
+        witnessHex,
+        sig,
+        keyAHex:
+            keys.attestKey === undefined ? '' : pubKeyBytes(keys.attestKey),
+        keyBHex:
+            keys.endorseKey === undefined ? '' : pubKeyBytes(keys.endorseKey),
+        payoutHex: keys.payoutHex ?? '',
+        payslot,
+    }
     if (nextState.halted) {
-        return {
-            halted: true,
-            reward,
-            bounty: outcome.bountyDue,
-            nextState,
-            remaining,
-            witnessHex,
-            sig,
-        }
+        return { halted: true, ...common }
     }
     const next = m.next()
     next.pc = nextState.pc
@@ -186,16 +241,7 @@ export function planCycle(
     next.mem = toByteString(nextState.mem)
     next.outLog = toByteString(nextState.out)
     next.lastTime = lockTime
-    return {
-        halted: false,
-        reward,
-        bounty: outcome.bountyDue,
-        next,
-        nextState,
-        remaining,
-        witnessHex,
-        sig,
-    }
+    return { halted: false, next, ...common }
 }
 
 /** Options the test harness may override to build deliberately bad txs. */
@@ -215,7 +261,8 @@ export interface CycleOverrides {
  * outputs out exactly as the contract expects:
  *   output 0: next state, or P2PKH to the beneficiary when halted
  *   output 1: reward to the keeper (omitted when the reward is 0)
- *   output 2: change
+ *   output 2: PAYSLOT payout to the slot's address (omitted when none)
+ *   then:     change
  * Input: instance, plan, keeper address, overrides. Output: MethodCallOptions
  * to pass to `m.methods.step`.
  */
@@ -228,8 +275,9 @@ export function bindCycleBuilder(
 ): MethodCallOptions<K17Machine> {
     const reward = overrides.reward ?? plan.reward
     const nextInstance = overrides.next ?? plan.next
-    const value = plan.remaining + plan.reward
-    const remaining = value - reward
+    const payslotSats = plan.payslot?.sats ?? 0n
+    const value = plan.remaining + plan.reward + payslotSats
+    const remaining = value - reward - payslotSats
 
     m.bindTxBuilder(
         'step',
@@ -282,6 +330,19 @@ export function bindCycleBuilder(
                     new bsv.Transaction.Output({
                         script: bsv.Script.buildPublicKeyHashOut(keeper),
                         satoshis: Number(reward),
+                    })
+                )
+            }
+            if (plan.payslot) {
+                tx.addOutput(
+                    new bsv.Transaction.Output({
+                        script: bsv.Script.buildPublicKeyHashOut(
+                            bsv.Address.fromPublicKeyHash(
+                                Buffer.from(plan.payslot.payoutHex, 'hex'),
+                                keeper.network
+                            )
+                        ),
+                        satoshis: Number(plan.payslot.sats),
                     })
                 )
             }
