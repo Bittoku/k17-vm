@@ -34,12 +34,14 @@
  * into it faults. ATTEST checks a reading signed by the key whose hash is
  * in a slot (keyA); ENDORSE checks that a slot member signed for a new
  * member (keyB, payout) and writes sha256(keyB) || payout into an empty
- * slot. SIGVERIFY, ATTEST and ENDORSE share one signature per cycle; a bad
- * key or signature invalidates the transaction. VALUE pushes the balance of
- * the machine output being spent. PAYSLOT pays N sats to slot k's payout address in output 2. A
- * PAYSLOT the program gets wrong (N == 0, a second one in a cycle, or one
- * that would leave the machine below one satoshi) is a fault: the machine
- * halts, the payout is dropped and the beneficiary is refunded.
+ * slot. Both messages include the machine's instanceId. SIGVERIFY, ATTEST
+ * and ENDORSE share one signature per cycle; a bad key or signature
+ * invalidates the transaction. VALUE pushes the balance of the machine
+ * output being spent. PAYSLOT pays N sats to slot k's payout address in the
+ * output after the keeper's reward; the payout has priority and the reward
+ * shrinks to make room. A PAYSLOT the program gets wrong (a second one in a
+ * cycle, N == 0, or N larger than the balance less one satoshi) is a fault:
+ * the machine halts, the payout is dropped and the beneficiary is refunded.
  *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
@@ -146,6 +148,13 @@ export class K17Machine extends SmartContract {
      */
     @prop()
     readonly roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>
+    /**
+     * 32-byte id of this machine instance. ATTEST and ENDORSE messages
+     * include it, so a signature made for one machine cannot be replayed
+     * into another machine that shares a roster key.
+     */
+    @prop()
+    readonly instanceId: ByteString
 
     // ---- mutable machine state ----------------------------------------
 
@@ -175,6 +184,7 @@ export class K17Machine extends SmartContract {
         slope: bigint,
         rewardMax: bigint,
         roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>,
+        instanceId: ByteString,
         pc: bigint,
         ds: ByteString,
         rs: ByteString,
@@ -189,6 +199,7 @@ export class K17Machine extends SmartContract {
         this.slope = slope
         this.rewardMax = rewardMax
         this.roster = roster
+        this.instanceId = instanceId
         this.pc = pc
         this.ds = ds
         this.rs = rs
@@ -643,10 +654,11 @@ export class K17Machine extends SmartContract {
                                         'key not in roster slot'
                                     )
                                     sigUsed = true
-                                    // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
+                                    // "K17M" || instanceId || cell(TAG) || cell(VAL)
                                     verifyNeeded = true
                                     verifyMsg =
-                                        toByteString('4b313741') +
+                                        toByteString('4b31374d') +
+                                        this.instanceId +
                                         slice(ds, n - 12n, n - 4n)
                                     verifyKey = Utils.fromLEUnsigned(keyA)
                                     ds = slice(ds, 0n, n - 12n)
@@ -710,11 +722,12 @@ export class K17Machine extends SmartContract {
                                     )
                                     sigUsed = true
                                     const newHash = sha256(keyB)
-                                    // ENDORSE_DOMAIN ("K17E") || cell(TAG) ||
+                                    // "K17E" || instanceId || cell(TAG) ||
                                     // cell(NEWSLOT) || sha256(keyB) || payout
                                     verifyNeeded = true
                                     verifyMsg =
                                         toByteString('4b313745') +
+                                        this.instanceId +
                                         slice(ds, n - 12n, n - 8n) +
                                         slice(ds, n - 4n, n) +
                                         newHash +
@@ -730,10 +743,18 @@ export class K17Machine extends SmartContract {
                             }
                         } else if (op == 34n) {
                             // PAYSLOT : N SLOT --
-                            // Underflow, bad slot or empty slot: fault.
-                            // N == 0 or a second PAYSLOT this cycle: fault
-                            // that also drops the payout (never tx-invalid).
-                            if (n < 8n || top >= K17Machine.ROSTER_SLOTS_MEM) {
+                            // A second PAYSLOT this cycle (checked first,
+                            // however malformed): fault that drops the
+                            // payout. Underflow, bad slot, empty slot or
+                            // N == 0: fault. Never tx-invalid.
+                            if (payslotUsed) {
+                                halted = true
+                                payslotUsed = false
+                                payslotSats = 0n
+                            } else if (
+                                n < 8n ||
+                                top >= K17Machine.ROSTER_SLOTS_MEM
+                            ) {
                                 halted = true
                             } else {
                                 const slotByte =
@@ -745,10 +766,8 @@ export class K17Machine extends SmartContract {
                                     K17Machine.EMPTY_HASH
                                 ) {
                                     halted = true
-                                } else if (second == 0n || payslotUsed) {
+                                } else if (second == 0n) {
                                     halted = true
-                                    payslotUsed = false
-                                    payslotSats = 0n
                                 } else {
                                     payslotUsed = true
                                     payslotSats = second
@@ -831,12 +850,20 @@ export class K17Machine extends SmartContract {
             // Never drain the machine below one satoshi.
             reward = value - 1n
         }
-        if (payslotUsed && value - reward - payslotSats < 1n) {
-            // An unaffordable PAYSLOT is a fault: halt, drop the payout,
+        if (payslotUsed) {
+            // The slot payout has priority over the keeper's reward: the
+            // reward shrinks (to 0 at worst) so the payout is paid in full.
+            // Only a payout the balance cannot cover with one satoshi left,
+            // which no keeper can cause, is a fault: halt, drop the payout,
             // refund the beneficiary.
-            halted = true
-            payslotUsed = false
-            payslotSats = 0n
+            const cap = value - 1n - payslotSats
+            if (cap < 0n) {
+                halted = true
+                payslotUsed = false
+                payslotSats = 0n
+            } else if (reward > cap) {
+                reward = cap
+            }
         }
         const remaining = value - reward - payslotSats
 

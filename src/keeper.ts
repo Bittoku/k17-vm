@@ -20,7 +20,7 @@ import {
     bsv,
     toByteString,
 } from 'scrypt-ts'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { RabinPubKey, RabinSig } from 'scrypt-ts-lib'
 import { K17Machine, FIXED_ROSTER_SLOTS } from './contracts/k17Machine'
 import {
@@ -59,10 +59,28 @@ export function rosterOf(keys: RabinPubKey[] = []): Roster {
 }
 
 /**
+ * Default instance id of a machine: sha256 over the program bytes, the
+ * initial memory image and cell(deployTime).
+ * Input: program hex, memory image hex (MEM_CELLS cells), deployment time.
+ * Output: 64 lowercase hex chars.
+ */
+export function defaultInstanceId(
+    progHex: string,
+    memHex: string,
+    deployTime: bigint
+): string {
+    return createHash('sha256')
+        .update(Buffer.from(progHex + memHex + encodeCell(deployTime), 'hex'))
+        .digest('hex')
+}
+
+/**
  * Create a fresh (not yet deployed) machine for a program.
  * Input: program hex, economics, deployment time (unix seconds), optional
  * fixed SIGVERIFY roster, optional initial memory image (MEM_CELLS cells as
- * hex, e.g. with memory roster slot 0 pre-filled; see `withSlot`).
+ * hex, e.g. with memory roster slot 0 pre-filled; see `withSlot`), optional
+ * 32-byte instance id hex (default `defaultInstanceId`; ATTEST and ENDORSE
+ * signatures bind it). Throws if the instance id is not 32 bytes.
  * Output: contract instance with empty stacks and the given (default zeroed)
  * memory.
  */
@@ -71,12 +89,19 @@ export function newMachine(
     econ: Economics,
     deployTime: bigint,
     roster: Roster = rosterOf(),
-    initialMemHex?: string
+    initialMemHex?: string,
+    instanceIdHex?: string
 ): K17Machine {
     const s = initialState(
         progHex,
         initialMemHex === undefined ? undefined : initialMemHex.toLowerCase()
     )
+    const instanceId = (
+        instanceIdHex ?? defaultInstanceId(progHex, s.mem, deployTime)
+    ).toLowerCase()
+    if (!/^[0-9a-f]{64}$/.test(instanceId)) {
+        throw new Error('instance id must be 32 bytes (64 hex chars)')
+    }
     return new K17Machine(
         toByteString(progHex),
         econ.beneficiary,
@@ -84,6 +109,7 @@ export function newMachine(
         econ.slope,
         econ.rewardMax,
         roster,
+        toByteString(instanceId),
         s.pc,
         toByteString(s.ds),
         toByteString(s.rs),
@@ -113,14 +139,20 @@ export function assertWellFormed(s: K17State): void {
 }
 
 /**
- * Mirror of `K17Machine.rewardFor` plus the one-satoshi floor, so a keeper
- * can predict the reward without running the contract.
+ * Mirror of the contract's reward accounting, so a keeper can predict the
+ * reward without running the contract: `rewardFor(elapsed) + bountyDue`,
+ * clamped so the machine keeps one satoshi, then (with a PAYSLOT payout)
+ * clamped again so the slot payout is paid in full first.
+ * Input: instance, nLockTime, UTXO value, released bounty, PAYSLOT sats
+ * (0 = none; the caller handles payslotSats > value - 1 as a fault).
+ * Output: the keeper's reward in sats (never negative).
  */
 export function rewardAt(
     m: K17Machine,
     lockTime: bigint,
     value: bigint,
-    bountyDue = 0n
+    bountyDue = 0n,
+    payslotSats = 0n
 ): bigint {
     const elapsed = lockTime - m.lastTime
     if (elapsed < 0n) throw new Error('lockTime before lastTime')
@@ -128,6 +160,10 @@ export function rewardAt(
     if (r > m.rewardMax) r = m.rewardMax
     r += bountyDue
     if (r > value - 1n) r = value - 1n
+    if (payslotSats > 0n && r > value - 1n - payslotSats) {
+        r = value - 1n - payslotSats
+    }
+    if (r < 0n) r = 0n
     return r
 }
 
@@ -180,8 +216,9 @@ export interface CyclePlan {
  * to use, keeper address, witness cells, optional signature, optional keys
  * and payout for ATTEST/ENDORSE. Output: the CyclePlan. Throws when the cycle
  * cannot form a valid transaction (missing or rejected witness, signature or
- * key). A PAYSLOT the balance cannot cover (value - reward - N < 1) is a
- * fault, as on chain: the plan is halted and carries no payslot.
+ * key). A PAYSLOT payout has priority over the keeper reward, which shrinks
+ * (down to 0) so the payout is paid in full; only N > value - 1 is a fault,
+ * as on chain: the plan is halted and carries no payslot.
  */
 export function planCycle(
     m: K17Machine,
@@ -204,24 +241,34 @@ export function planCycle(
         endorseKey: keys.endorseKey,
         payout: keys.payoutHex,
         value,
+        instanceId: m.instanceId,
     }
     const outcome = stepK(cur, env, K17Machine.K)
     if (outcome.status === 'need_witness') {
         throw new Error('cycle needs a witness cell the solver did not supply')
     }
     if (outcome.status === 'verify_failed') {
-        throw new Error('witness rejected by VERIFY or SIGVERIFY')
+        throw new Error(
+            'witness rejected by VERIFY, SIGVERIFY, ATTEST or ENDORSE'
+        )
     }
-    const reward = rewardAt(m, lockTime, value, outcome.bountyDue)
     let nextState = outcome.state
     let payslot = outcome.payslot
-    if (payslot && value - reward - payslot.sats < 1n) {
-        // The contract faults an unaffordable PAYSLOT at its payout
-        // accounting (the VM cannot, it does not know the reward): the
-        // machine halts, the payout is dropped, the beneficiary is refunded.
+    if (payslot && value - 1n - payslot.sats < 0n) {
+        // The contract faults a PAYSLOT the balance cannot cover even with
+        // no keeper reward (the VM leaves this to the planner): the machine
+        // halts, the payout is dropped, the beneficiary is refunded.
         nextState = { ...nextState, halted: true }
         payslot = undefined
     }
+    // The slot payout has priority over the auction reward.
+    const reward = rewardAt(
+        m,
+        lockTime,
+        value,
+        outcome.bountyDue,
+        payslot?.sats ?? 0n
+    )
     const remaining = value - reward - (payslot?.sats ?? 0n)
     const witnessHex = witness.map((w) => encodeCell(w)).join('')
     const common = {

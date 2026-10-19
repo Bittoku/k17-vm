@@ -57,6 +57,44 @@ export function signReading(
     return toRabinSig(rabin.sign(attestMessage(tag, value), attester.priv))
 }
 
+/**
+ * Domain prefix of an ATTEST message, ASCII "K17M" (memory roster). Kept
+ * apart from ATTEST_DOMAIN ("K17A", SIGVERIFY) so that a SIGVERIFY
+ * signature can never be presented to ATTEST or the other way round.
+ */
+export const ATTEST_DOMAIN_M = '4b31374d'
+
+/**
+ * Message an attester signs for `TAG VAL SLOT ATTEST` on one machine.
+ * Input: the machine's 32-byte instance id (64 hex chars), tag, value.
+ * Output: hex of ATTEST_DOMAIN_M + instanceId + cell(tag) + cell(value).
+ * The instance id stops a reading signed for one machine being replayed
+ * into another machine that shares the roster key.
+ */
+export function attestMessageFor(
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint
+): string {
+    return ATTEST_DOMAIN_M + instanceIdHex + encodeCell(tag) + encodeCell(value)
+}
+
+/**
+ * Sign a reading for `TAG VAL SLOT ATTEST` on one machine.
+ * Input: attester, the machine's instance id hex, tag, value.
+ * Output: Rabin signature over attestMessageFor.
+ */
+export function signReadingFor(
+    attester: Attester,
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint
+): RabinSig {
+    return toRabinSig(
+        rabin.sign(attestMessageFor(instanceIdHex, tag, value), attester.priv)
+    )
+}
+
 /** The empty signature a keeper passes when the cycle has no SIGVERIFY. */
 export const NO_SIG: RabinSig = { s: 0n, padding: '' }
 
@@ -102,13 +140,16 @@ export function keyHash(pub: RabinPubKey): string {
 
 /**
  * Message a roster member signs to endorse a new member into a slot.
- * Input: tag (replay guard), new member's public key, 20-byte payout hex,
- * target roster slot (the NEWSLOT cell of ENDORSE).
- * Output: hex of ENDORSE_DOMAIN + cell(tag) + cell(newSlot) +
+ * Input: the machine's 32-byte instance id (64 hex chars), tag (replay
+ * guard), new member's public key, 20-byte payout hex, target roster slot
+ * (the NEWSLOT cell of ENDORSE).
+ * Output: hex of ENDORSE_DOMAIN + instanceId + cell(tag) + cell(newSlot) +
  * keyHash(newPub) + payout. Binding the slot stops a relayer from writing
- * the endorsed key into a slot the endorser did not choose.
+ * the endorsed key into a slot the endorser did not choose; binding the
+ * instance stops a replay into another machine.
  */
 export function endorseMessage(
+    instanceIdHex: string,
     tag: bigint,
     newPub: RabinPubKey,
     payoutHex: string,
@@ -116,6 +157,7 @@ export function endorseMessage(
 ): string {
     return (
         ENDORSE_DOMAIN +
+        instanceIdHex +
         encodeCell(tag) +
         encodeCell(newSlot) +
         keyHash(newPub) +
@@ -125,11 +167,13 @@ export function endorseMessage(
 
 /**
  * Sign an endorsement of a new member key into a roster slot.
- * Input: endorser, tag, new member's public key, payout hex, target slot.
+ * Input: endorser, the machine's instance id hex, tag, new member's public
+ * key, payout hex, target slot.
  * Output: Rabin signature over endorseMessage.
  */
 export function signEndorsement(
     endorser: Attester,
+    instanceIdHex: string,
     tag: bigint,
     newPub: RabinPubKey,
     payoutHex: string,
@@ -137,7 +181,7 @@ export function signEndorsement(
 ): RabinSig {
     return toRabinSig(
         rabin.sign(
-            endorseMessage(tag, newPub, payoutHex, newSlot),
+            endorseMessage(instanceIdHex, tag, newPub, payoutHex, newSlot),
             endorser.priv
         )
     )

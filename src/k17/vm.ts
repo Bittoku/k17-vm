@@ -33,7 +33,7 @@ import {
     slotCells,
     slotOffset,
 } from './isa'
-import { keyHash, endorseMessage } from './attest'
+import { keyHash, endorseMessage, attestMessageFor } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
 export interface K17State {
@@ -71,6 +71,8 @@ export interface StepEnv {
     endorseKey?: RabinPubKey
     /** The new member's payout, 20 bytes as 40 lowercase hex chars (ENDORSE). */
     payout?: string
+    /** The machine's 32-byte instance id as 64 hex chars (ATTEST, ENDORSE messages). */
+    instanceId?: string
     /** Balance of the machine output being spent, in satoshis (VALUE); default 0. */
     value?: bigint
 }
@@ -103,13 +105,34 @@ export function verifyAttestation(
 }
 
 /**
+ * Check an ATTEST signature exactly as the contract does.
+ * Input: instance id hex, tag and value cells, signature, member key.
+ * Output: true when `sig` signs attestMessageFor(instanceId, tag, value)
+ * under `pub`.
+ */
+export function verifyAttestationFor(
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint,
+    sig: RabinSig,
+    pub: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(attestMessageFor(instanceIdHex, tag, value)),
+        sig,
+        pub
+    )
+}
+
+/**
  * Check a roster endorsement signature.
- * Input: tag cell, new member key, payout hex, target slot cell, signature,
- * endorser's key.
- * Output: true when `sig` signs endorseMessage(tag, newPub, payoutHex,
- * newSlot) under `endorser`.
+ * Input: instance id hex, tag cell, new member key, payout hex, target slot
+ * cell, signature, endorser's key.
+ * Output: true when `sig` signs endorseMessage(instanceId, tag, newPub,
+ * payoutHex, newSlot) under `endorser`.
  */
 export function verifyEndorsement(
+    instanceIdHex: string,
     tag: bigint,
     newPub: RabinPubKey,
     payoutHex: string,
@@ -118,7 +141,9 @@ export function verifyEndorsement(
     endorser: RabinPubKey
 ): boolean {
     return RabinVerifier.verifySig(
-        toByteString(endorseMessage(tag, newPub, payoutHex, newSlot)),
+        toByteString(
+            endorseMessage(instanceIdHex, tag, newPub, payoutHex, newSlot)
+        ),
         sig,
         endorser
     )
@@ -556,7 +581,12 @@ export function step(
             if (slot >= BigInt(ROSTER_SLOTS)) return fault()
             const entry = readSlot(mem, Number(slot))
             if (entry.empty) return fault()
-            if (su || !e.sig || e.attestKey === undefined) {
+            if (
+                su ||
+                !e.sig ||
+                e.attestKey === undefined ||
+                e.instanceId === undefined
+            ) {
                 return unchanged('need_witness')
             }
             if (keyHash(e.attestKey) !== entry.hashHex) {
@@ -565,7 +595,15 @@ export function step(
             pop()
             const value = pop()
             const tag = pop()
-            if (!verifyAttestation(tag, value, e.sig, e.attestKey)) {
+            if (
+                !verifyAttestationFor(
+                    e.instanceId,
+                    tag,
+                    value,
+                    e.sig,
+                    e.attestKey
+                )
+            ) {
                 return unchanged('verify_failed')
             }
             su = true
@@ -587,7 +625,8 @@ export function step(
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.endorseKey === undefined ||
-                e.payout === undefined
+                e.payout === undefined ||
+                e.instanceId === undefined
             ) {
                 return unchanged('need_witness')
             }
@@ -602,6 +641,7 @@ export function step(
             const tag = pop()
             if (
                 !verifyEndorsement(
+                    e.instanceId,
                     tag,
                     e.endorseKey,
                     e.payout,
@@ -629,15 +669,18 @@ export function step(
             // N SLOT --   pay N sats to the roster slot's payout address.
             // Every refusal here is caused by the program, so it is a fault
             // and drops the payout; it never invalidates the transaction.
-            // (The contract also faults when the balance cannot cover N; the
-            // VM does not know the reward, so planCycle checks that.)
+            // (The contract also faults when N >= the balance; the VM leaves
+            // that check to planCycle, next to the reward accounting.)
+            // A second PAYSLOT is checked first: it always drops the
+            // payout, however malformed it is.
+            if (ps) return { ...fault(), payslot: undefined }
             if (dsDepth < 2) return fault()
             const slot = pop()
             const sats = pop()
             if (slot >= BigInt(ROSTER_SLOTS)) return fault()
             const entry = readSlot(mem, Number(slot))
             if (entry.empty) return fault()
-            if (sats === 0n || ps) return { ...fault(), payslot: undefined }
+            if (sats === 0n) return fault()
             ps = { slot: Number(slot), payoutHex: entry.payoutHex, sats }
             break
         }

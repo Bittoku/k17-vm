@@ -45,6 +45,7 @@ import {
     bindCycleBuilder,
     newMachine,
     planCycle,
+    defaultInstanceId,
     rosterOf,
     CyclePlan,
     CycleKeys,
@@ -54,6 +55,7 @@ import {
     NO_SIG,
     newAttester,
     signReading,
+    signReadingFor,
     keyHash,
     payoutOf,
     pubKeyBytes,
@@ -74,6 +76,21 @@ const ECON = {
     rewardMin: 100n,
     slope: 1n, // +1 sat per second of silence
     rewardMax: 500n,
+}
+
+/** Memory image with every roster slot filled (for the differential fuzz). */
+const FULL_ROSTER_MEM = [0, 1, 2, 3, 4, 5, 6, 7].reduce(
+    (mem, slot) =>
+        withSlot(mem, slot, slotCells('ab'.repeat(32), '11'.repeat(20))),
+    '00'.repeat(MEM_CELLS * CELL)
+)
+
+/**
+ * Print a size measurement when K17_SIZES is set in the environment, so a
+ * normal test run stays quiet. Input: message. Output: none.
+ */
+function logSize(message: string): void {
+    if (process.env.K17_SIZES) console.log(message)
 }
 
 /**
@@ -175,9 +192,7 @@ describe('K17Machine on-chain', function () {
     it('reports the compiled script size', async () => {
         const m = newMachine(fibonacciProgram(10), ECON, T0)
         const bytes = m.lockingScript.toBuffer().length
-        console.log(
-            `      locking script: ${bytes} bytes for K=${K17Machine.K}`
-        )
+        logSize(`      locking script: ${bytes} bytes for K=${K17Machine.K}`)
         expect(bytes).to.be.greaterThan(1000)
     })
 
@@ -216,10 +231,10 @@ describe('K17Machine on-chain', function () {
             out0.script.toAddress(beneficiaryAddress.network).toString()
         ).to.equal(beneficiaryAddress.toString())
         expect(BigInt(out0.satoshis)).to.equal(remaining)
-        console.log(
+        logSize(
             `      ${cycles} cycles, ${paid} sats to keeper, ${remaining} sats to beneficiary`
         )
-        console.log(`      final cycle tx: ${last.tx.toBuffer().length} bytes`)
+        logSize(`      final cycle tx: ${last.tx.toBuffer().length} bytes`)
     })
 
     it('exercises CALL/EXIT via the countdown program', async () => {
@@ -358,7 +373,8 @@ describe('K17Machine on-chain', function () {
                 }
             }
             const prog = Buffer.from(bytes).toString('hex')
-            const m = await deploy(prog)
+            // every roster slot filled, so random PAYSLOTs can succeed
+            const m = await deploy(prog, FUNDING, FULL_ROSTER_MEM)
             let cur: K17Machine | undefined = m
             let value = BigInt(FUNDING)
             let t = T0
@@ -650,9 +666,7 @@ describe('K17Machine on-chain', function () {
         )
         expect(r.plan.halted).to.be.true
         expect(outputLog(r.plan.nextState)).to.deep.equal([5n, 2231n])
-        console.log(
-            `      attestation cycle tx: ${r.tx.toBuffer().length} bytes`
-        )
+        logSize(`      attestation cycle tx: ${r.tx.toBuffer().length} bytes`)
     })
 
     it('SIGVERIFY: wrong key, altered reading, replayed tag and missing signature are all rejected', async () => {
@@ -674,15 +688,15 @@ describe('K17Machine on-chain', function () {
                 [5n, 2231n],
                 signReading(attesterA, 5n, 2231n)
             )
-        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // reading altered after signing
         await expect(
             cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2232n], good)
-        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // old signature replayed under a new tag
         await expect(
             cycle(next, value, T0 + 2n, keeperA, {}, [6n, 2231n], good)
-        ).to.be.rejectedWith(/rejected by VERIFY or SIGVERIFY/)
+        ).to.be.rejectedWith(/rejected by VERIFY, SIGVERIFY/)
         // no signature at all
         await expect(
             cycle(next, value, T0 + 2n, keeperA, {}, [5n, 2231n])
@@ -790,27 +804,75 @@ describe('K17Machine on-chain', function () {
         expect(r.plan.remaining).to.equal(value - r.plan.reward)
     }
 
-    it('PAYSLOT that the balance cannot cover faults and refunds the beneficiary', async () => {
-        // FUNDING 1000, reward 101 at T0+1: 898 leaves one satoshi, 899 none.
+    it('PAYSLOT has priority over the keeper reward; only N >= the balance faults', async () => {
+        // FUNDING 1000, auction reward 101 at T0+1.
         const small = 1000
-        const ok = await deploy(
-            assemble(['LIT', 898, 'LIT', 3, 'PAYSLOT', 'YIELD']),
-            small,
-            SLOT3_MEM
-        )
-        const r = await cycle(ok, BigInt(small), T0 + 1n, keeperA)
+        const pay = (n: number) =>
+            deploy(
+                assemble(['LIT', n, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+                small,
+                SLOT3_MEM
+            )
+        // 898 leaves room for the full reward and one satoshi.
+        let r = await cycle(await pay(898), BigInt(small), T0 + 1n, keeperA)
         expect(r.plan.reward).to.equal(101n)
         expect(r.tx.outputs[0].satoshis).to.equal(1)
         expect(r.tx.outputs[2].satoshis).to.equal(898)
+        // 950: the reward shrinks to 49, the slot is paid in full.
+        r = await cycle(await pay(950), BigInt(small), T0 + 1n, keeperA)
+        expect(r.plan.reward).to.equal(49n)
+        expect(r.tx.outputs[0].satoshis).to.equal(1)
+        expect(r.tx.outputs[2].satoshis).to.equal(950)
+        // 999: no reward at all (no keeper output); payout is output 1.
+        r = await cycle(await pay(999), BigInt(small), T0 + 1n, keeperA)
+        expect(r.plan.reward).to.equal(0n)
+        expect(r.plan.halted).to.be.false
+        expect(r.tx.outputs[0].satoshis).to.equal(1)
+        expect(addressOf(r.tx.outputs[1])).to.equal(payee.toString())
+        expect(r.tx.outputs[1].satoshis).to.equal(999)
+        // 1000 cannot leave one satoshi: fault, payout dropped, refund.
+        const f = await cycle(await pay(1000), BigInt(small), T0 + 1n, keeperA)
+        expectFaultRefund(f, BigInt(small))
+        expect(f.plan.remaining).to.equal(899n)
+    })
 
-        const broke = await deploy(
-            assemble(['LIT', 899, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+    it('a late keeper cannot shrink the slot payout, only its own reward', async () => {
+        // FUNDING 1000, PAYSLOT 800; at T0+300 the auction offers 400
+        // (capped at rewardMax 500), but only 199 is left after the payout.
+        const small = 1000
+        const m = await deploy(
+            assemble(['LIT', 800, 'LIT', 3, 'PAYSLOT', 'YIELD']),
             small,
             SLOT3_MEM
         )
-        const f = await cycle(broke, BigInt(small), T0 + 1n, keeperA)
-        expectFaultRefund(f, BigInt(small))
-        expect(f.plan.remaining).to.equal(899n)
+        const r = await cycle(m, BigInt(small), T0 + 300n, keeperB)
+        expect(r.plan.halted).to.be.false
+        expect(r.plan.reward).to.equal(199n)
+        expect(r.tx.outputs[0].satoshis).to.equal(1)
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperB.toString())
+        expect(r.tx.outputs[1].satoshis).to.equal(199)
+        expect(addressOf(r.tx.outputs[2])).to.equal(payee.toString())
+        expect(r.tx.outputs[2].satoshis).to.equal(800)
+    })
+
+    it('PAYSLOT then an unrelated fault keeps the payout', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 700, 'LIT', 3, 'PAYSLOT', 'DROP', 'DROP', 'DROP', 'YIELD',
+        ])
+        const m = await deploy(prog, FUNDING, SLOT3_MEM)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.payslot?.sats).to.equal(700n)
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - r.plan.reward - 700n
+        )
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(addressOf(r.tx.outputs[2])).to.equal(payee.toString())
+        expect(r.tx.outputs[2].satoshis).to.equal(700)
     })
 
     it('PAYSLOT 0 faults and refunds the beneficiary', async () => {
@@ -851,6 +913,14 @@ describe('K17Machine on-chain', function () {
         const m = await deploy(twice, FUNDING, SLOT3_MEM)
         const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
         expectFaultRefund(r, BigInt(FUNDING))
+        // a malformed (underflowing) second PAYSLOT also drops the payout
+        const bad = await deploy(
+            assemble(['LIT', 1, 'LIT', 3, 'PAYSLOT', 'PAYSLOT', 'YIELD']),
+            FUNDING,
+            SLOT3_MEM
+        )
+        const rb = await cycle(bad, BigInt(FUNDING), T0 + 1n, keeperA)
+        expectFaultRefund(rb, BigInt(FUNDING))
     })
 
     it('STORE into the roster faults and refunds; STORE below it advances', async () => {
@@ -900,9 +970,10 @@ describe('K17Machine on-chain', function () {
         payoutHex: LANDOWNER_PAYOUT,
     }
     /** The sponsor's endorsement of the landowner into `slot`. */
-    const endorsementFor = (slot: bigint): RabinSig =>
+    const endorsementFor = (slot: bigint, instanceId: string): RabinSig =>
         signEndorsement(
             sponsor,
+            instanceId,
             BigInt(TAG_E),
             landowner.pub,
             LANDOWNER_PAYOUT,
@@ -948,7 +1019,7 @@ describe('K17Machine on-chain', function () {
             keeperA,
             {},
             [],
-            endorsementFor(1n),
+            endorsementFor(1n, m.instanceId),
             ENDORSE_KEYS
         )
         expect(r1.plan.halted).to.be.false
@@ -966,7 +1037,12 @@ describe('K17Machine on-chain', function () {
             keeperA,
             {},
             [READING],
-            signReading(landowner, BigInt(TAG_A), READING),
+            signReadingFor(
+                landowner,
+                enrolled.instanceId,
+                BigInt(TAG_A),
+                READING
+            ),
             { attestKey: landowner.pub }
         )
         expect(r2.plan.halted).to.be.true
@@ -982,7 +1058,7 @@ describe('K17Machine on-chain', function () {
         expect(BigInt(r2.tx.outputs[0].satoshis)).to.equal(
             r1.plan.remaining - r2.plan.reward - BigInt(BOUNTY)
         )
-        console.log(
+        logSize(
             `      endorsement cycle tx: ${
                 r1.tx.toBuffer().length
             } bytes, attestation cycle tx: ${r2.tx.toBuffer().length} bytes`
@@ -1000,7 +1076,9 @@ describe('K17Machine on-chain', function () {
         'ATTEST',
         'YIELD',
     ])
-    const ATTEST0_SIG = (): RabinSig => signReading(sponsor, 5n, 2231n)
+    /** The sponsor's signature of (5, 2231) for the machine `instanceId`. */
+    const ATTEST0_SIG = (instanceId: string): RabinSig =>
+        signReadingFor(sponsor, instanceId, 5n, 2231n)
 
     it('ATTEST accepts the slot key and refuses a 383-byte key', async () => {
         const m = await deploy(ATTEST0, FUNDING, SPONSOR_MEM)
@@ -1010,7 +1088,7 @@ describe('K17Machine on-chain', function () {
             T0 + 1n,
             keeperA,
             [],
-            ATTEST0_SIG(),
+            ATTEST0_SIG(m.instanceId),
             {
                 attestKey: sponsor.pub,
             }
@@ -1025,7 +1103,7 @@ describe('K17Machine on-chain', function () {
             keeperA,
             {},
             [],
-            ATTEST0_SIG(),
+            ATTEST0_SIG(m.instanceId),
             {
                 attestKey: sponsor.pub,
             }
@@ -1042,7 +1120,7 @@ describe('K17Machine on-chain', function () {
             T0 + 1n,
             keeperA,
             [],
-            ATTEST0_SIG(),
+            ATTEST0_SIG(m.instanceId),
             {
                 attestKey: sponsor.pub,
             }
@@ -1067,19 +1145,26 @@ describe('K17Machine on-chain', function () {
                 T0 + 1n,
                 keeperA,
                 [],
-                ATTEST0_SIG(),
+                ATTEST0_SIG(m.instanceId),
                 ENDORSE_KEYS
             )
         ).to.throw(/needs a witness/)
         // Build the spend from an ATTEST-only plan: the contract must refuse.
-        const once = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
+        const once = newMachine(
+            ATTEST0,
+            ECON,
+            T0,
+            rosterOf(),
+            SPONSOR_MEM,
+            m.instanceId
+        )
         const plan = planCycle(
             once,
             BigInt(FUNDING),
             T0 + 1n,
             keeperA,
             [],
-            ATTEST0_SIG(),
+            ATTEST0_SIG(m.instanceId),
             ENDORSE_KEYS
         )
         await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
@@ -1107,7 +1192,7 @@ describe('K17Machine on-chain', function () {
                 T0 + 1n,
                 keeperA,
                 [],
-                endorsementFor(1n),
+                endorsementFor(1n, m.instanceId),
                 ENDORSE_KEYS
             )
         ).to.throw(/witness rejected/)
@@ -1117,7 +1202,8 @@ describe('K17Machine on-chain', function () {
             ECON,
             T0,
             rosterOf(),
-            SPONSOR_MEM
+            SPONSOR_MEM,
+            m.instanceId
         )
         const plan = planCycle(
             into1,
@@ -1125,7 +1211,7 @@ describe('K17Machine on-chain', function () {
             T0 + 1n,
             keeperA,
             [],
-            endorsementFor(1n),
+            endorsementFor(1n, m.instanceId),
             ENDORSE_KEYS
         )
         await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
@@ -1146,7 +1232,7 @@ describe('K17Machine on-chain', function () {
             keeperA,
             {},
             [],
-            ATTEST0_SIG(),
+            ATTEST0_SIG(emptySlot.instanceId),
             {
                 attestKey: sponsor.pub,
             }
@@ -1164,9 +1250,66 @@ describe('K17Machine on-chain', function () {
             keeperA,
             {},
             [],
-            endorsementFor(0n),
+            endorsementFor(0n, filled.instanceId),
             ENDORSE_KEYS
         )
         expectFaultRefund(e, BigInt(FUNDING))
+    })
+
+    it('a reading signed for instance A is refused by instance B', async () => {
+        const idA = 'aa'.repeat(32)
+        const idB = 'bb'.repeat(32)
+        const a = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM, idA)
+        const b = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM, idB)
+        await b.connect(getDefaultSigner())
+        await b.deploy(FUNDING)
+        const keys = { attestKey: sponsor.pub }
+        // The reference VM refuses to plan it.
+        expect(() =>
+            planCycle(
+                b,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                [],
+                ATTEST0_SIG(idA),
+                keys
+            )
+        ).to.throw(/witness rejected/)
+        // Build the spend from instance A's honest plan: B must refuse.
+        const plan = planCycle(
+            a,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            ATTEST0_SIG(idA),
+            keys
+        )
+        await expect(sendPlan(b, plan, T0 + 1n)).to.be.rejectedWith(
+            /signature check failed/
+        )
+        // and B accepts its own signature
+        const r = await cycle(
+            b,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(idB),
+            keys
+        )
+        expect(r.plan.halted).to.be.false
+    })
+
+    it('newMachine derives the default instance id and rejects a malformed one', () => {
+        const m = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
+        expect(m.instanceId).to.equal(
+            defaultInstanceId(ATTEST0, SPONSOR_MEM, T0)
+        )
+        expect(() =>
+            newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM, 'ab')
+        ).to.throw(/32 bytes/)
     })
 })

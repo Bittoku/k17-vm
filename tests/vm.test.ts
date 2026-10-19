@@ -43,6 +43,7 @@ import {
 import {
     newAttester,
     signReading,
+    signReadingFor,
     KEY_BYTES,
     pubKeyBytes,
     pubKeyFromBytes,
@@ -53,6 +54,11 @@ import {
 } from '../src/k17/attest'
 import { RabinVerifier } from 'scrypt-ts-lib'
 import { bsv, toByteString, Utils } from 'scrypt-ts'
+
+/** Instance id used by the ATTEST and ENDORSE tests (any 32 bytes). */
+const ID = 'cd'.repeat(32)
+/** A second instance id, for replay tests. */
+const OTHER_ID = 'ef'.repeat(32)
 
 describe('K17 ISA encoding', () => {
     it('round-trips cells', () => {
@@ -437,6 +443,33 @@ describe('K17 VALUE, PAYSLOT and roster write-protection', function () {
         expect(full.payslot).to.equal(undefined)
     })
 
+    it('a second PAYSLOT drops the payout even when it is malformed', () => {
+        // the second PAYSLOT underflows: still a payout-dropping fault
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 1, 'LIT', 2, 'PAYSLOT', 'PAYSLOT', 'HALT',
+        ])
+        const r = stepK(withSlot2(prog), envOf(0n), 10)
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.equal(undefined)
+        expect(r.state.pc).to.equal(11n)
+    })
+
+    it('PAYSLOT then an unrelated fault keeps the payout', () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 700, 'LIT', 2, 'PAYSLOT', 'DROP', 'DROP', 'DROP', 'YIELD',
+        ])
+        const r = stepK(withSlot2(prog), envOf(0n), 10)
+        expect(r.status).to.equal('halted')
+        expect(r.state.pc).to.equal(11n) // faulted at the first DROP
+        expect(r.payslot).to.deep.equal({
+            slot: 2,
+            payoutHex: payout,
+            sats: 700n,
+        })
+    })
+
     it('PAYSLOT 0 faults', () => {
         const prog = assemble(['LIT', 0, 'LIT', 2, 'PAYSLOT', 'HALT'])
         const r = stepK(withSlot2(prog), envOf(0n), 10)
@@ -489,21 +522,22 @@ describe('K17 roster key encoding and endorsement', function () {
         const payout = payoutOf(bsv.PrivateKey.fromRandom().toAddress())
         expect(payout.length).to.equal(40)
         const other = '11'.repeat(20)
-        const message = endorseMessage(5n, successor.pub, payout, 3n)
+        const message = endorseMessage(ID, 5n, successor.pub, payout, 3n)
         expect(message).to.equal(
             '4b313745' +
+                ID +
                 encodeCell(5n) +
                 encodeCell(3n) +
                 keyHash(successor.pub) +
                 payout
         )
-        const sig = signEndorsement(endorser, 5n, successor.pub, payout, 3n)
+        const sig = signEndorsement(endorser, ID, 5n, successor.pub, payout, 3n)
         expect(
             RabinVerifier.verifySig(toByteString(message), sig, endorser.pub)
         ).to.equal(true)
         expect(
             RabinVerifier.verifySig(
-                toByteString(endorseMessage(5n, successor.pub, other, 3n)),
+                toByteString(endorseMessage(ID, 5n, successor.pub, other, 3n)),
                 sig,
                 endorser.pub
             )
@@ -511,7 +545,7 @@ describe('K17 roster key encoding and endorsement', function () {
         // the target slot is bound: the same endorsement for slot 4 fails
         expect(
             RabinVerifier.verifySig(
-                toByteString(endorseMessage(5n, successor.pub, payout, 4n)),
+                toByteString(endorseMessage(ID, 5n, successor.pub, payout, 4n)),
                 sig,
                 endorser.pub
             )
@@ -554,8 +588,9 @@ describe('K17 ATTEST against a roster slot', function () {
     it('accepts the slot key signing the reading and pops the three cells', function () {
         const r = run(installed(), {
             ...envOf(0n),
-            sig: signReading(attester, 5n, 2231n),
+            sig: signReadingFor(attester, ID, 5n, 2231n),
             attestKey: attester.pub,
+            instanceId: ID,
         })
         expect(r.status).to.equal('halted')
         expect(r.state.ds).to.equal('')
@@ -564,8 +599,9 @@ describe('K17 ATTEST against a roster slot', function () {
     it('rejects a key whose hash is not the slot hash', function () {
         const r = run(installed(), {
             ...envOf(0n),
-            sig: signReading(stranger, 5n, 2231n),
+            sig: signReadingFor(stranger, ID, 5n, 2231n),
             attestKey: stranger.pub,
+            instanceId: ID,
         })
         expect(r.status).to.equal('verify_failed')
     })
@@ -573,8 +609,9 @@ describe('K17 ATTEST against a roster slot', function () {
     it('rejects a signature over a different value', function () {
         const r = run(installed(), {
             ...envOf(0n),
-            sig: signReading(attester, 5n, 2232n),
+            sig: signReadingFor(attester, ID, 5n, 2232n),
             attestKey: attester.pub,
+            instanceId: ID,
         })
         expect(r.status).to.equal('verify_failed')
     })
@@ -582,8 +619,9 @@ describe('K17 ATTEST against a roster slot', function () {
     it('faults on an empty slot and on a slot beyond the roster', function () {
         const env = {
             ...envOf(0n),
-            sig: signReading(attester, 5n, 2231n),
+            sig: signReadingFor(attester, ID, 5n, 2231n),
             attestKey: attester.pub,
+            instanceId: ID,
         }
         expect(stepUntilStop(initialState(prog), env).faulted).to.equal(true)
         const high = assemble(['LIT', 5, 'LIT', 2231, 'LIT', 8, 'ATTEST'])
@@ -593,13 +631,22 @@ describe('K17 ATTEST against a roster slot', function () {
     })
 
     it('needs a witness without a signature or a key, or after one is used', function () {
-        const sig = signReading(attester, 5n, 2231n)
+        const sig = signReadingFor(attester, ID, 5n, 2231n)
         expect(
-            run(installed(), { ...envOf(0n), attestKey: attester.pub }).status
+            run(installed(), {
+                ...envOf(0n),
+                attestKey: attester.pub,
+                instanceId: ID,
+            }).status
         ).to.equal('need_witness')
-        expect(run(installed(), { ...envOf(0n), sig }).status).to.equal(
-            'need_witness'
-        )
+        expect(
+            run(installed(), { ...envOf(0n), sig, instanceId: ID }).status
+        ).to.equal('need_witness')
+        // no instance id: the message cannot be formed
+        expect(
+            run(installed(), { ...envOf(0n), sig, attestKey: attester.pub })
+                .status
+        ).to.equal('need_witness')
         const twice = assemble([
             'LIT',
             5,
@@ -620,9 +667,27 @@ describe('K17 ATTEST against a roster slot', function () {
         const s = initialState(twice)
         const r = run(
             { ...s, mem: installed().mem },
-            { ...envOf(0n), sig, attestKey: attester.pub }
+            { ...envOf(0n), sig, attestKey: attester.pub, instanceId: ID }
         )
         expect(r.status).to.equal('need_witness')
+    })
+
+    it('refuses a reading signed for another instance', function () {
+        const r = run(installed(), {
+            ...envOf(0n),
+            sig: signReadingFor(attester, ID, 5n, 2231n),
+            attestKey: attester.pub,
+            instanceId: OTHER_ID,
+        })
+        expect(r.status).to.equal('verify_failed')
+        // a SIGVERIFY-style ("K17A") signature is not accepted either
+        const k17a = run(installed(), {
+            ...envOf(0n),
+            sig: signReading(attester, 5n, 2231n),
+            attestKey: attester.pub,
+            instanceId: ID,
+        })
+        expect(k17a.status).to.equal('verify_failed')
     })
 })
 
@@ -654,7 +719,8 @@ describe('K17 ENDORSE writes a new roster slot', function () {
     /** Environment carrying a valid sponsor endorsement of the newcomer. */
     const goodEnv = (): StepEnv => ({
         ...envOf(0n),
-        sig: signEndorsement(sponsor, tagE, newcomer.pub, payout, 1n),
+        instanceId: ID,
+        sig: signEndorsement(sponsor, ID, tagE, newcomer.pub, payout, 1n),
         attestKey: sponsor.pub,
         endorseKey: newcomer.pub,
         payout,
@@ -707,8 +773,9 @@ describe('K17 ENDORSE writes a new roster slot', function () {
             c1.state,
             {
                 ...envOf(0n, 0n, [123n]),
-                sig: signReading(newcomer, 9n, 123n),
+                sig: signReadingFor(newcomer, ID, 9n, 123n),
                 attestKey: newcomer.pub,
+                instanceId: ID,
             },
             8
         )
@@ -738,7 +805,7 @@ describe('K17 ENDORSE writes a new roster slot', function () {
             withSponsor(prog),
             {
                 ...goodEnv(),
-                sig: signReading(sponsor, 5n, 2231n),
+                sig: signReadingFor(sponsor, ID, 5n, 2231n),
             },
             16
         )
@@ -749,7 +816,7 @@ describe('K17 ENDORSE writes a new roster slot', function () {
         const short = payout.slice(0, 38)
         const r = run(withSponsor(endorseProg), {
             ...goodEnv(),
-            sig: signEndorsement(sponsor, tagE, newcomer.pub, short, 1n),
+            sig: signEndorsement(sponsor, ID, tagE, newcomer.pub, short, 1n),
             payout: short,
         })
         expect(r.status).to.equal('verify_failed')
@@ -759,7 +826,7 @@ describe('K17 ENDORSE writes a new roster slot', function () {
         const upper = payout.toUpperCase()
         const r = run(withSponsor(endorseProg), {
             ...goodEnv(),
-            sig: signEndorsement(sponsor, tagE, newcomer.pub, upper, 1n),
+            sig: signEndorsement(sponsor, ID, tagE, newcomer.pub, upper, 1n),
             payout: upper,
         })
         expect(r.status).to.equal('verify_failed')
@@ -819,7 +886,7 @@ describe('K17 ENDORSE writes a new roster slot', function () {
     it('rejects a signer whose hash is not the one at SLOT', function () {
         const r = run(withSponsor(endorseProg), {
             ...goodEnv(),
-            sig: signEndorsement(stranger, tagE, newcomer.pub, payout, 1n),
+            sig: signEndorsement(stranger, ID, tagE, newcomer.pub, payout, 1n),
             attestKey: stranger.pub,
         })
         expect(r.status).to.equal('verify_failed')
@@ -828,7 +895,14 @@ describe('K17 ENDORSE writes a new roster slot', function () {
     it('rejects a signature over a different tag', function () {
         const r = run(withSponsor(endorseProg), {
             ...goodEnv(),
-            sig: signEndorsement(sponsor, tagE + 1n, newcomer.pub, payout, 1n),
+            sig: signEndorsement(
+                sponsor,
+                ID,
+                tagE + 1n,
+                newcomer.pub,
+                payout,
+                1n
+            ),
         })
         expect(r.status).to.equal('verify_failed')
     })

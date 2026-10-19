@@ -15,10 +15,10 @@
  * one transaction: whoever supplies the witnesses is the one who collects.
  *
  * K17+ adds the DC4CD-port extension: MIN and MAX (fuzzy AND/OR over truth
- * values), unsigned division (/), and SIGVERIFY k, which accepts a cycle only if the Rabin signature
- * carried in the unlocking script, under roster key k, signs the two cells
- * on top of the stack. This is how an off-chain sensor node attests a
- * reading: the keeper who relays the reading need not be the node that
+ * values), unsigned division (/), and SIGVERIFY k, which accepts a cycle
+ * only if the Rabin signature carried in the unlocking script, under roster
+ * key k, signs the two cells on top of the stack. This is how an off-chain
+ * sensor node attests a reading: the keeper who relays the reading need not be the node that
  * measured it. One signature per cycle; a second SIGVERIFY in the same
  * cycle makes the transaction invalid.
  *
@@ -47,27 +47,32 @@
  * ROSTER_BASE + ROSTER_SLOTS * SLOT_CELLS == MEM_CELLS, so the roster
  * occupies cells 152..255 and programs use cells 0..151.
  *
- * Roster instructions (stack effects; semantics arrive with the machine):
- *   ATTEST  (0x20)  TAG VAL SLOT --  verifies, with the key the transaction supplies,
- *                   that the key's hash equals roster slot SLOT's hash and that its Rabin
- *                   signature covers cell(TAG)||cell(VAL); faults on underflow, SLOT >=
- *                   ROSTER_SLOTS or an empty slot; invalid transaction without a witness,
- *                   with a second signature in one cycle, or on a hash or signature mismatch
- *   ENDORSE (0x21)  TAG SLOT NEWSLOT --  verifies, with the key the transaction supplies,
- *                   that the member at roster slot SLOT vouches for a new member (the
- *                   Rabin signature covers the tag, NEWSLOT, the new key's hash and the
- *                   payout),
- *                   then writes the new member's slot cells into roster slot NEWSLOT;
- *                   pushes nothing. Faults on underflow, SLOT or NEWSLOT >= ROSTER_SLOTS,
- *                   an empty SLOT or a filled NEWSLOT; invalid transaction without a
- *                   witness, with a second signature in one cycle, on a payout that is
- *                   not 40 lowercase hex chars, or on a hash or signature mismatch
- *   PAYSLOT (0x22)  N SLOT --  pays N sats to roster slot SLOT's payout; faults on
- *                   underflow, SLOT >= ROSTER_SLOTS, an empty slot, N == 0, a second
- *                   PAYSLOT in one cycle, or (contract side, at payout accounting) a
- *                   payout that would leave the machine below one satoshi; a fault
- *                   drops the payout
- *   VALUE   (0x23)  -- V    pushes the value of the spent output (mod 2^32)
+ * Roster instructions. The transaction supplies keyA, keyB, payout and one
+ * Rabin signature; I is the machine's 32-byte instance id.
+ *   ATTEST  (0x20)  TAG VAL SLOT --
+ *       keyA must hash to slot SLOT's key hash and sign
+ *       "K17M" || I || cell(TAG) || cell(VAL).
+ *       Fault: underflow, SLOT >= ROSTER_SLOTS, empty slot.
+ *       Invalid tx: no witness, a second signature in the cycle, a hash or
+ *       signature mismatch.
+ *   ENDORSE (0x21)  TAG SLOT NEWSLOT --
+ *       keyA must hash to slot SLOT's key hash and sign
+ *       "K17E" || I || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout;
+ *       then sha256(keyB) || payout is written into slot NEWSLOT.
+ *       Fault: underflow, SLOT or NEWSLOT >= ROSTER_SLOTS, empty SLOT,
+ *       filled NEWSLOT.
+ *       Invalid tx: no witness, a second signature in the cycle, a payout
+ *       that is not 20 bytes (40 lowercase hex chars in the VM), a hash or
+ *       signature mismatch.
+ *   PAYSLOT (0x22)  N SLOT --
+ *       Pays N sats to slot SLOT's payout address. The payout has priority
+ *       over the keeper's reward, which shrinks to make room.
+ *       Fault (payout dropped): a second PAYSLOT in the cycle (checked
+ *       first), underflow, SLOT >= ROSTER_SLOTS, empty slot, N == 0, and
+ *       (at payout accounting, in planCycle and the contract) N greater
+ *       than the balance less one satoshi. Never an invalid tx.
+ *   VALUE   (0x23)  -- V
+ *       Pushes the value of the spent output (mod 2^32).
  * None of the four carries an operand.
  *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
