@@ -1878,4 +1878,252 @@ describe('K17Machine on-chain', function () {
             beneficiaryAddress.toString()
         )
     })
+    // ---- isolating interpreter tests for the tree asserts ----
+    // Each tampered push below leaves the outputs (and so hashOutputs)
+    // valid, so only the named tree assert can refuse the transaction.
+
+    /**
+     * Flip the low bit of one byte of a hex string.
+     * Input: hex, byte index. Output: hex of the same length.
+     */
+    const flipByte = (hex: string, byteIndex: number): string =>
+        hex.slice(0, byteIndex * 2) +
+        (parseInt(hex.slice(byteIndex * 2, byteIndex * 2 + 2), 16) ^ 1)
+            .toString(16)
+            .padStart(2, '0') +
+        hex.slice(byteIndex * 2 + 2)
+
+    /**
+     * Test-only: build a step transaction from an explicit plan without
+     * running the contract's TypeScript body (scrypt-ts `exec: false`) and
+     * without scrypt-ts's own verify-and-broadcast step (`partiallySigned:
+     * true`; the machine input needs no signature), so a transaction the
+     * contract must refuse can still be built and handed to the script
+     * interpreter.
+     * Input: machine, plan (its halted/next/payslot/remaining decide the
+     * outputs), lock time, witness hex for the unlocking script, optional
+     * next instance overriding plan.next. Output: the unverified tx.
+     */
+    async function buildStepTx(
+        m: K17Machine,
+        plan: CyclePlan,
+        lockTime: bigint,
+        witnessHex: string,
+        next?: K17Machine
+    ): Promise<bsv.Transaction> {
+        const opts = bindCycleBuilder(m, plan, keeperA, lockTime, { next })
+        const { tx } = await m.methods.step(
+            addrOf(keeperA),
+            toByteString(witnessHex),
+            plan.sig.s,
+            toByteString(plan.sig.padding),
+            toByteString(plan.keyAHex),
+            toByteString(plan.keyBHex),
+            toByteString(plan.payoutHex),
+            toByteString(plan.leafPre),
+            toByteString(plan.proof),
+            plan.leafIndex,
+            { ...opts, exec: false, partiallySigned: true }
+        )
+        return tx
+    }
+
+    it('interpreter: the old-root check alone refuses a tampered proof or leafPre (state unchanged)', async () => {
+        const prog = assemble(['MEMBER', 'DROP', 'YIELD'])
+        const honest = async () => {
+            const tree = twoMemberTree()
+            const m = await deployTree(prog, tree)
+            const r = await cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                NO_SIG,
+                {},
+                tree.proof(INDEX_A)
+            )
+            expect(r.plan.halted).to.be.false
+            expect((r.next as K17Machine).rosterRoot).to.equal(tree.root())
+            return { r, witness: tree.proof(INDEX_A) }
+        }
+        const proofTamper = await honest()
+        tamperPush(
+            proofTamper.r.tx,
+            0,
+            proofTamper.witness.proof,
+            flipByte(proofTamper.witness.proof, 200)
+        )
+        expectScriptRefused(proofTamper.r.tx)
+        const leafTamper = await honest()
+        tamperPush(
+            leafTamper.r.tx,
+            0,
+            leafTamper.witness.leafPre,
+            flipByte(leafTamper.witness.leafPre, 0)
+        )
+        expectScriptRefused(leafTamper.r.tx)
+    })
+
+    it('interpreter: the tree check still runs when the machine halts (refund layout)', async () => {
+        const prog = assemble(['MEMBER', 'DROP', 'DROP'])
+        const honest = async () => {
+            const tree = twoMemberTree()
+            const m = await deployTree(prog, tree)
+            const r = await cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                NO_SIG,
+                {},
+                tree.proof(INDEX_A)
+            )
+            expect(r.plan.halted).to.be.true
+            expect(addressOf(r.tx.outputs[0])).to.equal(
+                beneficiaryAddress.toString()
+            )
+            return { r, witness: tree.proof(INDEX_A) }
+        }
+        const proofTamper = await honest()
+        tamperPush(
+            proofTamper.r.tx,
+            0,
+            proofTamper.witness.proof,
+            flipByte(proofTamper.witness.proof, 0)
+        )
+        expectScriptRefused(proofTamper.r.tx)
+        const leafTamper = await honest()
+        tamperPush(
+            leafTamper.r.tx,
+            0,
+            leafTamper.witness.leafPre,
+            flipByte(leafTamper.witness.leafPre, 40)
+        )
+        expectScriptRefused(leafTamper.r.tx)
+    })
+
+    it("interpreter: ATTESTM refuses member B's key with B's valid signature on A's leaf", async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(MEMBER_PROG, tree)
+        // pick a reading whose two signatures have distinct, non-empty
+        // paddings and distinct s values, so each push is unique
+        const sigsFor = (reading: bigint) => ({
+            a: signMemberReading(
+                attesterA,
+                m.instanceId,
+                BigInt(TAG_M),
+                reading
+            ),
+            b: signMemberReading(
+                attesterB,
+                m.instanceId,
+                BigInt(TAG_M),
+                reading
+            ),
+        })
+        let reading = 11n
+        let sigs = sigsFor(reading)
+        while (
+            sigs.a.padding === '' ||
+            sigs.b.padding === '' ||
+            sigs.a.padding === sigs.b.padding ||
+            sigs.a.s === sigs.b.s
+        ) {
+            sigs = sigsFor(++reading)
+        }
+        const r = await memberCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            'A',
+            tree,
+            reading
+        )
+        expect(r.tx.verifyInputScript(0).success).to.equal(true)
+        // B's signature over the same "K17T" message verifies under B's
+        // key, so only sha256(keyA) == the leaf's key hash can refuse it.
+        tamperPush(
+            r.tx,
+            0,
+            pubKeyBytes(attesterA.pub),
+            pubKeyBytes(attesterB.pub)
+        )
+        tamperPush(r.tx, 0, int2ByteString(sigs.a.s), int2ByteString(sigs.b.s))
+        tamperPush(r.tx, 0, sigs.a.padding, sigs.b.padding)
+        expectScriptRefused(r.tx)
+    })
+
+    it('interpreter: the same-round assert refuses round == lastRound whatever outputs the tx carries', async () => {
+        const prog = assemble([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            PAY_M,
+            'IN',
+            'PAYLEAF',
+            'YIELD',
+            'LIT',
+            0,
+            'IF',
+            0,
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree)
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [5n],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        tree.set(INDEX_A, leafOf('A', 5n))
+        const n1 = r1.next as K17Machine
+        const t2 = T0 + 2n
+        // Honest round-6 plan; the attacks reuse its reward and payout.
+        const plan6 = planCycle(
+            n1,
+            r1.plan.remaining,
+            t2,
+            keeperA,
+            [6n],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        expect(plan6.halted).to.be.false
+        const round5 = encodeCell(5n)
+
+        // (a) what an implementation without the check would output for
+        // round 5: the member paid and the leaf rewritten with
+        // lastRound 5, i.e. rosterRoot unchanged.
+        const wrongNext = (plan6.next as K17Machine).next()
+        wrongNext.rosterRoot = toByteString(tree.root())
+        const stateTx = await buildStepTx(n1, plan6, t2, round5, wrongNext)
+        expectScriptRefused(stateTx)
+
+        // (b) what an implementation that faults instead of refusing would
+        // output: halted, payout dropped, beneficiary refunded.
+        const refundPlan: CyclePlan = {
+            ...plan6,
+            halted: true,
+            next: undefined,
+            payslot: undefined,
+            remaining: r1.plan.remaining - plan6.reward,
+        }
+        const refundTx = await buildStepTx(n1, refundPlan, t2, round5)
+        expectScriptRefused(refundTx)
+
+        // Control: the same builder with the honest round-6 plan verifies,
+        // so the refusals above come from the round check.
+        const honestTx = await buildStepTx(n1, plan6, t2, encodeCell(6n))
+        expect(honestTx.verifyInputScript(0).success).to.equal(true)
+    })
 })

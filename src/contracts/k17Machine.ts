@@ -65,8 +65,9 @@
  * leaf changed). After the loop, next to the Rabin check, the proof is
  * checked once against the old root, the ATTESTM key is checked against the
  * leaf's key hash and, when the leaf changed, the new leaf hash is walked up
- * the same proof to give the new root. A missing or wrong proof, preimage or index invalidates the
- * transaction; a tree instruction the program misuses is a fault.
+ * the same proof to give the new root. A missing or wrong proof, preimage
+ * or index invalidates the transaction; a tree instruction the program
+ * misuses is a fault.
  *
  * Semantics are defined by `src/k17/isa.ts` and the reference VM in
  * `src/k17/vm.ts`; this file must agree with them exactly.
