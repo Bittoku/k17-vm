@@ -65,6 +65,9 @@ publication belong in this repo.
 - A program that takes `SLOT` (or `N`) from a witness must check it with `VERIFY` (in range
   and filled) before `ATTEST` or `PAYSLOT`; otherwise any keeper can halt the machine with a
   bad slot number and still collect the auction reward.
+- The same applies to `MEMBER`'s `IDX` and `LASTROUND`'s value: the relayer chooses which
+  member it proves, so both are relayer-chosen. Do not use them as a memory address or a loop
+  bound without bounding them first (for example with `VERIFY`), as for `SLOT`.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
   12 KB per instruction with the current 43 handlers (469 384 bytes at K=40). A cycle that

@@ -2148,6 +2148,41 @@ describe('K17Machine on-chain', function () {
         expect(r.tx.outputs[2].satoshis).to.equal(700)
     })
 
+    it('planCycle accepts an uppercase leafPre and proof and sends them lowercased', async () => {
+        const tree = twoMemberTree()
+        const prog = assemble([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            700,
+            'TIME',
+            'PAYLEAF',
+            'YIELD',
+        ])
+        const m = await deployTree(prog, tree)
+        const lower = tree.proof(INDEX_A)
+        const upper: CycleTree = {
+            leafPre: lower.leafPre.toUpperCase(),
+            proof: lower.proof.toUpperCase(),
+            leafIndex: lower.leafIndex,
+        }
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            NO_SIG,
+            {},
+            upper
+        )
+        expect(r.plan.halted).to.be.false
+        expect(r.plan.leafPre).to.equal(lower.leafPre)
+        expect(r.plan.proof).to.equal(lower.proof)
+        expect(r.plan.payslot?.sats).to.equal(700n)
+    })
+
     // ---- isolating interpreter tests for the tree asserts ----
     // Each tampered push below leaves the outputs (and so hashOutputs)
     // valid, so only the named tree assert can refuse the transaction.

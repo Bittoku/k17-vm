@@ -281,16 +281,16 @@ export type TreeOp = 'none' | 'member' | 'admit' | 'remove'
 /**
  * The roster member a cycle's MEMBER instruction bound.
  * Purpose: carries the verified leaf (its fields, preimage and proof) to the
- * later instructions of the same cycle (LASTROUND, ATTESTM, PAYLEAF, and
- * ADMIT, REMOVE in a later task). Output of `step`/`stepK`; never stored in
- * the machine state.
+ * later instructions of the same cycle (LASTROUND, ATTESTM, PAYLEAF; a bound
+ * member makes a later ADMIT or REMOVE fault). Output of `step`/`stepK`;
+ * never stored in the machine state.
  */
 export interface BoundMember {
     /** sha256 of the member's Rabin key, 64 lowercase hex. */
     keyHash: string
     /** The member's 20-byte payout address, 40 lowercase hex. */
     payoutHex: string
-    /** Last round the member attested in. */
+    /** Last round the member was paid in (its admission round until then). */
     lastRound: bigint
     /** Leaf flags cell. */
     flags: bigint
@@ -316,7 +316,7 @@ export interface StepResult {
     sigUsed: boolean
     /** The payout recorded by PAYSLOT this cycle, if any. */
     payslot?: PaySlot
-    /** The tree operation performed so far this cycle; 'none' until Task 3-5 handlers set it. */
+    /** The tree operation performed so far this cycle; 'none' until MEMBER, ADMIT or REMOVE runs. */
     treeOp: TreeOp
     /** The member bound by MEMBER this cycle, if any. */
     member?: BoundMember

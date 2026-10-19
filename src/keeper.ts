@@ -258,7 +258,8 @@ export interface CyclePlan {
  * Input: current instance, its UTXO value (also what VALUE pushes), nLockTime
  * to use, keeper address, witness cells, optional signature, optional keys
  * and payout for ATTEST/ATTESTM/ENDORSE, optional roster-tree proof for
- * MEMBER. The VM starts from the instance's rosterRoot, rosterSeq, logHash
+ * MEMBER (leafPre and proof hex in either case; the plan carries them
+ * lowercased). The VM starts from the instance's rosterRoot, rosterSeq, logHash
  * and sponsorKeyHash. Output: the CyclePlan; `next` carries the predicted
  * rosterRoot, rosterSeq and logHash. Throws when the cycle cannot form a
  * valid transaction (missing or rejected witness, signature, key or tree
@@ -279,6 +280,14 @@ export function planCycle(
 ): CyclePlan {
     const cur = stateOf(m)
     assertWellFormed(cur)
+    // The VM accepts only lowercase leafPre and proof hex, while the chain
+    // reads the bytes and ignores the case of the hex: lowercase them here
+    // so a keeper that passes uppercase hex is not refused.
+    const treeArg: CycleTree | undefined = tree && {
+        leafPre: tree.leafPre.toLowerCase(),
+        proof: tree.proof.toLowerCase(),
+        leafIndex: tree.leafIndex,
+    }
     const env: StepEnv = {
         lockTime,
         who: keeper ? whoOf(keeper.toObject().hash) : 0n,
@@ -290,7 +299,7 @@ export function planCycle(
         payout: keys.payoutHex,
         value,
         instanceId: m.instanceId,
-        tree,
+        tree: treeArg,
     }
     // The contract faults a machine whose instanceId is not 32 bytes before
     // its first instruction; mirror that here.
@@ -343,9 +352,9 @@ export function planCycle(
         keyBHex:
             keys.endorseKey === undefined ? '' : pubKeyBytes(keys.endorseKey),
         payoutHex: keys.payoutHex ?? '',
-        leafPre: tree?.leafPre ?? '',
-        proof: tree?.proof ?? '',
-        leafIndex: tree?.leafIndex ?? 0n,
+        leafPre: treeArg?.leafPre ?? '',
+        proof: treeArg?.proof ?? '',
+        leafIndex: treeArg?.leafIndex ?? 0n,
         treeOp: outcome.treeOp,
         payslot,
     }
