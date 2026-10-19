@@ -53,6 +53,7 @@ import {
     CycleKeys,
     CycleOverrides,
     CycleTree,
+    DEAD_MAN_FLOOR,
 } from '../src/keeper'
 import {
     EMPTY_HASHES,
@@ -143,7 +144,7 @@ async function deploy(
     funding: number = FUNDING,
     initialMemHex?: string,
     tree: { rosterRoot?: string; sponsorKeyHash?: string } = {},
-    econ: typeof ECON & { deadMan?: bigint } = ECON
+    econ: typeof ECON & { deadMan?: bigint; allowShortDeadMan?: boolean } = ECON
 ): Promise<K17Machine> {
     const m = newMachine(
         prog,
@@ -433,10 +434,18 @@ describe('K17Machine on-chain', function () {
      * With `deadMan` > 0 the machines are deployed with that dead-man
      * interval and each cycle advances the clock by MIN_STEP or, at
      * random, by deadMan, so the dead-man halt also meets random mid-run
-     * states (v3.1).
+     * states (v3.1). Each program then starts with `IN DUP VERIFY`, and
+     * each cycle carries 0 to 2 random witness cells in 0..2, so IN can
+     * block, VERIFY can fail, or both pass and leave a cell for the random
+     * part. A cycle the planner refuses (missing or rejected witness) is
+     * retried with no witness at lastTime + deadMan, which must be a
+     * dead-man halt that verifies. These choices use the high bits of the
+     * generator (`hi`); `rnd` uses the low bits, as before, so the programs
+     * of the fuzz runs without a dead-man are unchanged.
      * Input: op set, memory image, PRNG seed, optional deadMan (default
-     * 0n, off). Output: the number of cycles the dead-man halted (throws
-     * on a cycle that does not verify or a tree field that changed).
+     * 0n, off). Output: the number of dead-man halts and how many of them
+     * freed a blocked machine (throws on a cycle that does not verify or a
+     * tree field that changed).
      */
     async function fuzz(
         ops: number[],
@@ -448,9 +457,18 @@ describe('K17Machine on-chain', function () {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
             return seed % n
         }
+        // The low bits of this generator have short periods; use the high
+        // bits for the dead-man choices.
+        const hi = (n: number) => {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff
+            return (seed >>> 16) % n
+        }
         let deadManHalts = 0
+        let blockedEscapes = 0
         for (let p = 0; p < 12; p++) {
-            const bytes: number[] = []
+            // dead-man runs: IN DUP VERIFY first, so witnesses matter
+            const bytes: number[] =
+                deadMan > 0n ? [Op.IN, Op.DUP, Op.VERIFY] : []
             let hasOuth = false
             for (let i = 0; i < 24; i++) {
                 const op = ops[rnd(ops.length)]
@@ -465,6 +483,7 @@ describe('K17Machine on-chain', function () {
             const m = await deploy(prog, FUNDING, mem, FUZZ_TREE, {
                 ...ECON,
                 deadMan,
+                allowShortDeadMan: true,
             })
             expect(m.rosterRoot).to.equal(FUZZ_TREE.rosterRoot)
             expect(m.sponsorKeyHash).to.equal(FUZZ_TREE.sponsorKeyHash)
@@ -472,9 +491,27 @@ describe('K17Machine on-chain', function () {
             let value = BigInt(FUNDING)
             let t = T0
             for (let c = 0; c < 6 && cur; c++) {
-                t +=
-                    deadMan > 0n && rnd(3) === 0 ? deadMan : K17Machine.MIN_STEP
-                const r = await cycle(cur, value, t, keeperA)
+                t += deadMan > 0n && hi(3) === 0 ? deadMan : K17Machine.MIN_STEP
+                let r: CycleResult
+                if (deadMan > 0n) {
+                    const witness = Array.from({ length: hi(3) }, () =>
+                        BigInt(hi(3))
+                    )
+                    try {
+                        r = await cycle(cur, value, t, keeperA, {}, witness)
+                    } catch (e) {
+                        if (!/needs a witness|witness rejected/.test(`${e}`)) {
+                            throw e
+                        }
+                        // Blocked: only the dead-man can move it now.
+                        t = cur.lastTime + deadMan
+                        r = await cycle(cur, value, t, keeperA)
+                        expect(r.plan.deadManHalt).to.be.true
+                        blockedEscapes++
+                    }
+                } else {
+                    r = await cycle(cur, value, t, keeperA)
+                }
                 if (r.plan.deadManHalt) deadManHalts++
                 value = r.plan.remaining
                 cur = r.next
@@ -494,7 +531,7 @@ describe('K17Machine on-chain', function () {
                 }
             }
         }
-        return deadManHalts
+        return { deadManHalts, blockedEscapes }
     }
 
     it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
@@ -514,17 +551,26 @@ describe('K17Machine on-chain', function () {
         await fuzz(ops, FULL_ROSTER_MEM, 12345)
     })
 
-    it('differential fuzz with a dead-man: random states halt cleanly when it fires', async () => {
+    it('differential fuzz with a dead-man: random states, IN and VERIFY included, halt cleanly when it fires', async () => {
+        // IN and VERIFY join the op set: a cycle they block is freed by a
+        // dead-man cycle, which needs no witness. SIGVERIFY, ATTEST and
+        // ENDORSE stay out (the fuzz supplies no signature).
         const ops = ALL_OPS.filter(
-            (v) =>
-                v !== Op.IN &&
-                v !== Op.VERIFY &&
-                v !== Op.SIGVERIFY &&
-                v !== Op.ATTEST &&
-                v !== Op.ENDORSE
+            (v) => v !== Op.SIGVERIFY && v !== Op.ATTEST && v !== Op.ENDORSE
         )
-        const fired = await fuzz(ops, FULL_ROSTER_MEM, 777, 3600n)
-        expect(fired).to.be.greaterThan(0)
+        const { deadManHalts, blockedEscapes } = await fuzz(
+            ops,
+            FULL_ROSTER_MEM,
+            777,
+            DEAD_MAN_FLOOR
+        )
+        if (process.env.K17_SIZES) {
+            console.log(
+                `      dead-man halts: ${deadManHalts}, of which freed a blocked machine: ${blockedEscapes}`
+            )
+        }
+        expect(deadManHalts).to.be.greaterThan(0)
+        expect(blockedEscapes).to.be.greaterThan(0)
     })
 
     it('differential fuzz on an empty roster: ATTEST and ENDORSE only fault', async () => {
@@ -3604,12 +3650,61 @@ describe('K17Machine on-chain', function () {
         expect(r.plan.nextState.rosterSeq).to.equal(0n)
     })
 
+    it('v3.1: ATTEST then REMOVE in one cycle faults on the signature rule', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 5, 'LIT', 2231, 'LIT', 0, 'ATTEST',
+            'LIT', TAG_X, 'REMOVE', 'YIELD',
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree, FUNDING, SPONSOR_MEM)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(m.instanceId),
+            { attestKey: sponsor.pub }
+        )
+        // halted at REMOVE (pc 21), member A still in the tree
+        expectRefundAt(r, BigInt(FUNDING), 21n)
+        expect(r.plan.treeOp).to.equal('none')
+        expect(r.plan.nextState.rosterRoot).to.equal(tree.root())
+        expect(r.plan.nextState.rosterSeq).to.equal(0n)
+        expect(r.plan.nextState.ds).to.equal(encodeCell(BigInt(TAG_X)))
+    })
+
+    it('v3.1: SIGVERIFY then SIGVERIFY in one cycle faults and refunds', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'IN', 'IN', 'OVER', 'OVER',
+            'SIGVERIFY', 1, 'SIGVERIFY', 1, 'HALT',
+        ])
+        const m = newMachine(prog, ECON, T0, ROSTER, undefined, TEST_ID)
+        await m.connect(getDefaultSigner())
+        await m.deploy(FUNDING)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [5n, 2231n],
+            signReading(attesterB, 5n, 2231n)
+        )
+        // the first SIGVERIFY verified; the second (pc 9) faults
+        expectRefundAt(r, BigInt(FUNDING), 9n)
+        expect(r.plan.nextState.ds).to.equal(encodeCell(5n) + encodeCell(2231n))
+    })
+
     // ------------------------------------------------------------------
     // v3.1: dead-man halt and the 60 s minimum clock advance
     // ------------------------------------------------------------------
 
-    /** Dead-man interval of the tests below: one hour. */
-    const DEAD_MAN = 3600n
+    /** Dead-man interval of the tests below: the keeper's floor, 6 hours. */
+    const DEAD_MAN = DEAD_MAN_FLOOR
 
     /**
      * Deploy `prog` with ECON plus a dead-man interval.
@@ -3650,10 +3745,34 @@ describe('K17Machine on-chain', function () {
         planCycle(m, BigInt(FUNDING), m.lastTime + DEAD_MAN, keeperA)
 
     it('v3.1: newMachine stores deadMan and refuses a negative or too short one', () => {
+        expect(DEAD_MAN_FLOOR).to.equal(21_600n)
         expect(newMachine(WAIT_IN, ECON, T0).deadMan).to.equal(0n)
         expect(
             newMachine(WAIT_IN, { ...ECON, deadMan: DEAD_MAN }, T0).deadMan
         ).to.equal(DEAD_MAN)
+        // below the 6 h floor: refused unless the test override is set
+        expect(() =>
+            newMachine(WAIT_IN, { ...ECON, deadMan: DEAD_MAN_FLOOR - 1n }, T0)
+        ).to.throw(/DEAD_MAN_FLOOR/)
+        expect(
+            newMachine(
+                WAIT_IN,
+                { ...ECON, deadMan: 3600n, allowShortDeadMan: true },
+                T0
+            ).deadMan
+        ).to.equal(3600n)
+        // at or below MIN_STEP: refused even with the override
+        expect(() =>
+            newMachine(
+                WAIT_IN,
+                {
+                    ...ECON,
+                    deadMan: K17Machine.MIN_STEP,
+                    allowShortDeadMan: true,
+                },
+                T0
+            )
+        ).to.throw(/MIN_STEP/)
         expect(() =>
             newMachine(WAIT_IN, { ...ECON, deadMan: -1n }, T0)
         ).to.throw(/negative/)
@@ -3686,6 +3805,24 @@ describe('K17Machine on-chain', function () {
         // nothing ran: the state is the deployed one
         expect(r.plan.nextState.pc).to.equal(0n)
         expect(r.plan.nextState.out).to.equal('')
+    })
+
+    it('v3.1: a dead-man cycle that pays the keeper rewardMax + 1 is refused by the interpreter', async () => {
+        const m = await deployDeadMan(WAIT_IN, DEAD_MAN)
+        const honest = deadManPlanFor(m)
+        expect(honest.reward).to.equal(ECON.rewardMax)
+        // Control: the honest dead-man transaction verifies.
+        const ok = await buildStepTx(m, honest, T0 + DEAD_MAN, '')
+        expect(ok.verifyInputScript(0).success).to.equal(true)
+        // One satoshi more to the keeper, one less to the beneficiary.
+        const greedy: CyclePlan = {
+            ...honest,
+            reward: honest.reward + 1n,
+            remaining: honest.remaining - 1n,
+        }
+        const bad = await buildStepTx(m, greedy, T0 + DEAD_MAN, '')
+        expect(BigInt(bad.outputs[1].satoshis)).to.equal(ECON.rewardMax + 1n)
+        expectScriptRefused(bad)
     })
 
     it('v3.1: dead-man counts from the last live cycle and never fires when disabled', async () => {

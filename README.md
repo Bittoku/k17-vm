@@ -252,7 +252,11 @@ the transaction invalid.
   for a `SLOT` from `IN`.
 - Clock. A cycle that keeps the machine alive must have nLockTime at least
   `lastTime + 60` (`MIN_STEP`, v3.1). A cycle that halts (`HALT`, a fault
-  or the dead-man) needs only nLockTime at or after `lastTime`.
+  or the dead-man) needs only nLockTime at or after `lastTime`. Trade-off:
+  nLockTime = MTP - 1 gives about one live cycle per block and no clock
+  lag; steps of exactly 60 seconds give up to about 10 cycles per block but
+  let `lastTime` trail MTP, which brings the dead-man closer in real time.
+  Any honest cycle at MTP - 1 removes the lag.
 - Dead-man. When the machine has `deadMan` > 0 and nLockTime is at least
   `lastTime + deadMan`, the cycle halts before its first instruction (v3.1).
   See "Freeze escape" below.
@@ -313,22 +317,43 @@ the outputs. The reference VM does the same check in `stepK` and `run` when
 
 Minimum clock advance. `lastTime` is the nLockTime of the last cycle, and
 consensus does not bound nLockTime from below. Without a rule, a keeper that
-can drive the machine could keep `nLockTime = lastTime` on every cycle, so
-the dead-man clock would not move. Thus a cycle that keeps the machine alive
+can drive the machine could keep `nLockTime = lastTime` on every cycle.
+Then `lastTime` would fall behind real time, and the dead-man would become
+due earlier in real time than `deadMan` after the last real progress. Thus a cycle that keeps the machine alive
 must advance the clock by `MIN_STEP` = 60 seconds:
 `nLockTime >= lastTime + 60`. The contract asserts this on the alive path
 only; a halting cycle is exempt, so the rule never blocks a refund.
 `planCycle` refuses a live cycle that breaks it. The rule also applies to
 the first cycle: it must be at least 60 seconds after the deployment time.
-`newMachine` refuses a `deadMan` from 1 to 60, because then no cycle could
-stay alive.
+Throughput and clock lag. Consensus bounds nLockTime above by the median
+time past (MTP) of the chain. A keeper that uses `nLockTime = MTP - 1` gets
+about one live cycle per block, and `lastTime` does not lag. A keeper that
+steps by exactly `lastTime + 60` can get up to about 10 cycles per block
+(MTP moves about 600 seconds per block), but `lastTime` then trails MTP,
+and this lag brings the dead-man closer in real time. Any honest cycle at `MTP - 1` removes the lag. The measurements below are
+per cycle; a machine's throughput is bounded by this clock rule, not by
+script size.
 
-Choose `deadMan` long compared with the program's normal interval between
-cycles (for example 30 days for daily rounds). A keeper that pins the clock
-must still win every cycle for `deadMan` seconds and pay the fee of each,
-and the result is only an early refund of the beneficiary's own deposit.
+Choosing `deadMan`. `deadMan` counts on the chain's MTP clock, not on wall
+time. When `MTP - 1 >= lastTime + deadMan`, the dead-man cycle can be
+mined, and from then on a kill is the profitable move for any keeper: it
+pays the same capped reward as a live cycle with about half the fee (there
+is no state output). Honest keepers cannot push `lastTime` past MTP, so an
+MTP jump of `deadMan` or more lets any keeper kill a healthy machine.
+Choose `deadMan` as a multiple of the round length, for example 30 days for
+daily rounds. `newMachine` refuses a `deadMan` below `DEAD_MAN_FLOOR`
+(6 hours) unless `econ.allowShortDeadMan` is true (for tests), and always
+refuses a value from 1 to 60, because then no cycle could stay alive.
+
+A keeper that pins the clock with 60-second steps must still win every
+cycle and pay the fee of each, and the result is only an early refund of
+the beneficiary's own deposit.
 
 ## Measurements (K = instructions per cycle)
+
+Throughput is set by the clock as well as by size (v3.1): about one live
+cycle per block at nLockTime = MTP - 1, or up to about 10 per block with
+60-second steps at the cost of clock lag (see "Freeze escape").
 
 | K   | Handlers                                | Locking script | Cycle transaction |
 | --- | --------------------------------------- | -------------- | ----------------- |

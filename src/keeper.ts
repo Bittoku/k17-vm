@@ -24,6 +24,23 @@
  * pays the keeper its reward (CyclePlan.deadManHalt). Note that the
  * first cycle after deployment counts from the deployment time.
  *
+ * deadMan counts on the chain's clock, not wall time: nLockTime is bounded
+ * above by the median time past (MTP), so a dead-man cycle becomes
+ * mineable once MTP - 1 >= lastTime + deadMan. From then on a kill is the
+ * profitable move for any keeper: it pays the same capped reward as a live
+ * cycle, with about half the fee (no state output). Honest keepers cannot
+ * push lastTime past MTP, so after any MTP jump of deadMan or more a
+ * healthy machine can be killed. Choose deadMan as a multiple of the round
+ * length (for example 30 days for daily rounds); newMachine refuses less
+ * than DEAD_MAN_FLOOR (6 h) unless `econ.allowShortDeadMan` is set.
+ *
+ * Throughput: with MIN_STEP, a keeper that uses lockTime = MTP - 1 gets
+ * about one live cycle per block and no clock lag. Stepping by exactly
+ * lastTime + 60 allows up to about 10 cycles per block (MTP moves about
+ * 600 s per block), but lastTime then trails MTP, and that lag brings the
+ * dead-man closer in real time.
+ * Any honest cycle at MTP - 1 removes the lag.
+ *
  * The functions here are pure plumbing; the economics live in the contract.
  */
 
@@ -64,7 +81,20 @@ export interface Economics {
      * whatever the program waits for. Optional; 0 (the default) disables it.
      */
     deadMan?: bigint
+    /**
+     * Test-only escape: allow 0 < deadMan < DEAD_MAN_FLOOR (it must still be
+     * above MIN_STEP). Default false.
+     */
+    allowShortDeadMan?: boolean
 }
+
+/**
+ * Smallest dead-man interval newMachine accepts without
+ * `econ.allowShortDeadMan`: 6 hours, in seconds. A shorter interval lets
+ * any keeper kill a healthy machine after an ordinary MTP jump (see the
+ * module header).
+ */
+export const DEAD_MAN_FLOOR = 6n * 3600n
 
 /** Fixed SIGVERIFY roster as the contract wants it: exactly FIXED_ROSTER_SLOTS keys. */
 export type Roster = FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>
@@ -106,7 +136,9 @@ export function randomInstanceId(): string {
  * instance or its locking script) before they sign anything for it.
  * Output: contract instance with empty stacks and the given (default zeroed)
  * memory. `econ.deadMan` (default 0n, disabled) becomes the immutable
- * dead-man interval; a negative value, or one in (0, MIN_STEP], throws.
+ * dead-man interval, counted on the chain's MTP clock. It must be 0 or at
+ * least DEAD_MAN_FLOOR (6 h); with `econ.allowShortDeadMan` (tests only)
+ * any value above MIN_STEP is accepted. Anything else throws.
  */
 export function newMachine(
     progHex: string,
@@ -124,14 +156,21 @@ export function newMachine(
     )
     const deadMan = econ.deadMan ?? 0n
     if (deadMan < 0n) throw new Error('deadMan must not be negative')
-    // A cycle that stays alive needs lockTime >= lastTime + MIN_STEP, and
-    // the dead-man fires at lastTime + deadMan; with deadMan <= MIN_STEP no
-    // cycle could ever keep the machine alive. The contract accepts such a
-    // value; the keeper refuses to deploy it.
-    if (deadMan > 0n && deadMan <= K17Machine.MIN_STEP) {
-        throw new Error(
-            `deadMan must be 0 (off) or above MIN_STEP (${K17Machine.MIN_STEP} s)`
-        )
+    // The contract accepts any value; the keeper refuses values that let
+    // a keeper kill a healthy machine. With deadMan <= MIN_STEP no cycle
+    // could ever stay alive; below DEAD_MAN_FLOOR an ordinary MTP jump makes
+    // a kill due while honest keepers are still active.
+    if (deadMan > 0n) {
+        if (deadMan <= K17Machine.MIN_STEP) {
+            throw new Error(
+                `deadMan must be 0 (off) or above MIN_STEP (${K17Machine.MIN_STEP} s)`
+            )
+        }
+        if (deadMan < DEAD_MAN_FLOOR && !econ.allowShortDeadMan) {
+            throw new Error(
+                `deadMan must be 0 (off) or at least DEAD_MAN_FLOOR (${DEAD_MAN_FLOOR} s); set allowShortDeadMan for tests`
+            )
+        }
     }
     const instanceId = instanceIdHex ?? randomInstanceId()
     if (!/^[0-9a-f]{64}$/.test(instanceId)) {
@@ -303,9 +342,12 @@ export interface CyclePlan {
  * which shrinks (down to 0) so the payout is paid in full; only
  * N > value - 1 is a fault, as on chain: the plan is halted and carries no
  * payslot. The VM gets the instance's deadMan and lastTime, so a due
- * dead-man gives a halted plan with `deadManHalt` set (v3.1). Throws when
- * a cycle that stays alive uses a lockTime earlier than lastTime +
- * K17Machine.MIN_STEP (the contract refuses it; v3.1).
+ * dead-man gives a halted plan with `deadManHalt` set (v3.1).
+ * Errors, in the order they are checked: 'lockTime before lastTime'
+ * (before the VM runs); then the VM's 'needs a witness' or 'witness
+ * rejected'; then the MIN_STEP error for a cycle that stays alive with a
+ * lockTime earlier than lastTime + K17Machine.MIN_STEP (the contract
+ * refuses it; v3.1).
  */
 export function planCycle(
     m: K17Machine,
@@ -317,6 +359,8 @@ export function planCycle(
     keys: CycleKeys = {},
     tree?: CycleTree
 ): CyclePlan {
+    // Checked first, before the VM, so callers can match it reliably.
+    if (lockTime < m.lastTime) throw new Error('lockTime before lastTime')
     const cur = stateOf(m)
     assertWellFormed(cur)
     // The VM accepts only lowercase leafPre and proof hex, while the chain
@@ -372,7 +416,6 @@ export function planCycle(
         nextState = { ...nextState, halted: true }
         payslot = undefined
     }
-    if (lockTime < m.lastTime) throw new Error('lockTime before lastTime')
     if (!nextState.halted && lockTime < m.lastTime + K17Machine.MIN_STEP) {
         // The contract asserts the minimum clock advance on the alive path
         // only; a halting cycle may use any nLockTime from lastTime on.

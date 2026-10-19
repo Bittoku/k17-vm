@@ -84,7 +84,17 @@ publication belong in this repo.
   `locktime >= lastTime + MIN_STEP` (an `assert` on the alive path only). Halting cycles are
   exempt, so a refund is never blocked. It is a transaction rule, not a VM rule: `planCycle`
   enforces it. Tests must space live cycles at least 60 s apart, the first one 60 s after the
-  deployment time `T0`.
+  deployment time `T0`. Throughput trade-off: lockTime = MTP - 1 gives about one live cycle
+  per block and no clock lag; steps of exactly lastTime + 60 give up to about 10 cycles per
+  block but let lastTime trail MTP, which brings the dead-man closer in real time; any honest
+  cycle at MTP - 1 removes the lag.
+- `deadMan` counts on the chain's MTP clock, not wall time. Once due, a kill is the profitable
+  move for any keeper (same capped reward, about half the fee), so choose it as a multiple of
+  the round length (e.g. 30 days for daily rounds). `newMachine` refuses `0 < deadMan <
+DEAD_MAN_FLOOR` (6 h, exported from `src/keeper.ts`) unless `econ.allowShortDeadMan` is true
+  (tests only), and always refuses `deadMan <= 60`.
+- `planCycle` error order: `lockTime before lastTime` (before the VM), then the VM's
+  `needs a witness` / `witness rejected`, then the MIN_STEP error.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
   12 KB per instruction with the current 43 handlers (469 918 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).

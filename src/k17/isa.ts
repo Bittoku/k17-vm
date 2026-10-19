@@ -27,8 +27,8 @@
  * Three outcomes are NOT faults: IN with no witness left, VERIFY of zero,
  * and SIGVERIFY with a missing or wrong signature. Those make the spending
  * transaction invalid instead, so a program that is waiting for an answer
- * cannot be killed by a keeper who has none, and a wrong answer is simply
- * rejected.
+ * cannot be killed by a keeper who has none (until the dead-man interval
+ * passes, when deadMan > 0), and a wrong answer is simply rejected.
  *
  * Encoding
  *   - Program: a byte string. Each instruction is one opcode byte. LIT, IF,

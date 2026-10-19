@@ -199,7 +199,8 @@ export class K17Machine extends SmartContract {
      * Minimum clock advance, in seconds, of a cycle that keeps the machine
      * alive (v3.1): its nLockTime must be at least lastTime + MIN_STEP. A
      * keeper therefore cannot hold the clock still while it drives the
-     * machine (which would hold off the dead-man halt), and a chain of
+     * machine (which would bring the dead-man halt earlier in real time,
+     * since lastTime would lag behind the chain's clock), and a chain of
      * unconfirmed cycles cannot run the program with a frozen clock. A
      * cycle that halts (HALT, a fault or the dead-man) is exempt, so this
      * rule never blocks a refund.

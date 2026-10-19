@@ -1703,6 +1703,23 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         expect(r.treeOp).to.equal('none')
     })
 
+    it('REMOVE with the signature already used this cycle faults (v3.1)', () => {
+        const tree = buildTree()
+        const s = {
+            ...machine(['REMOVE', 'HALT'], tree.root()),
+            ds: encodeCell(TAG),
+        }
+        // the full REMOVE witness is present; only the used signature faults
+        expect(step(s, removeEnv(tree), 0, 0n, false).status).to.equal('ok')
+        const r = step(s, removeEnv(tree), 0, 0n, true)
+        expect(r.status).to.equal('fault')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.rosterRoot).to.equal(s.rosterRoot)
+        expect(r.state.rosterSeq).to.equal(s.rosterSeq)
+        expect(r.state.ds).to.equal(encodeCell(TAG))
+        expect(r.treeOp).to.equal('none')
+    })
+
     it('ADMIT over a filled slot with an empty preimage and its real siblings is verify_failed', () => {
         const tree = buildTree()
         const s = machine(ADMIT_PROG, tree.root())
