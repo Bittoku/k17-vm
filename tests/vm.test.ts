@@ -600,3 +600,211 @@ describe('K17 ATTEST against a roster slot', function () {
         expect(r.status).to.equal('need_witness')
     })
 })
+
+describe('K17 ENDORSE writes a new roster slot', function () {
+    this.timeout(120_000)
+    const sponsor = newAttester(Buffer.alloc(32, 31))
+    const newcomer = newAttester(Buffer.alloc(32, 32))
+    const stranger = newAttester(Buffer.alloc(32, 33))
+    const payout = payoutOf(bsv.PrivateKey.fromRandom().toAddress())
+    const tagE = 77n
+    const endorseProg = assemble([
+        'LIT',
+        Number(tagE),
+        'LIT',
+        0,
+        'LIT',
+        1,
+        'ENDORSE',
+        'HALT',
+    ])
+    /** State with the sponsor installed in slot 0. */
+    const withSponsor = (prog: string) => {
+        const s = initialState(prog)
+        return {
+            ...s,
+            mem: withSlot(s.mem, 0, slotCells(keyHash(sponsor.pub), payout)),
+        }
+    }
+    /** Environment carrying a valid sponsor endorsement of the newcomer. */
+    const goodEnv = (): StepEnv => ({
+        ...envOf(0n),
+        sig: signEndorsement(sponsor, tagE, newcomer.pub, payout),
+        attestKey: sponsor.pub,
+        endorseKey: newcomer.pub,
+        payout,
+    })
+    /** Single-step until an instruction does not return 'ok'. */
+    const stepUntilStop = (
+        start: ReturnType<typeof initialState>,
+        env: StepEnv
+    ) => {
+        let cur = start
+        for (;;) {
+            const r = step(cur, env)
+            if (r.status !== 'ok') return r
+            cur = r.state
+        }
+    }
+
+    it('writes the newcomer into the named slot and pops three cells', function () {
+        const r = run(withSponsor(endorseProg), goodEnv())
+        expect(r.status).to.equal('halted')
+        expect(r.state.ds).to.equal('')
+        expect(readSlot(r.state.mem, 1)).to.deep.equal({
+            hashHex: keyHash(newcomer.pub),
+            payoutHex: payout,
+            empty: false,
+        })
+    })
+
+    it('lets the newcomer attest in the next cycle', function () {
+        const prog = assemble([
+            'LIT',
+            Number(tagE),
+            'LIT',
+            0,
+            'LIT',
+            1,
+            'ENDORSE',
+            'YIELD',
+            'LIT',
+            9,
+            'IN',
+            'LIT',
+            1,
+            'ATTEST',
+            'HALT',
+        ])
+        const c1 = stepK(withSponsor(prog), goodEnv(), 8)
+        expect(c1.status).to.equal('ok')
+        const c2 = stepK(
+            c1.state,
+            {
+                ...envOf(0n, 0n, [123n]),
+                sig: signReading(newcomer, 9n, 123n),
+                attestKey: newcomer.pub,
+            },
+            8
+        )
+        expect(c2.status).to.equal('halted')
+        expect(c2.state.ds).to.equal('')
+    })
+
+    it('needs a witness for ENDORSE after ATTEST in one cycle', function () {
+        const prog = assemble([
+            'LIT',
+            5,
+            'LIT',
+            2231,
+            'LIT',
+            0,
+            'ATTEST',
+            'LIT',
+            Number(tagE),
+            'LIT',
+            0,
+            'LIT',
+            1,
+            'ENDORSE',
+            'HALT',
+        ])
+        const r = stepK(
+            withSponsor(prog),
+            {
+                ...goodEnv(),
+                sig: signReading(sponsor, 5n, 2231n),
+            },
+            16
+        )
+        expect(r.status).to.equal('need_witness')
+    })
+
+    it('rejects a payout that is not 40 hex characters', function () {
+        const short = payout.slice(0, 38)
+        const r = run(withSponsor(endorseProg), {
+            ...goodEnv(),
+            sig: signEndorsement(sponsor, tagE, newcomer.pub, short),
+            payout: short,
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('rejects uppercase hex in the payout', function () {
+        const upper = payout.toUpperCase()
+        const r = run(withSponsor(endorseProg), {
+            ...goodEnv(),
+            sig: signEndorsement(sponsor, tagE, newcomer.pub, upper),
+            payout: upper,
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('faults when NEWSLOT is filled, out of range, or SLOT is empty or low on stack', function () {
+        const into0 = assemble([
+            'LIT',
+            Number(tagE),
+            'LIT',
+            0,
+            'LIT',
+            0,
+            'ENDORSE',
+        ])
+        expect(stepUntilStop(withSponsor(into0), goodEnv()).faulted).to.equal(
+            true
+        )
+        const into8 = assemble([
+            'LIT',
+            Number(tagE),
+            'LIT',
+            0,
+            'LIT',
+            8,
+            'ENDORSE',
+        ])
+        expect(stepUntilStop(withSponsor(into8), goodEnv()).faulted).to.equal(
+            true
+        )
+        const emptySponsor = assemble([
+            'LIT',
+            Number(tagE),
+            'LIT',
+            2,
+            'LIT',
+            1,
+            'ENDORSE',
+        ])
+        expect(
+            stepUntilStop(withSponsor(emptySponsor), goodEnv()).faulted
+        ).to.equal(true)
+        const shallow = assemble(['LIT', 0, 'LIT', 1, 'ENDORSE'])
+        expect(stepUntilStop(withSponsor(shallow), goodEnv()).faulted).to.equal(
+            true
+        )
+    })
+
+    it('needs a witness when endorseKey is missing', function () {
+        const env = goodEnv()
+        delete env.endorseKey
+        expect(run(withSponsor(endorseProg), env).status).to.equal(
+            'need_witness'
+        )
+    })
+
+    it('rejects a signer whose hash is not the one at SLOT', function () {
+        const r = run(withSponsor(endorseProg), {
+            ...goodEnv(),
+            sig: signEndorsement(stranger, tagE, newcomer.pub, payout),
+            attestKey: stranger.pub,
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('rejects a signature over a different tag', function () {
+        const r = run(withSponsor(endorseProg), {
+            ...goodEnv(),
+            sig: signEndorsement(sponsor, tagE + 1n, newcomer.pub, payout),
+        })
+        expect(r.status).to.equal('verify_failed')
+    })
+})

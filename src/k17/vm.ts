@@ -30,9 +30,10 @@ import {
     attestMessage,
     decodeCell,
     encodeCell,
+    slotCells,
     slotOffset,
 } from './isa'
-import { keyHash } from './attest'
+import { keyHash, endorseMessage } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
 export interface K17State {
@@ -66,6 +67,10 @@ export interface StepEnv {
     sig?: RabinSig
     /** The Rabin public key `sig` is made under (ATTEST); its hash must match the slot. */
     attestKey?: RabinPubKey
+    /** The new member's Rabin public key (ENDORSE); its hash is written to the new slot. */
+    endorseKey?: RabinPubKey
+    /** The new member's payout, 20 bytes as 40 lowercase hex chars (ENDORSE). */
+    payout?: string
     /** Balance of the machine output being spent, in satoshis (VALUE); default 0. */
     value?: bigint
 }
@@ -94,6 +99,25 @@ export function verifyAttestation(
         toByteString(attestMessage(tag, value)),
         sig,
         pub
+    )
+}
+
+/**
+ * Check a roster endorsement signature.
+ * Input: tag cell, new member key, payout hex, signature, endorser's key.
+ * Output: true when `sig` signs endorseMessage(tag, newPub, payoutHex) under `endorser`.
+ */
+export function verifyEndorsement(
+    tag: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string,
+    sig: RabinSig,
+    endorser: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(endorseMessage(tag, newPub, payoutHex)),
+        sig,
+        endorser
     )
 }
 
@@ -541,6 +565,54 @@ export function step(
             if (!verifyAttestation(tag, value, e.sig, e.attestKey)) {
                 return unchanged('verify_failed')
             }
+            su = true
+            break
+        }
+        case Op.ENDORSE: {
+            // TAG SLOT NEWSLOT --   the member at SLOT vouches for a new member,
+            // whose slot cells are written into the empty slot NEWSLOT
+            if (dsDepth < 3) return fault()
+            const newSlot = cellAt(ds, dsDepth - 1)
+            const slot = cellAt(ds, dsDepth - 2)
+            if (slot >= BigInt(ROSTER_SLOTS)) return fault()
+            const sponsor = readSlot(mem, Number(slot))
+            if (sponsor.empty) return fault()
+            if (newSlot >= BigInt(ROSTER_SLOTS)) return fault()
+            if (!readSlot(mem, Number(newSlot)).empty) return fault()
+            if (
+                su ||
+                !e.sig ||
+                e.attestKey === undefined ||
+                e.endorseKey === undefined ||
+                e.payout === undefined
+            ) {
+                return unchanged('need_witness')
+            }
+            if (!/^[0-9a-f]{40}$/.test(e.payout)) {
+                return unchanged('verify_failed')
+            }
+            if (keyHash(e.attestKey) !== sponsor.hashHex) {
+                return unchanged('verify_failed')
+            }
+            pop()
+            pop()
+            const tag = pop()
+            if (
+                !verifyEndorsement(
+                    tag,
+                    e.endorseKey,
+                    e.payout,
+                    e.sig,
+                    e.attestKey
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            mem = withSlot(
+                mem,
+                Number(newSlot),
+                slotCells(keyHash(e.endorseKey), e.payout)
+            )
             su = true
             break
         }

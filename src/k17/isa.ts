@@ -53,7 +53,14 @@
  *                   signature covers cell(TAG)||cell(VAL); faults on underflow, SLOT >=
  *                   ROSTER_SLOTS or an empty slot; invalid transaction without a witness,
  *                   with a second signature in one cycle, or on a hash or signature mismatch
- *   ENDORSE (0x21)  see the v2 machine; verifies a roster endorsement
+ *   ENDORSE (0x21)  TAG SLOT NEWSLOT --  verifies, with the key the transaction supplies,
+ *                   that the member at roster slot SLOT vouches for a new member (the
+ *                   Rabin signature covers the tag, the new key's hash and the payout),
+ *                   then writes the new member's slot cells into roster slot NEWSLOT;
+ *                   pushes nothing. Faults on underflow, SLOT or NEWSLOT >= ROSTER_SLOTS,
+ *                   an empty SLOT or a filled NEWSLOT; invalid transaction without a
+ *                   witness, with a second signature in one cycle, on a payout that is
+ *                   not 40 lowercase hex chars, or on a hash or signature mismatch
  *   PAYSLOT (0x22)  N SLOT --  pays N sats to roster slot SLOT's payout; faults on
  *                   underflow, SLOT >= ROSTER_SLOTS or an empty slot; a second
  *                   PAYSLOT in one cycle invalidates the transaction
