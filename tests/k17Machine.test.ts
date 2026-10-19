@@ -1644,18 +1644,30 @@ describe('K17Machine on-chain', function () {
 
     /**
      * Deploy `prog` with the roster tree root of `tree` and the sponsor's
-     * key hash. Input: program hex, off-chain tree. Output: live instance.
+     * key hash. Input: program hex, off-chain tree, optional funding (sats,
+     * default FUNDING) and initial memory image hex (default zeroed).
+     * Output: live instance.
      */
     async function deployTree(
         prog: string,
-        tree: SparseMerkleTree
+        tree: SparseMerkleTree,
+        funding: number = FUNDING,
+        initialMemHex?: string
     ): Promise<K17Machine> {
-        const m = newMachine(prog, ECON, T0, undefined, undefined, TEST_ID, {
-            rosterRoot: tree.root(),
-            sponsorKeyHash: keyHash(sponsor.pub),
-        })
+        const m = newMachine(
+            prog,
+            ECON,
+            T0,
+            undefined,
+            initialMemHex,
+            TEST_ID,
+            {
+                rosterRoot: tree.root(),
+                sponsorKeyHash: keyHash(sponsor.pub),
+            }
+        )
         await m.connect(getDefaultSigner())
-        await m.deploy(FUNDING)
+        await m.deploy(funding)
         return m
     }
 
@@ -1901,6 +1913,184 @@ describe('K17Machine on-chain', function () {
             beneficiaryAddress.toString()
         )
     })
+    // ---- PAYLEAF faults and payout accounting (mirror the PAYSLOT tests) ----
+
+    /**
+     * Run one cycle of `prog` on a fresh tree machine, binding member A with
+     * its proof from `tree` (or no proof when `bind` is false).
+     * Input: program hex, off-chain tree, lock time, funding (sats), memory
+     * image hex, whether to send member A's proof. Output: the cycle result.
+     */
+    async function payleafCycle(
+        prog: string,
+        tree: SparseMerkleTree,
+        lockTime: bigint = T0 + 1n,
+        funding: number = FUNDING,
+        mem?: string,
+        bind = true
+    ): Promise<CycleResult> {
+        const m = await deployTree(prog, tree, funding, mem)
+        return cycle(
+            m,
+            BigInt(funding),
+            lockTime,
+            keeperA,
+            {},
+            [],
+            NO_SIG,
+            {},
+            bind ? tree.proof(INDEX_A) : undefined
+        )
+    }
+
+    it('PAYLEAF 0 faults and refunds the beneficiary, no payout', async () => {
+        const r = await payleafCycle(
+            assemble(['MEMBER', 'DROP', 'LIT', 0, 'TIME', 'PAYLEAF', 'YIELD']),
+            twoMemberTree()
+        )
+        expect(r.plan.treeOp).to.equal('member')
+        expectFaultRefund(r, BigInt(FUNDING))
+    })
+
+    it('PAYSLOT then PAYLEAF, and PAYLEAF twice, fault and drop the payout', async () => {
+        // A filled memory slot (3) and a tree member (A) in one machine.
+        // prettier-ignore
+        const slotThenLeaf = assemble([
+            'LIT', 700, 'LIT', 3, 'PAYSLOT',
+            'MEMBER', 'DROP', 'LIT', 500, 'TIME', 'PAYLEAF', 'YIELD',
+        ])
+        const r1 = await payleafCycle(
+            slotThenLeaf,
+            twoMemberTree(),
+            T0 + 1n,
+            FUNDING,
+            SLOT3_MEM
+        )
+        expectFaultRefund(r1, BigInt(FUNDING))
+        // prettier-ignore
+        const leafTwice = assemble([
+            'MEMBER', 'DROP', 'LIT', 500, 'TIME', 'PAYLEAF',
+            'LIT', 500, 'TIME', 'PAYLEAF', 'YIELD',
+        ])
+        const r2 = await payleafCycle(leafTwice, twoMemberTree())
+        expectFaultRefund(r2, BigInt(FUNDING))
+    })
+
+    it('PAYLEAF without MEMBER faults and refunds', async () => {
+        const r = await payleafCycle(
+            assemble(['LIT', 500, 'TIME', 'PAYLEAF', 'YIELD']),
+            twoMemberTree(),
+            T0 + 1n,
+            FUNDING,
+            undefined,
+            false
+        )
+        expect(r.plan.treeOp).to.equal('none')
+        expectFaultRefund(r, BigInt(FUNDING))
+    })
+
+    it('PAYLEAF of the whole balance faults: refund, payout dropped, as planCycle predicts', async () => {
+        const prog = assemble([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            FUNDING,
+            'TIME',
+            'PAYLEAF',
+            'YIELD',
+        ])
+        const tree = twoMemberTree()
+        // planCycle alone, before any transaction: halted, no payout.
+        const m = await deployTree(prog, tree)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        expect(plan.halted).to.be.true
+        expect(plan.payslot).to.be.undefined
+        expect(plan.reward).to.equal(101n)
+        expect(plan.remaining).to.equal(BigInt(FUNDING) - 101n)
+        // The same cycle on chain: the refund layout, no output 2.
+        const r = await payleafCycle(prog, tree)
+        expectFaultRefund(r, BigInt(FUNDING))
+        expect(r.plan.reward).to.equal(plan.reward)
+    })
+
+    it('a late keeper cannot shrink the PAYLEAF payout: the reward is clamped to value - 1 - N', async () => {
+        // FUNDING 1000, PAYLEAF 800; at T0+300 the auction offers 400
+        // (rewardMax 500), but only 1000 - 1 - 800 = 199 is left.
+        const small = 1000
+        const tree = twoMemberTree()
+        const lockTime = T0 + 300n
+        const r = await payleafCycle(
+            assemble([
+                'MEMBER',
+                'DROP',
+                'LIT',
+                800,
+                'TIME',
+                'PAYLEAF',
+                'YIELD',
+            ]),
+            tree,
+            lockTime,
+            small
+        )
+        expect(r.plan.halted).to.be.false
+        expect(r.plan.reward).to.equal(199n)
+        expect(r.plan.payslot).to.deep.equal({
+            slot: -1,
+            payoutHex: payoutOf(memberAAddress),
+            sats: 800n,
+        })
+        expect(r.plan.remaining).to.equal(1n)
+        expect(r.tx.outputs[0].satoshis).to.equal(1)
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(r.tx.outputs[1].satoshis).to.equal(199)
+        expect(addressOf(r.tx.outputs[2])).to.equal(memberAAddress.toString())
+        expect(r.tx.outputs[2].satoshis).to.equal(800)
+        tree.set(INDEX_A, leafOf('A', lockTime))
+        expect((r.next as K17Machine).rosterRoot).to.equal(tree.root())
+    })
+
+    it('PAYLEAF then an unrelated fault keeps the payout', async () => {
+        // DROP on the empty stack after PAYLEAF faults, as in the PAYSLOT test.
+        const r = await payleafCycle(
+            assemble([
+                'MEMBER',
+                'DROP',
+                'LIT',
+                700,
+                'TIME',
+                'PAYLEAF',
+                'DROP',
+                'YIELD',
+            ]),
+            twoMemberTree()
+        )
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.payslot?.sats).to.equal(700n)
+        expect(r.tx.outputs.length).to.equal(4) // beneficiary, keeper, member, change
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - r.plan.reward - 700n
+        )
+        expect(r.plan.remaining).to.equal(
+            BigInt(FUNDING) - r.plan.reward - 700n
+        )
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(addressOf(r.tx.outputs[2])).to.equal(memberAAddress.toString())
+        expect(r.tx.outputs[2].satoshis).to.equal(700)
+    })
+
     // ---- isolating interpreter tests for the tree asserts ----
     // Each tampered push below leaves the outputs (and so hashOutputs)
     // valid, so only the named tree assert can refuse the transaction.
