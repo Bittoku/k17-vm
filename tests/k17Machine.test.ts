@@ -102,6 +102,28 @@ const FULL_ROSTER_MEM = [0, 1, 2, 3, 4, 5, 6, 7].reduce(
 )
 
 /**
+ * Roster-tree settings for the differential fuzz: a seeded tree with two
+ * members (fixed key hashes and payouts, at leaves 5 and 6) and a non-zero
+ * sponsor key hash, so the fuzz runs on a populated tree, not the empty one.
+ */
+const FUZZ_TREE = {
+    rosterRoot: new SparseMerkleTree(
+        new Map([
+            [5, encodeLeafPre('c1'.repeat(32), '21'.repeat(20), 0n)],
+            [6, encodeLeafPre('c2'.repeat(32), '22'.repeat(20), 7n)],
+        ])
+    ).root(),
+    sponsorKeyHash: 'cd'.repeat(32),
+}
+
+/**
+ * Most candidates a test tries when it searches for a tag or reading whose
+ * signatures give unique pushes. A search that needs more throws, so a
+ * key or payout change cannot make a test loop forever.
+ */
+const SEARCH_CAP = 1000
+
+/**
  * Print a size measurement when K17_SIZES is set in the environment, so a
  * normal test run stays quiet. Input: message. Output: none.
  */
@@ -111,15 +133,25 @@ function logSize(message: string): void {
 
 /**
  * Deploy a machine for `prog` and return the live instance.
- * Input: program hex; optional funding (sats) and initial memory image hex.
- * Output: the deployed contract instance.
+ * Input: program hex; optional funding (sats), initial memory image hex and
+ * roster-tree settings (rosterRoot, sponsorKeyHash; default the empty tree
+ * and no sponsor). Output: the deployed contract instance.
  */
 async function deploy(
     prog: string,
     funding: number = FUNDING,
-    initialMemHex?: string
+    initialMemHex?: string,
+    tree: { rosterRoot?: string; sponsorKeyHash?: string } = {}
 ): Promise<K17Machine> {
-    const m = newMachine(prog, ECON, T0, rosterOf(), initialMemHex, TEST_ID)
+    const m = newMachine(
+        prog,
+        ECON,
+        T0,
+        rosterOf(),
+        initialMemHex,
+        TEST_ID,
+        tree
+    )
     await m.connect(getDefaultSigner())
     await m.deploy(funding)
     return m
@@ -385,10 +417,16 @@ describe('K17Machine on-chain', function () {
 
     /**
      * Differential fuzz: deploy 12 random 24-instruction programs over `ops`
-     * with memory image `mem` and step each up to 6 cycles; every cycle goes
-     * through cycle(), so every one must pass verifyInputScript.
+     * with memory image `mem` on the populated FUZZ_TREE roster and step
+     * each up to 6 cycles; every cycle goes through cycle(), so every one
+     * must pass verifyInputScript. After every cycle (in the VM's next
+     * state, and in the contract's next state when the machine is alive),
+     * rosterRoot and rosterSeq must equal their deployed values (the op set
+     * has no instruction that may change them), and logHash must still be zero
+     * unless the program contains an OUTH instruction (a static check: the
+     * fuzz does not trace which instructions ran).
      * Input: op set, memory image, PRNG seed. Output: none (throws on a
-     * cycle that does not verify).
+     * cycle that does not verify or a tree field that changed).
      */
     async function fuzz(ops: number[], mem: string, seed: number) {
         const rnd = (n: number) => {
@@ -397,16 +435,20 @@ describe('K17Machine on-chain', function () {
         }
         for (let p = 0; p < 12; p++) {
             const bytes: number[] = []
+            let hasOuth = false
             for (let i = 0; i < 24; i++) {
                 const op = ops[rnd(ops.length)]
                 bytes.push(op)
+                if (op === Op.OUTH) hasOuth = true
                 if (HAS_OPERAND.has(op)) {
                     const operand = rnd(40) // small: addresses, offsets, literals
                     bytes.push(operand, 0, 0, 0)
                 }
             }
             const prog = Buffer.from(bytes).toString('hex')
-            const m = await deploy(prog, FUNDING, mem)
+            const m = await deploy(prog, FUNDING, mem, FUZZ_TREE)
+            expect(m.rosterRoot).to.equal(FUZZ_TREE.rosterRoot)
+            expect(m.sponsorKeyHash).to.equal(FUZZ_TREE.sponsorKeyHash)
             let cur: K17Machine | undefined = m
             let value = BigInt(FUNDING)
             let t = T0
@@ -415,6 +457,20 @@ describe('K17Machine on-chain', function () {
                 const r = await cycle(cur, value, t, keeperA)
                 value = r.plan.remaining
                 cur = r.next
+                // The VM's next state, halted or not (most random programs
+                // fault within a cycle or two) ...
+                const s = r.plan.nextState
+                expect(s.rosterRoot).to.equal(FUZZ_TREE.rosterRoot)
+                expect(s.rosterSeq).to.equal(0n)
+                if (!hasOuth) expect(s.logHash).to.equal('00'.repeat(32))
+                // ... and the state output the contract accepted, when alive.
+                if (cur) {
+                    expect(cur.rosterRoot).to.equal(FUZZ_TREE.rosterRoot)
+                    expect(cur.rosterSeq).to.equal(0n)
+                    if (!hasOuth) {
+                        expect(cur.logHash).to.equal('00'.repeat(32))
+                    }
+                }
             }
         }
     }
@@ -1536,6 +1592,7 @@ describe('K17Machine on-chain', function () {
             sigs.b.padding === '' ||
             sigs.a.padding === sigs.b.padding
         ) {
+            if (tag - 5 >= SEARCH_CAP) throw new Error('no ATTEST tag found')
             sigs = sigsFor(++tag)
         }
         const prog = assemble([
@@ -2246,6 +2303,9 @@ describe('K17Machine on-chain', function () {
             sigs.a.padding === sigs.b.padding ||
             sigs.a.s === sigs.b.s
         ) {
+            if (reading - 11n >= BigInt(SEARCH_CAP)) {
+                throw new Error('no ATTESTM reading found')
+            }
             sigs = sigsFor(++reading)
         }
         const r = await memberCycle(
@@ -2387,13 +2447,14 @@ describe('K17Machine on-chain', function () {
         )
 
     /**
-     * ADMIT tag for these tests: the first tag from 1000 up for which the
+     * ADMIT tag for these tests: the first tag from 1000 up (at most
+     * SEARCH_CAP tries) for which the
      * signatures the tamper tests swap (sponsor at seq 0 against seq 1,
      * seq 0 against seq 2, and sponsor against attesterB at seq 0) all
      * have distinct, non-empty paddings, so each push is unique.
      */
     const TAG_D = (() => {
-        for (let tag = 1000; ; tag++) {
+        for (let tag = 1000; tag < 1000 + SEARCH_CAP; tag++) {
             const sig = (signer: Attester, seq: bigint) =>
                 admissionSig(signer, seq, ADMIT_INDEX, attesterA.pub, tag)
             const s0 = sig(sponsor, 0n)
@@ -2405,6 +2466,7 @@ describe('K17Machine on-chain', function () {
                 return tag
             }
         }
+        throw new Error('no ADMIT tag found')
     })()
 
     /**
@@ -3021,6 +3083,7 @@ describe('K17Machine on-chain', function () {
                 removalSig(attesterB, tag, INDEX_A, leafHashA)
             )
         ) {
+            if (tag - 2000 >= SEARCH_CAP) throw new Error('no REMOVE tag found')
             tag++
         }
         const tree = twoMemberTree()
