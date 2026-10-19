@@ -763,7 +763,22 @@ describe('K17Machine on-chain', function () {
         }
     })
 
-    it('PAYSLOT that the balance cannot cover is refused', async () => {
+    /**
+     * Check that a cycle faulted with no PAYSLOT payout: halted, outputs are
+     * beneficiary (value less reward), keeper reward, change; no output 2.
+     */
+    const expectFaultRefund = (r: CycleResult, value: bigint): void => {
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.payslot).to.be.undefined
+        expect(r.tx.outputs.length).to.equal(3) // beneficiary, keeper, change
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(value - r.plan.reward)
+        expect(r.plan.remaining).to.equal(value - r.plan.reward)
+    }
+
+    it('PAYSLOT that the balance cannot cover faults and refunds the beneficiary', async () => {
         // FUNDING 1000, reward 101 at T0+1: 898 leaves one satoshi, 899 none.
         const small = 1000
         const ok = await deploy(
@@ -781,9 +796,19 @@ describe('K17Machine on-chain', function () {
             small,
             SLOT3_MEM
         )
-        await expect(
-            cycle(broke, BigInt(small), T0 + 1n, keeperA)
-        ).to.be.rejectedWith(/balance too low/)
+        const f = await cycle(broke, BigInt(small), T0 + 1n, keeperA)
+        expectFaultRefund(f, BigInt(small))
+        expect(f.plan.remaining).to.equal(899n)
+    })
+
+    it('PAYSLOT 0 faults and refunds the beneficiary', async () => {
+        const m = await deploy(
+            assemble(['LIT', 0, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+            FUNDING,
+            SLOT3_MEM
+        )
+        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expectFaultRefund(r, BigInt(FUNDING))
     })
 
     it('PAYSLOT on an empty or out-of-range slot faults and refunds the beneficiary', async () => {
@@ -806,47 +831,14 @@ describe('K17Machine on-chain', function () {
         }
     })
 
-    it('a second PAYSLOT in one cycle invalidates the transaction', async () => {
+    it('a second PAYSLOT in one cycle faults, drops the payout and refunds', async () => {
+        // prettier-ignore
         const twice = assemble([
-            'LIT',
-            1,
-            'LIT',
-            3,
-            'PAYSLOT',
-            'LIT',
-            1,
-            'LIT',
-            3,
-            'PAYSLOT',
-            'YIELD',
+            'LIT', 1, 'LIT', 3, 'PAYSLOT', 'LIT', 1, 'LIT', 3, 'PAYSLOT', 'YIELD',
         ])
         const m = await deploy(twice, FUNDING, SLOT3_MEM)
-        // The reference VM refuses to plan it.
-        expect(() => planCycle(m, BigInt(FUNDING), T0 + 1n, keeperA)).to.throw(
-            /needs a witness/
-        )
-        // Build the spend from a one-PAYSLOT plan: the contract must refuse.
-        const once = newMachine(
-            assemble(['LIT', 1, 'LIT', 3, 'PAYSLOT', 'YIELD']),
-            ECON,
-            T0,
-            rosterOf(),
-            SLOT3_MEM
-        )
-        const plan = planCycle(once, BigInt(FUNDING), T0 + 1n, keeperA)
-        const opts = bindCycleBuilder(m, plan, keeperA, T0 + 1n)
-        await expect(
-            m.methods.step(
-                addrOf(keeperA),
-                toByteString(''),
-                0n,
-                toByteString(''),
-                toByteString(''),
-                toByteString(''),
-                toByteString(''),
-                opts
-            )
-        ).to.be.rejectedWith(/one PAYSLOT per cycle/)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        expectFaultRefund(r, BigInt(FUNDING))
     })
 
     it('STORE into the roster faults and refunds; STORE below it advances', async () => {

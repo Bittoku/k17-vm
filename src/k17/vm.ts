@@ -104,18 +104,21 @@ export function verifyAttestation(
 
 /**
  * Check a roster endorsement signature.
- * Input: tag cell, new member key, payout hex, signature, endorser's key.
- * Output: true when `sig` signs endorseMessage(tag, newPub, payoutHex) under `endorser`.
+ * Input: tag cell, new member key, payout hex, target slot cell, signature,
+ * endorser's key.
+ * Output: true when `sig` signs endorseMessage(tag, newPub, payoutHex,
+ * newSlot) under `endorser`.
  */
 export function verifyEndorsement(
     tag: bigint,
     newPub: RabinPubKey,
     payoutHex: string,
+    newSlot: bigint,
     sig: RabinSig,
     endorser: RabinPubKey
 ): boolean {
     return RabinVerifier.verifySig(
-        toByteString(endorseMessage(tag, newPub, payoutHex)),
+        toByteString(endorseMessage(tag, newPub, payoutHex, newSlot)),
         sig,
         endorser
     )
@@ -602,6 +605,7 @@ export function step(
                     tag,
                     e.endorseKey,
                     e.payout,
+                    newSlot,
                     e.sig,
                     e.attestKey
                 )
@@ -622,14 +626,18 @@ export function step(
             break
         }
         case Op.PAYSLOT: {
-            // N SLOT --   pay N sats to the roster slot's payout address
+            // N SLOT --   pay N sats to the roster slot's payout address.
+            // Every refusal here is caused by the program, so it is a fault
+            // and drops the payout; it never invalidates the transaction.
+            // (The contract also faults when the balance cannot cover N; the
+            // VM does not know the reward, so planCycle checks that.)
             if (dsDepth < 2) return fault()
             const slot = pop()
             const sats = pop()
             if (slot >= BigInt(ROSTER_SLOTS)) return fault()
             const entry = readSlot(mem, Number(slot))
             if (entry.empty) return fault()
-            if (ps) return unchanged('need_witness')
+            if (sats === 0n || ps) return { ...fault(), payslot: undefined }
             ps = { slot: Number(slot), payoutHex: entry.payoutHex, sats }
             break
         }

@@ -179,9 +179,9 @@ export interface CyclePlan {
  * Input: current instance, its UTXO value (also what VALUE pushes), nLockTime
  * to use, keeper address, witness cells, optional signature, optional keys
  * and payout for ATTEST/ENDORSE. Output: the CyclePlan. Throws when the cycle
- * cannot form a valid transaction (missing or rejected witness, signature,
- * key, or a second PAYSLOT). A PAYSLOT the balance cannot cover is not caught
- * here; the contract refuses it ('balance too low for PAYSLOT').
+ * cannot form a valid transaction (missing or rejected witness, signature or
+ * key). A PAYSLOT the balance cannot cover (value - reward - N < 1) is a
+ * fault, as on chain: the plan is halted and carries no payslot.
  */
 export function planCycle(
     m: K17Machine,
@@ -212,9 +212,16 @@ export function planCycle(
     if (outcome.status === 'verify_failed') {
         throw new Error('witness rejected by VERIFY or SIGVERIFY')
     }
-    const nextState = outcome.state
     const reward = rewardAt(m, lockTime, value, outcome.bountyDue)
-    const payslot = outcome.payslot
+    let nextState = outcome.state
+    let payslot = outcome.payslot
+    if (payslot && value - reward - payslot.sats < 1n) {
+        // The contract faults an unaffordable PAYSLOT at its payout
+        // accounting (the VM cannot, it does not know the reward): the
+        // machine halts, the payout is dropped, the beneficiary is refunded.
+        nextState = { ...nextState, halted: true }
+        payslot = undefined
+    }
     const remaining = value - reward - (payslot?.sats ?? 0n)
     const witnessHex = witness.map((w) => encodeCell(w)).join('')
     const common = {

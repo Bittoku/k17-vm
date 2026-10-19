@@ -32,8 +32,10 @@
  * ROSTER_SLOTS_MEM roster slots of SLOT_CELLS cells each (32-byte key hash,
  * then 20-byte payout address hash). The region is write-protected: STORE
  * into it faults. VALUE pushes the balance of the machine output being
- * spent. PAYSLOT n k pays n sats to slot k's payout address in output 2;
- * one PAYSLOT per cycle, and the balance must keep at least one satoshi.
+ * spent. PAYSLOT pays N sats to slot k's payout address in output 2. A
+ * PAYSLOT the program gets wrong (N == 0, a second one in a cycle, or one
+ * that would leave the machine below one satoshi) is a fault: the machine
+ * halts, the payout is dropped and the beneficiary is refunded.
  *
  * Liveness Dutch auction: the reward grows linearly with the time elapsed
  * since the previous cycle (`rewardMin + slope * elapsed`, capped at
@@ -601,7 +603,8 @@ export class K17Machine extends SmartContract {
                         } else if (op == 34n) {
                             // PAYSLOT : N SLOT --
                             // Underflow, bad slot or empty slot: fault.
-                            // A second PAYSLOT this cycle: tx invalid.
+                            // N == 0 or a second PAYSLOT this cycle: fault
+                            // that also drops the payout (never tx-invalid).
                             if (n < 8n || top >= K17Machine.ROSTER_SLOTS_MEM) {
                                 halted = true
                             } else {
@@ -616,11 +619,11 @@ export class K17Machine extends SmartContract {
                                     )
                                 ) {
                                     halted = true
+                                } else if (second == 0n || payslotUsed) {
+                                    halted = true
+                                    payslotUsed = false
+                                    payslotSats = 0n
                                 } else {
-                                    assert(
-                                        !payslotUsed,
-                                        'one PAYSLOT per cycle'
-                                    )
                                     payslotUsed = true
                                     payslotSats = second
                                     payslotAddr = Addr(
@@ -692,11 +695,12 @@ export class K17Machine extends SmartContract {
             // Never drain the machine below one satoshi.
             reward = value - 1n
         }
-        if (payslotSats > 0n) {
-            assert(
-                value - reward - payslotSats >= 1n,
-                'balance too low for PAYSLOT'
-            )
+        if (payslotUsed && value - reward - payslotSats < 1n) {
+            // An unaffordable PAYSLOT is a fault: halt, drop the payout,
+            // refund the beneficiary.
+            halted = true
+            payslotUsed = false
+            payslotSats = 0n
         }
         const remaining = value - reward - payslotSats
 

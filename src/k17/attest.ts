@@ -101,31 +101,45 @@ export function keyHash(pub: RabinPubKey): string {
 }
 
 /**
- * Message an outgoing roster member signs to endorse a successor.
- * Input: tag (replay guard), successor public key, 20-byte payout hex.
- * Output: hex of ENDORSE_DOMAIN + cell(tag) + keyHash(newPub) + payout.
+ * Message a roster member signs to endorse a new member into a slot.
+ * Input: tag (replay guard), new member's public key, 20-byte payout hex,
+ * target roster slot (the NEWSLOT cell of ENDORSE).
+ * Output: hex of ENDORSE_DOMAIN + cell(tag) + cell(newSlot) +
+ * keyHash(newPub) + payout. Binding the slot stops a relayer from writing
+ * the endorsed key into a slot the endorser did not choose.
  */
 export function endorseMessage(
     tag: bigint,
     newPub: RabinPubKey,
-    payoutHex: string
+    payoutHex: string,
+    newSlot: bigint
 ): string {
-    return ENDORSE_DOMAIN + encodeCell(tag) + keyHash(newPub) + payoutHex
+    return (
+        ENDORSE_DOMAIN +
+        encodeCell(tag) +
+        encodeCell(newSlot) +
+        keyHash(newPub) +
+        payoutHex
+    )
 }
 
 /**
- * Sign an endorsement of a successor key.
- * Input: endorser, tag, successor public key, payout hex.
+ * Sign an endorsement of a new member key into a roster slot.
+ * Input: endorser, tag, new member's public key, payout hex, target slot.
  * Output: Rabin signature over endorseMessage.
  */
 export function signEndorsement(
     endorser: Attester,
     tag: bigint,
     newPub: RabinPubKey,
-    payoutHex: string
+    payoutHex: string,
+    newSlot: bigint
 ): RabinSig {
     return toRabinSig(
-        rabin.sign(endorseMessage(tag, newPub, payoutHex), endorser.priv)
+        rabin.sign(
+            endorseMessage(tag, newPub, payoutHex, newSlot),
+            endorser.priv
+        )
     )
 }
 
