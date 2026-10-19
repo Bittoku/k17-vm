@@ -480,13 +480,14 @@ export class K17Machine extends SmartContract {
         // 3 REMOVE. At most one per cycle; the proof is checked once after
         // the loop when treeOp != 0.
         let treeOp = 0n
-        // lastRound of the leaf MEMBER bound (treeOp 1), which PAYLEAF
-        // advances to ROUND, or the ROUND that ADMIT gives the new leaf
-        // (treeOp 2). The other member fields are sliced from leafPre where
-        // needed, so the loop carries no copies of them.
+        // lastRound of the leaf MEMBER bound (only read when treeOp == 1);
+        // PAYLEAF advances it to ROUND. The other member fields are sliced
+        // from leafPre where needed, so the loop carries no copies of them.
         let memberLastRound = 0n
-        // TAG of ADMIT or REMOVE; their message is built after the loop.
-        let treeTag = 0n
+        // The operand cells of ADMIT (cell(TAG) || cell(ROUND)) or REMOVE
+        // (cell(TAG)), as they were on the stack; the message and new leaf
+        // are built from them after the loop.
+        let treeArgs = toByteString('')
         // True once PAYLEAF, ADMIT or REMOVE replaced the leaf; the new
         // leaf hash and root are computed after the loop only then.
         let leafChanged = false
@@ -1098,37 +1099,23 @@ export class K17Machine extends SmartContract {
                                 memberLastRound = top
                                 ds = ds2
                             }
-                        } else if (op == 40n) {
-                            // ADMIT : TAG ROUND --
+                        } else if (op == 40n || op == 41n) {
+                            // ADMIT (0x28) : TAG ROUND --
+                            // REMOVE (0x29) : TAG --
                             // Underflow or a second tree instruction this
                             // cycle: fault. A second signature: tx invalid.
                             // The leaf, proof, keys, payout and signature
                             // are checked after the loop (tx invalid when
-                            // wrong).
-                            if (n < 8n || treeOp != 0n) {
+                            // wrong). treeOp becomes 2 (ADMIT) or 3 (REMOVE).
+                            const need: bigint = op == 40n ? 8n : 4n
+                            if (n < need || treeOp != 0n) {
                                 halted = true
                             } else {
                                 assert(!sigUsed, 'one attestation per cycle')
                                 sigUsed = true
-                                treeOp = 2n
-                                treeTag = second
-                                memberLastRound = top
-                                ds = ds2
-                            }
-                        } else if (op == 41n) {
-                            // REMOVE : TAG --
-                            // Underflow or a second tree instruction this
-                            // cycle: fault. A second signature: tx invalid.
-                            // The leaf, proof, key and signature are checked
-                            // after the loop (tx invalid when wrong).
-                            if (n < 4n || treeOp != 0n) {
-                                halted = true
-                            } else {
-                                assert(!sigUsed, 'one attestation per cycle')
-                                sigUsed = true
-                                treeOp = 3n
-                                treeTag = top
-                                ds = ds1
+                                treeOp = op - 38n
+                                treeArgs = slice(ds, n - need, n)
+                                ds = slice(ds, 0n, n - need)
                             }
                         } else if (op == 42n) {
                             // OUTH : N1 --   logHash := sha256(logHash || cell(N1))
@@ -1209,7 +1196,7 @@ export class K17Machine extends SmartContract {
                 // cell(rosterSeq) || cell(leafIndex) || (the rest below)
                 const msgHead =
                     this.instanceId +
-                    K17Machine.cell(treeTag) +
+                    slice(treeArgs, 0n, 4n) +
                     K17Machine.cell(this.rosterSeq) +
                     K17Machine.cell(leafIndex)
                 if (treeOp == 2n) {
@@ -1233,7 +1220,7 @@ export class K17Machine extends SmartContract {
                         K17Machine.LEAF_DOMAIN +
                             newKeyHash +
                             payout +
-                            K17Machine.cell(memberLastRound) +
+                            slice(treeArgs, 4n, 8n) +
                             K17Machine.cell(0n)
                     )
                 } else {

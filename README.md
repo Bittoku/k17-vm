@@ -268,7 +268,7 @@ a day or more.
 | 4   | 21       | 16 247 bytes   | 16 802 bytes      |
 | 40  | 28       | 159 003 bytes  | about 160 KB      |
 | 40  | 32       | 202 468 bytes  | about 204 KB      |
-| 40  | 43       | 489 181 bytes  | about 490 KB      |
+| 40  | 43       | 470 453 bytes  | about 471 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
@@ -278,7 +278,7 @@ script per unrolled instruction, plus a fixed part
 construction). The cycle transaction column is the final (halting) cycle.
 A cycle that continues also carries the next state output, so it is about
 twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
-978 904 bytes at K=40 (43 handlers). Set `K17_SIZES=1` to print these sizes during
+941 448 bytes at K=40 (43 handlers). Set `K17_SIZES=1` to print these sizes during
 `npm test`. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.

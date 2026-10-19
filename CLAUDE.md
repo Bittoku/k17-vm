@@ -41,7 +41,7 @@ publication belong in this repo.
   one tree proof (60-byte leaf preimage, or empty for `ADMIT`; 512 bytes of siblings, level 0
   first; index in `[0, 65536)`). Pass empty byte strings and 0 when unused.
 - Tree roster (v3 machine): state `sponsorKeyHash` (immutable), `rosterRoot`, `rosterSeq`,
-  `logHash`. Handlers in the unrolled loop only record (`treeOp`, tag, round, flags); the proof,
+  `logHash`. Handlers in the unrolled loop only record (`treeOp`, the ADMIT/REMOVE operand cells, flags); the proof,
   the `ADMIT`/`REMOVE` keys and message, and the new root are checked and built once after the
   loop, before the one Rabin verification. Rules:
   - Programs derive `ROUND` (for `PAYLEAF` and `ADMIT`) from `TIME`, never from `IN`.
@@ -67,7 +67,7 @@ publication belong in this repo.
   bad slot number and still collect the auction reward.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (489 181 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (470 453 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile
