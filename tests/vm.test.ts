@@ -37,7 +37,19 @@ import {
     heartbeatProgram,
     attestProgram,
 } from '../src/k17/programs'
-import { newAttester, signReading } from '../src/k17/attest'
+import {
+    newAttester,
+    signReading,
+    KEY_BYTES,
+    pubKeyBytes,
+    pubKeyFromBytes,
+    keyHash,
+    endorseMessage,
+    signEndorsement,
+    payoutOf,
+} from '../src/k17/attest'
+import { RabinVerifier } from 'scrypt-ts-lib'
+import { bsv, toByteString } from 'scrypt-ts'
 
 describe('K17 ISA encoding', () => {
     it('round-trips cells', () => {
@@ -332,5 +344,40 @@ describe('K17 reference VM', () => {
             sig: signReading(b, 1n, 2n),
         })
         expect(r.status).to.equal('need_witness')
+    })
+})
+
+describe('K17 roster key encoding and endorsement', function () {
+    this.timeout(120_000)
+
+    it('encodes keys, hashes them and signs endorsements', function () {
+        const endorser = newAttester(Buffer.alloc(32, 1))
+        const successor = newAttester(Buffer.alloc(32, 2))
+        const hex = pubKeyBytes(endorser.pub)
+        expect(KEY_BYTES).to.equal(384)
+        expect(hex.length).to.equal(768)
+        expect(pubKeyFromBytes(hex)).to.equal(endorser.pub)
+        expect(keyHash(endorser.pub)).to.equal(
+            createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex')
+        )
+
+        const payout = payoutOf(bsv.PrivateKey.fromRandom().toAddress())
+        expect(payout.length).to.equal(40)
+        const other = '11'.repeat(20)
+        const message = endorseMessage(5n, successor.pub, payout)
+        expect(message).to.equal(
+            '4b313745' + encodeCell(5n) + keyHash(successor.pub) + payout
+        )
+        const sig = signEndorsement(endorser, 5n, successor.pub, payout)
+        expect(
+            RabinVerifier.verifySig(toByteString(message), sig, endorser.pub)
+        ).to.equal(true)
+        expect(
+            RabinVerifier.verifySig(
+                toByteString(endorseMessage(5n, successor.pub, other)),
+                sig,
+                endorser.pub
+            )
+        ).to.equal(false)
     })
 })

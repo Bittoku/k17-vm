@@ -18,7 +18,9 @@
 
 import { Rabin, RabinPrivateKey, toRabinSig } from 'rabinsig'
 import { RabinPubKey, RabinSig } from 'scrypt-ts-lib'
-import { attestMessage } from './isa'
+import { bsv } from 'scrypt-ts'
+import { createHash } from 'crypto'
+import { attestMessage, encodeCell, ENDORSE_DOMAIN } from './isa'
 
 /** Security level shared with RabinVerifier.SECURITY_LEVEL. */
 export const RABIN_SECURITY_LEVEL = 6
@@ -57,3 +59,80 @@ export function signReading(
 
 /** The empty signature a keeper passes when the cycle has no SIGVERIFY. */
 export const NO_SIG: RabinSig = { s: 0n, padding: '' }
+
+/** Fixed width of an encoded roster public key: 3072 bits. */
+export const KEY_BYTES = 384
+
+/**
+ * Encode a Rabin public modulus as the roster byte string.
+ * Input: public key. Output: 768 hex characters, little-endian unsigned,
+ * zero-padded (the form Utils.fromLEUnsigned reads on chain). Throws if the
+ * key needs more than KEY_BYTES bytes.
+ */
+export function pubKeyBytes(pub: RabinPubKey): string {
+    let hex = pub.toString(16)
+    if (hex.length % 2) hex = '0' + hex
+    const bigEndian = Buffer.from(hex, 'hex')
+    if (pub < 0n || bigEndian.length > KEY_BYTES) {
+        throw new Error('public key does not fit in ' + KEY_BYTES + ' bytes')
+    }
+    const out = Buffer.alloc(KEY_BYTES)
+    bigEndian.reverse().copy(out)
+    return out.toString('hex')
+}
+
+/**
+ * Decode a roster byte string back to a public modulus.
+ * Input: hex from pubKeyBytes. Output: the bigint public key.
+ */
+export function pubKeyFromBytes(hex: string): RabinPubKey {
+    const bigEndian = Buffer.from(hex, 'hex').reverse()
+    return BigInt('0x' + (bigEndian.toString('hex') || '0'))
+}
+
+/**
+ * Hash of a roster key as stored in the roster and in endorsements.
+ * Input: public key. Output: hex of sha256(pubKeyBytes(pub)).
+ */
+export function keyHash(pub: RabinPubKey): string {
+    return createHash('sha256')
+        .update(Buffer.from(pubKeyBytes(pub), 'hex'))
+        .digest('hex')
+}
+
+/**
+ * Message an outgoing roster member signs to endorse a successor.
+ * Input: tag (replay guard), successor public key, 20-byte payout hex.
+ * Output: hex of ENDORSE_DOMAIN + cell(tag) + keyHash(newPub) + payout.
+ */
+export function endorseMessage(
+    tag: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string
+): string {
+    return ENDORSE_DOMAIN + encodeCell(tag) + keyHash(newPub) + payoutHex
+}
+
+/**
+ * Sign an endorsement of a successor key.
+ * Input: endorser, tag, successor public key, payout hex.
+ * Output: Rabin signature over endorseMessage.
+ */
+export function signEndorsement(
+    endorser: Attester,
+    tag: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string
+): RabinSig {
+    return toRabinSig(
+        rabin.sign(endorseMessage(tag, newPub, payoutHex), endorser.priv)
+    )
+}
+
+/**
+ * Payout identity of an address. Input: bsv address. Output: its 20-byte
+ * public-key-hash as 40 hex characters.
+ */
+export function payoutOf(address: bsv.Address): string {
+    return address.hashBuffer.toString('hex')
+}
