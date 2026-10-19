@@ -1254,46 +1254,36 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/key not in roster slot/)
     })
 
-    it('ATTEST then ENDORSE in one cycle is refused', async () => {
+    it('ATTEST then ENDORSE in one cycle faults and refunds (v3.1)', async () => {
         // prettier-ignore
         const both = assemble([
             'LIT', 5, 'LIT', 2231, 'LIT', 0, 'ATTEST',
             'LIT', TAG_E, 'LIT', 0, 'LIT', 1, 'ENDORSE', 'YIELD',
         ])
         const m = await deploy(both, FUNDING, SPONSOR_MEM)
-        // The reference VM refuses to plan it.
-        expect(() =>
-            planCycle(
-                m,
-                BigInt(FUNDING),
-                T0 + 1n,
-                keeperA,
-                [],
-                ATTEST0_SIG(m.instanceId),
-                ENDORSE_KEYS
-            )
-        ).to.throw(/needs a witness/)
-        // Build the spend from an ATTEST-only plan: the contract must refuse.
-        const once = newMachine(
-            ATTEST0,
-            ECON,
-            T0,
-            rosterOf(),
-            SPONSOR_MEM,
-            m.instanceId
-        )
-        const plan = planCycle(
-            once,
+        // The ATTEST verifies; the ENDORSE is a second signature in the
+        // cycle, so the VM and the contract halt and refund.
+        const r = await cycle(
+            m,
             BigInt(FUNDING),
-            T0 + 1n,
+            T0 + 60n,
             keeperA,
+            {},
             [],
             ATTEST0_SIG(m.instanceId),
-            ENDORSE_KEYS
+            { attestKey: sponsor.pub }
         )
-        await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
-            /one attestation per cycle/
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.reward).to.equal(160n)
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
         )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - 160n
+        )
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        // slot 1 was not written
+        expect(readSlot(r.plan.nextState.mem, 1).empty).to.be.true
     })
 
     it('an endorsement signed for slot 1 is refused when presented with NEWSLOT 2', async () => {
@@ -3465,5 +3455,106 @@ describe('K17Machine on-chain', function () {
         )
         tamperPush(honest.tx, 0, sigs.current.padding, sigs.old.padding)
         expectScriptRefused(honest.tx)
+    })
+
+    // ------------------------------------------------------------------
+    // v3.1: a second signature instruction in one cycle is a fault
+    // ------------------------------------------------------------------
+
+    /**
+     * Check a cycle result that faulted at `pc`: the plan is halted, the
+     * beneficiary gets value - reward in output 0 and the keeper its
+     * reward in output 1. Input: cycle result, value spent, expected
+     * halting pc. Output: none (chai assertions).
+     */
+    const expectRefundAt = (r: CycleResult, value: bigint, pc: bigint) => {
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.nextState.pc).to.equal(pc)
+        expect(r.plan.reward > 0n).to.be.true
+        expect(addressOf(r.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(value - r.plan.reward)
+        expect(addressOf(r.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(BigInt(r.tx.outputs[1].satoshis)).to.equal(r.plan.reward)
+        expect(r.tx.verifyInputScript(0).success).to.equal(true)
+    }
+
+    it('v3.1: ATTEST then ATTESTM in one cycle faults and refunds', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'MEMBER', 'DROP',
+            'LIT', 5, 'LIT', 2231, 'LIT', 0, 'ATTEST',
+            'LIT', TAG_M, 'LIT', 7, 'ATTESTM', 'YIELD',
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree, FUNDING, SPONSOR_MEM)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(m.instanceId),
+            { attestKey: sponsor.pub },
+            tree.proof(INDEX_A)
+        )
+        // halted at ATTESTM (pc 28) with its operands on the stack
+        expectRefundAt(r, BigInt(FUNDING), 28n)
+        expect(r.plan.treeOp).to.equal('member')
+        expect(r.plan.nextState.ds).to.equal(
+            encodeCell(BigInt(TAG_M)) + encodeCell(7n)
+        )
+    })
+
+    it('v3.1: ATTESTM then ADMIT in one cycle faults and refunds', async () => {
+        // prettier-ignore
+        const prog = assemble([
+            'MEMBER', 'DROP', 'LIT', TAG_M, 'LIT', 7, 'ATTESTM',
+            'LIT', TAG_D, 'LIT', 1, 'ADMIT', 'YIELD',
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            signMemberReading(attesterA, m.instanceId, BigInt(TAG_M), 7n),
+            { attestKey: attesterA.pub },
+            tree.proof(INDEX_A)
+        )
+        // halted at ADMIT (pc 23): the roster is unchanged
+        expectRefundAt(r, BigInt(FUNDING), 23n)
+        expect(r.plan.nextState.rosterRoot).to.equal(tree.root())
+        expect(r.plan.nextState.rosterSeq).to.equal(0n)
+    })
+
+    it('v3.1: ATTEST then ADMIT in one cycle faults on the signature rule alone', async () => {
+        // No tree instruction runs before ADMIT, so only the second
+        // signature makes it fault; the tree block never runs.
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 5, 'LIT', 2231, 'LIT', 0, 'ATTEST',
+            'LIT', TAG_D, 'LIT', 1, 'ADMIT', 'YIELD',
+        ])
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(prog, tree, FUNDING, SPONSOR_MEM)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(m.instanceId),
+            { attestKey: sponsor.pub }
+        )
+        expectRefundAt(r, BigInt(FUNDING), 26n)
+        expect(r.plan.treeOp).to.equal('none')
+        expect(r.plan.nextState.rosterSeq).to.equal(0n)
     })
 })

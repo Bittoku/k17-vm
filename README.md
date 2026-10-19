@@ -70,7 +70,8 @@ so a stage of up to 40 instructions fits in one transaction.
 in the unlocking script, under the roster key in slot `k` (four slots, fixed
 at deployment), signs the eight bytes `cell(TAG) || cell(VAL)`. A missing or
 wrong signature makes the transaction invalid; an empty slot or a bad index
-is a fault. One signature per cycle. This separates the party that vouches
+is a fault. One signature per cycle: a second signature instruction in the
+cycle is a fault (v3.1). This separates the party that vouches
 for a reading (a sensor node, an oracle) from the party that relays it and
 is paid by the auction. `MIN`, `MAX` and `/` were added for the fuzzy and
 aggregation programs in the companion repository `k17-dc4cd`. Signing
@@ -118,7 +119,8 @@ zero is empty. Programs use cells 0..151.
   make the payout fail.
 - `VALUE`. Pushes the balance of the machine output being spent (mod 2^32).
 
-`SIGVERIFY`, `ATTEST` and `ENDORSE` share one signature per cycle.
+`SIGVERIFY`, `ATTEST` and `ENDORSE` share one signature per cycle. A
+second one in the cycle is a fault (v3.1).
 `src/k17/programs.ts` has `enrolAndAttestProgram`: the sponsor enrols a
 landowner in cycle 1, and in cycle 2 the landowner attests a reading and
 gets a bounty.
@@ -128,13 +130,13 @@ invalid transaction cannot be mined; the machine waits for a correct one.
 A condition that the program causes is a fault. A condition that the
 witness (keys, signatures) causes makes the transaction invalid.
 
-| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                                                          | Invalid transaction                                                                                                |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `!`         | address 152 or higher (roster), stack underflow                                                                                                                                                               | never                                                                                                              |
-| `ATTEST`    | underflow, `SLOT` 8 or higher, empty slot                                                                                                                                                                     | second signature in the cycle, missing key or signature, key not 384 bytes, key hash not the slot's, bad signature |
-| `ENDORSE`   | underflow, `SLOT` or `NEWSLOT` 8 or higher, empty `SLOT`, filled `NEWSLOT`                                                                                                                                    | as `ATTEST`, plus `keyB` not 384 bytes, payout not 20 bytes                                                        |
-| `PAYSLOT`   | always a fault, and the payout is dropped: a second `PAYSLOT` in the cycle (checked first, whatever its operands), underflow, `SLOT` 8 or higher, empty slot, `N` = 0, `N` larger than the balance less 1 sat | never                                                                                                              |
-| `VALUE`     | full data stack                                                                                                                                                                                               | never                                                                                                              |
+| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                                                          | Invalid transaction                                                                 |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `!`         | address 152 or higher (roster), stack underflow                                                                                                                                                               | never                                                                               |
+| `ATTEST`    | underflow, `SLOT` 8 or higher, second signature in the cycle, empty slot                                                                                                                                      | missing key or signature, key not 384 bytes, key hash not the slot's, bad signature |
+| `ENDORSE`   | underflow, `SLOT` or `NEWSLOT` 8 or higher, second signature in the cycle, empty `SLOT`, filled `NEWSLOT`                                                                                                     | as `ATTEST`, plus `keyB` not 384 bytes, payout not 20 bytes                         |
+| `PAYSLOT`   | always a fault, and the payout is dropped: a second `PAYSLOT` in the cycle (checked first, whatever its operands), underflow, `SLOT` 8 or higher, empty slot, `N` = 0, `N` larger than the balance less 1 sat | never                                                                               |
+| `VALUE`     | full data stack                                                                                                                                                                                               | never                                                                               |
 
 A fault that comes later in the cycle, after a `PAYSLOT` that succeeded,
 does not drop that payout.
@@ -222,22 +224,26 @@ The rule of the v2 roster applies. A condition that the program causes is a
 fault. A condition that the witness (proof, keys, signature) causes makes
 the transaction invalid.
 
-| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                      | Invalid transaction                                                                                                                                                                                                |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MEMBER`    | a second tree instruction in the cycle, full data stack (the proof is checked first)                                                                                      | no proof, `leafPre` not 60 bytes, index out of range, proof not 512 bytes, proof does not lead to `rosterRoot`                                                                                                     |
-| `LASTROUND` | no bound member, full data stack                                                                                                                                          | never                                                                                                                                                                                                              |
-| `ATTESTM`   | underflow, no bound member                                                                                                                                                | second signature in the cycle, missing key or signature, key hash not the leaf's, bad signature                                                                                                                    |
-| `PAYLEAF`   | the payout is dropped: a second payment in the cycle (`PAYSLOT` or `PAYLEAF`, checked first), underflow, no bound member, `N` = 0, `N` larger than the balance less 1 sat | `ROUND` not above the member's `lastRound`                                                                                                                                                                         |
-| `ADMIT`     | underflow, a second tree instruction in the cycle                                                                                                                         | second signature in the cycle, missing or wrong proof or index, `leafPre` not empty (occupied leaf), payout not 20 bytes, `keyB` not 384 bytes, `keyA` not the sponsor's, bad signature (also a wrong `rosterSeq`) |
-| `REMOVE`    | underflow, a second tree instruction in the cycle                                                                                                                         | second signature in the cycle, missing or wrong proof or index, `leafPre` not 60 bytes (empty leaf), `keyA` not the sponsor's, bad signature                                                                       |
-| `OUTH`      | underflow                                                                                                                                                                 | never                                                                                                                                                                                                              |
+| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                      | Invalid transaction                                                                                                                                                                 |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MEMBER`    | a second tree instruction in the cycle, full data stack (the proof is checked first)                                                                                      | no proof, `leafPre` not 60 bytes, index out of range, proof not 512 bytes, proof does not lead to `rosterRoot`                                                                      |
+| `LASTROUND` | no bound member, full data stack                                                                                                                                          | never                                                                                                                                                                               |
+| `ATTESTM`   | underflow, no bound member, second signature in the cycle                                                                                                                 | missing key or signature, key hash not the leaf's, bad signature                                                                                                                    |
+| `PAYLEAF`   | the payout is dropped: a second payment in the cycle (`PAYSLOT` or `PAYLEAF`, checked first), underflow, no bound member, `N` = 0, `N` larger than the balance less 1 sat | `ROUND` not above the member's `lastRound`                                                                                                                                          |
+| `ADMIT`     | underflow, a second tree instruction in the cycle, second signature in the cycle                                                                                          | missing or wrong proof or index, `leafPre` not empty (occupied leaf), payout not 20 bytes, `keyB` not 384 bytes, `keyA` not the sponsor's, bad signature (also a wrong `rosterSeq`) |
+| `REMOVE`    | underflow, a second tree instruction in the cycle, second signature in the cycle                                                                                          | missing or wrong proof or index, `leafPre` not 60 bytes (empty leaf), `keyA` not the sponsor's, bad signature                                                                       |
+| `OUTH`      | underflow                                                                                                                                                                 | never                                                                                                                                                                               |
 
 ### Rules for each cycle
 
 - One tree instruction. `MEMBER`, `ADMIT` and `REMOVE` share one proof. A
   second one in the cycle is a fault.
 - One signature. `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and
-  `REMOVE` share it. A second one makes the transaction invalid.
+  `REMOVE` share it. A second one is a fault: the machine halts and the
+  beneficiary is refunded (v3.1). Before v3.1 it made the transaction
+  invalid, and no witness could repair that, so a program could freeze its
+  own funds. The contract tests the condition together with the stack
+  underflow of each of these instructions.
 - One payment. `PAYSLOT` and `PAYLEAF` share it. A second one is a fault
   and drops the payout.
 - `MEMBER`'s `IDX` and `LASTROUND`'s value are chosen by the relayer: it
@@ -273,13 +279,14 @@ a day or more.
 
 ## Measurements (K = instructions per cycle)
 
-| K   | Handlers | Locking script | Cycle transaction |
-| --- | -------- | -------------- | ----------------- |
-| 1   | 21       | 9 026 bytes    | 9 574 bytes       |
-| 4   | 21       | 16 247 bytes   | 16 802 bytes      |
-| 40  | 28       | 159 003 bytes  | about 160 KB      |
-| 40  | 32       | 202 468 bytes  | about 204 KB      |
-| 40  | 43       | 469 386 bytes  | about 470 KB      |
+| K   | Handlers                           | Locking script | Cycle transaction |
+| --- | ---------------------------------- | -------------- | ----------------- |
+| 1   | 21                                 | 9 026 bytes    | 9 574 bytes       |
+| 4   | 21                                 | 16 247 bytes   | 16 802 bytes      |
+| 40  | 28                                 | 159 003 bytes  | about 160 KB      |
+| 40  | 32                                 | 202 468 bytes  | about 204 KB      |
+| 40  | 43                                 | 469 386 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, second signature faults) | 469 666 bytes  | about 470 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the

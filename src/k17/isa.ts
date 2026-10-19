@@ -19,8 +19,10 @@
  * only if the Rabin signature carried in the unlocking script, under roster
  * key k, signs the two cells on top of the stack. This is how an off-chain
  * sensor node attests a reading: the keeper who relays the reading need not be the node that
- * measured it. One signature per cycle; a second SIGVERIFY in the same
- * cycle makes the transaction invalid.
+ * measured it. One signature per cycle; a second signature instruction in
+ * the same cycle (SIGVERIFY, ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE) is
+ * a fault (v3.1; it made the transaction invalid before, which let a
+ * program freeze its own funds).
  *
  * Three outcomes are NOT faults: IN with no witness left, VERIFY of zero,
  * and SIGVERIFY with a missing or wrong signature. Those make the spending
@@ -52,16 +54,16 @@
  *   ATTEST  (0x20)  TAG VAL SLOT --
  *       keyA must hash to slot SLOT's key hash and sign
  *       "K17M" || I || cell(TAG) || cell(VAL).
- *       Fault: underflow, SLOT >= ROSTER_SLOTS, empty slot.
- *       Invalid tx: no witness, a second signature in the cycle, a hash or
- *       signature mismatch.
+ *       Fault: underflow, SLOT >= ROSTER_SLOTS, a second signature in the
+ *       cycle, empty slot.
+ *       Invalid tx: no witness, a hash or signature mismatch.
  *   ENDORSE (0x21)  TAG SLOT NEWSLOT --
  *       keyA must hash to slot SLOT's key hash and sign
  *       "K17E" || I || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout;
  *       then sha256(keyB) || payout is written into slot NEWSLOT.
- *       Fault: underflow, SLOT or NEWSLOT >= ROSTER_SLOTS, empty SLOT,
- *       filled NEWSLOT.
- *       Invalid tx: no witness, a second signature in the cycle, a payout
+ *       Fault: underflow, SLOT >= ROSTER_SLOTS, a second signature in the
+ *       cycle, empty SLOT, NEWSLOT >= ROSTER_SLOTS, filled NEWSLOT.
+ *       Invalid tx: no witness, a payout
  *       that is not 20 bytes (40 lowercase hex chars in the VM), a hash or
  *       signature mismatch.
  *   PAYSLOT (0x22)  N SLOT --
@@ -100,7 +102,8 @@
  * IN: a keeper controls IN, but nLockTime never decreases.
  *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
- * past the end, output log full) is a FAULT. A fault is treated exactly as
+ * past the end, output log full, a second signature instruction in the
+ * cycle) is a FAULT. A fault is treated exactly as
  * HALT: the machine stops and the contract releases its funds to the
  * beneficiary. Faults never make the spending transaction invalid, because
  * an unspendable program would freeze its funds forever.

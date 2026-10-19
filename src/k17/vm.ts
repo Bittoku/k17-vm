@@ -454,7 +454,9 @@ export function whoOf(addressHashHex: string): bigint {
  * Output: new state and status. Faults set `halted`; they are never thrown.
  * `need_witness` and `verify_failed` leave the state unchanged and mean the
  * enclosing transaction cannot be valid (SIGVERIFY reports `need_witness`
- * when no signature is left and `verify_failed` when it does not check).
+ * when the transaction carries no signature and `verify_failed` when it does
+ * not check). A second signature instruction in one cycle (SIGVERIFY,
+ * ATTEST, ENDORSE, ATTESTM, ADMIT, REMOVE) is a fault (v3.1).
  */
 export function step(
     s: K17State,
@@ -734,9 +736,11 @@ export function step(
             // TAG VAL --   tx invalid unless sig signs cell(TAG)||cell(VAL)
             if (dsDepth < 2) return fault()
             if (operand >= BigInt(ROSTER_MAX)) return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             const pub = e.roster?.[Number(operand)] ?? 0n
             if (pub === 0n) return fault()
-            if (su || !e.sig) return unchanged('need_witness')
+            if (!e.sig) return unchanged('need_witness')
             const value = pop()
             const tag = pop()
             if (!verifyAttestation(tag, value, e.sig, pub)) {
@@ -751,10 +755,11 @@ export function step(
             if (dsDepth < 3) return fault()
             const slot = cellAt(ds, dsDepth - 1)
             if (slot >= BigInt(ROSTER_SLOTS)) return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             const entry = readSlot(mem, Number(slot))
             if (entry.empty) return fault()
             if (
-                su ||
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.instanceId === undefined
@@ -788,12 +793,13 @@ export function step(
             const newSlot = cellAt(ds, dsDepth - 1)
             const slot = cellAt(ds, dsDepth - 2)
             if (slot >= BigInt(ROSTER_SLOTS)) return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             const sponsor = readSlot(mem, Number(slot))
             if (sponsor.empty) return fault()
             if (newSlot >= BigInt(ROSTER_SLOTS)) return fault()
             if (!readSlot(mem, Number(newSlot)).empty) return fault()
             if (
-                su ||
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.endorseKey === undefined ||
@@ -906,15 +912,17 @@ export function step(
         }
         case Op.ATTESTM: {
             // TAG VAL --   ATTEST under the key of the member MEMBER bound.
-            // No member is the program's fault; a missing signature or key,
+            // No member, or a second signature this cycle, is the program's
+            // fault; a missing signature or key,
             // a key that does not hash to the member's leaf, or a bad
             // signature over memberMessage(instanceId, TAG, VAL) makes the
             // transaction invalid (state and stack unchanged). Success
             // consumes the cycle's one signature.
             if (dsDepth < 2) return fault()
             if (!mb) return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             if (
-                su ||
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.instanceId === undefined
@@ -969,8 +977,8 @@ export function step(
         case Op.ADMIT: {
             // TAG ROUND --   the sponsor admits e.endorseKey into the empty
             // leaf the cycle's proof names, with lastRound := ROUND. A member
-            // or admin op already this cycle, or a short stack, is the
-            // program's fault. Missing witnesses are need_witness; every
+            // or admin op already this cycle, a short stack, or a second
+            // signature this cycle, is the program's fault. Missing witnesses are need_witness; every
             // other failure (index range, occupied leaf, proof not against
             // rosterRoot, malformed payout, signer not the sponsor, bad
             // signature over admitMessage with the current rosterSeq) makes
@@ -980,9 +988,10 @@ export function step(
             // ROUND and TAG are popped only on the way to success.
             if (dsDepth < 2) return fault()
             if (treeOp !== 'none') return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             if (
                 !e.tree ||
-                su ||
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.endorseKey === undefined ||
@@ -1045,9 +1054,10 @@ export function step(
             // peeked and popped only on success.
             if (dsDepth < 1) return fault()
             if (treeOp !== 'none') return fault()
+            // A second signature this cycle is the program's fault.
+            if (su) return fault()
             if (
                 !e.tree ||
-                su ||
                 !e.sig ||
                 e.attestKey === undefined ||
                 e.instanceId === undefined

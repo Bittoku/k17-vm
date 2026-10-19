@@ -408,7 +408,7 @@ describe('K17 reference VM', () => {
         expect(outputLog(emptySlot.state)).to.deep.equal([])
     })
 
-    it('a second SIGVERIFY in one cycle invalidates the transaction', function () {
+    it('a second SIGVERIFY in one cycle is a fault (v3.1)', function () {
         this.timeout(120_000)
         const b = newAttester(Buffer.alloc(32, 9))
         // prettier-ignore
@@ -423,7 +423,14 @@ describe('K17 reference VM', () => {
             roster: [b.pub, 0n, 0n, 0n],
             sig: signReading(b, 1n, 2n),
         })
-        expect(r.status).to.equal('need_witness')
+        // The first SIGVERIFY verified; the second one faults, so the
+        // machine halts (refund) with its operands still on the stack.
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(11n)
+        expect(r.state.ds).to.equal(
+            encodeCell(1n) + encodeCell(2n) + encodeCell(1n) + encodeCell(2n)
+        )
     })
 })
 
@@ -711,7 +718,7 @@ describe('K17 ATTEST against a roster slot', function () {
         expect(stepUntilStop(initialState(shallow), env).faulted).to.equal(true)
     })
 
-    it('needs a witness without a signature or a key, or after one is used', function () {
+    it('needs a witness without a signature or a key; a second ATTEST faults', function () {
         const sig = signReadingFor(attester, ID, 5n, 2231n)
         expect(
             run(installed(), {
@@ -750,7 +757,10 @@ describe('K17 ATTEST against a roster slot', function () {
             { ...s, mem: installed().mem },
             { ...envOf(0n), sig, attestKey: attester.pub, instanceId: ID }
         )
-        expect(r.status).to.equal('need_witness')
+        // v3.1: the second ATTEST is a fault, not a missing witness.
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(31n)
     })
 
     it('refuses a reading signed for another instance', function () {
@@ -864,7 +874,7 @@ describe('K17 ENDORSE writes a new roster slot', function () {
         expect(c2.state.ds).to.equal('')
     })
 
-    it('needs a witness for ENDORSE after ATTEST in one cycle', function () {
+    it('ENDORSE after ATTEST in one cycle faults (v3.1)', function () {
         const prog = assemble([
             'LIT',
             5,
@@ -890,7 +900,15 @@ describe('K17 ENDORSE writes a new roster slot', function () {
             },
             16
         )
-        expect(r.status).to.equal('need_witness')
+        // ATTEST used the cycle's signature; ENDORSE (pc 31) faults with
+        // its three operands on the stack and slot 1 left empty.
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(31n)
+        expect(r.state.ds).to.equal(
+            encodeCell(tagE) + encodeCell(0n) + encodeCell(1n)
+        )
+        expect(readSlot(r.state.mem, 1).empty).to.equal(true)
     })
 
     it('rejects a payout that is not 40 hex characters', function () {
@@ -1238,7 +1256,7 @@ describe('K17 v3 ATTESTM and PAYLEAF', function () {
         expect(r.state.pc).to.equal(10n)
     })
 
-    it('ATTESTM when the signature was already used is need_witness', () => {
+    it('ATTESTM when the signature was already used faults (v3.1)', () => {
         const r = run(
             machine([
                 'MEMBER',
@@ -1256,7 +1274,10 @@ describe('K17 v3 ATTESTM and PAYLEAF', function () {
             ]),
             envFor(MEMBER_INDEX)
         )
-        expect(r.status).to.equal('need_witness')
+        // halted at the second ATTESTM (pc 22), not at the HALT
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(22n)
     })
 
     it('ATTESTM with missing signature material is need_witness', () => {
@@ -1666,15 +1687,19 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         expect(twice.state.pc).to.equal(21n)
     })
 
-    it('ADMIT with the signature already used this cycle is need_witness', () => {
+    it('ADMIT with the signature already used this cycle faults (v3.1)', () => {
         const tree = buildTree()
         const s = {
             ...machine(['ADMIT', 'HALT'], tree.root()),
             ds: encodeCell(TAG) + encodeCell(ADMIT_ROUND),
         }
         const r = step(s, admitEnv(tree), 0, 0n, true)
-        expect(r.status).to.equal('need_witness')
-        expect(r.state).to.equal(s)
+        expect(r.status).to.equal('fault')
+        expect(r.state.halted).to.equal(true)
+        // a fault leaves the tree untouched
+        expect(r.state.rosterRoot).to.equal(s.rosterRoot)
+        expect(r.state.rosterSeq).to.equal(s.rosterSeq)
+        expect(r.treeOp).to.equal('none')
     })
 
     it('ADMIT over a filled slot with an empty preimage and its real siblings is verify_failed', () => {

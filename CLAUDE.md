@@ -17,11 +17,15 @@ publication belong in this repo.
 - Faults halt the machine and release funds; `IN` without a witness, `VERIFY` of zero and
   `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` or `REMOVE` with a missing or wrong
   signature or key, and a missing or wrong tree proof, invalidate the transaction. Do not blur
-  that distinction.
+  that distinction. A second signature instruction in a cycle is a fault (v3.1), not an
+  invalid transaction.
 - `SIGVERIFY` verifies a Rabin signature (scrypt-ts-lib `RabinVerifier`, security level 6);
   `src/k17/attest.ts` signs with the same parameters. One signature per cycle, shared by
   `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and `REMOVE`: a second one in a cycle
-  invalidates the transaction.
+  is a fault (v3.1). The contract folds `sigUsed` into each handler's existing fault condition
+  (`if (<underflow> || ... || sigUsed) halted = true`); do not wrap handler bodies in a new
+  `if`/`else`, which costs about 14 KB at K=40. The VM returns `fault` for `sigUsed` before any
+  `need_witness` check.
 - Roster in memory (v2 machine): 8 slots of 13 cells at cells 152..255 (slot k at
   `152 + 13k`): 8 cells of SHA-256 key hash, then 5 cells of payout address hash. All-zero
   hash cells mean an empty slot. `!` into cell 152 or higher faults; only `ENDORSE` writes
@@ -71,7 +75,7 @@ publication belong in this repo.
   bound without bounding them first (for example with `VERIFY`), as for `SLOT`.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (469 386 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (469 666 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile

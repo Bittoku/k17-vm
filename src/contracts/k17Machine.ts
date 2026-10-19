@@ -37,7 +37,8 @@
  * member (keyB, payout) and writes sha256(keyB) || payout into an empty
  * slot. Both messages include the machine's instanceId. SIGVERIFY, ATTEST
  * and ENDORSE share one signature per cycle; a bad key or signature
- * invalidates the transaction. VALUE pushes the balance of the machine
+ * invalidates the transaction, and a second signature instruction in the
+ * cycle is a fault (v3.1). VALUE pushes the balance of the machine
  * output being spent. PAYSLOT pays N sats to slot k's payout address in the
  * output after the keeper's reward; the payout has priority and the reward
  * shrinks to make room. A PAYSLOT the program gets wrong (a second one in a
@@ -76,11 +77,16 @@
  * short stack, a second tree instruction in the cycle, no bound member) is
  * a fault. One tree instruction, one signature and one payment per cycle.
  *
+ * v3.1: a second signature instruction in one cycle (SIGVERIFY, ATTEST,
+ * ENDORSE, ATTESTM, ADMIT or REMOVE after any of them) is a fault, checked
+ * in the same condition as the handler's stack underflow, so a program can
+ * never make the machine unspendable that way.
+ *
  * Semantics are defined by `src/k17/isa.ts` and the reference VM in
  * `src/k17/vm.ts`; this file must agree with them exactly.
  *
  * Faults (underflow, overflow, bad address, bad opcode, PC overrun, full
- * output log) never fail the transaction. They halt the machine so the funds
+ * output log, a second signature instruction) never fail the transaction. They halt the machine so the funds
  * can always be released.
  */
 
@@ -766,19 +772,16 @@ export class K17Machine extends SmartContract {
                             }
                         } else if (op == 30n) {
                             // SIGVERIFY k : TAG VAL --
-                            // Bad roster index or empty slot: fault. Missing,
-                            // reused or wrong signature: tx invalid.
-                            if (n < 8n || operand >= 4n) {
+                            // Underflow, bad roster index, a second signature
+                            // this cycle or an empty slot: fault. Missing or
+                            // wrong signature: tx invalid.
+                            if (n < 8n || operand >= 4n || sigUsed) {
                                 halted = true
                             } else {
                                 const pub = this.roster[Number(operand)]
                                 if (pub == 0n) {
                                     halted = true
                                 } else {
-                                    assert(
-                                        !sigUsed,
-                                        'one attestation per cycle'
-                                    )
                                     sigUsed = true
                                     // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
                                     verifyNeeded = true
@@ -791,11 +794,15 @@ export class K17Machine extends SmartContract {
                             }
                         } else if (op == 32n) {
                             // ATTEST : TAG VAL SLOT --
-                            // Underflow, bad slot or empty slot: fault. A
-                            // second signature, a key that is not 384 bytes
-                            // or not the slot's, or a bad signature: tx
-                            // invalid.
-                            if (n < 12n || top >= K17Machine.ROSTER_SLOTS_MEM) {
+                            // Underflow, bad slot, a second signature this
+                            // cycle or empty slot: fault. A key that is not
+                            // 384 bytes or not the slot's, or a bad
+                            // signature: tx invalid.
+                            if (
+                                n < 12n ||
+                                top >= K17Machine.ROSTER_SLOTS_MEM ||
+                                sigUsed
+                            ) {
                                 halted = true
                             } else {
                                 const slotByte =
@@ -810,10 +817,6 @@ export class K17Machine extends SmartContract {
                                 if (slotHash == K17Machine.EMPTY_HASH) {
                                     halted = true
                                 } else {
-                                    assert(
-                                        !sigUsed,
-                                        'one attestation per cycle'
-                                    )
                                     assert(
                                         len(keyA) == 384n,
                                         'key must be 384 bytes'
@@ -835,14 +838,15 @@ export class K17Machine extends SmartContract {
                             }
                         } else if (op == 33n) {
                             // ENDORSE : TAG SLOT NEWSLOT --
-                            // Underflow, bad or empty SLOT, bad or filled
-                            // NEWSLOT: fault. A second signature, keys that
-                            // are not 384 bytes, a payout that is not 20
-                            // bytes, a sponsor key that is not SLOT's, or a
-                            // bad signature: tx invalid.
+                            // Underflow, bad or empty SLOT, a second
+                            // signature this cycle, bad or filled NEWSLOT:
+                            // fault. Keys that are not 384 bytes, a payout
+                            // that is not 20 bytes, a sponsor key that is not
+                            // SLOT's, or a bad signature: tx invalid.
                             if (
                                 n < 12n ||
-                                second >= K17Machine.ROSTER_SLOTS_MEM
+                                second >= K17Machine.ROSTER_SLOTS_MEM ||
+                                sigUsed
                             ) {
                                 halted = true
                             } else {
@@ -869,10 +873,6 @@ export class K17Machine extends SmartContract {
                                 ) {
                                     halted = true
                                 } else {
-                                    assert(
-                                        !sigUsed,
-                                        'one attestation per cycle'
-                                    )
                                     assert(
                                         len(keyA) == 384n,
                                         'key must be 384 bytes'
@@ -991,13 +991,12 @@ export class K17Machine extends SmartContract {
                             }
                         } else if (op == 38n) {
                             // ATTESTM : TAG VAL --
-                            // Underflow or no bound member: fault. A second
-                            // signature, a key that is not the member's, or
-                            // a bad signature: tx invalid.
-                            if (n < 8n || treeOp != 1n) {
+                            // Underflow, no bound member or a second
+                            // signature this cycle: fault. A key that is not
+                            // the member's, or a bad signature: tx invalid.
+                            if (n < 8n || treeOp != 1n || sigUsed) {
                                 halted = true
                             } else {
-                                assert(!sigUsed, 'one attestation per cycle')
                                 // sha256(keyA) must equal the leaf's key
                                 // hash: checked after the loop. That check
                                 // pins keyA, so no length check is needed.
@@ -1043,16 +1042,15 @@ export class K17Machine extends SmartContract {
                         } else if (op == 40n || op == 41n) {
                             // ADMIT (0x28) : TAG ROUND --
                             // REMOVE (0x29) : TAG --
-                            // Underflow or a second tree instruction this
-                            // cycle: fault. A second signature: tx invalid.
+                            // Underflow, a second tree instruction or a
+                            // second signature this cycle: fault.
                             // The leaf, proof, keys, payout and signature
                             // are checked after the loop (tx invalid when
                             // wrong). treeOp becomes 2 (ADMIT) or 3 (REMOVE).
                             const need: bigint = op == 40n ? 8n : 4n
-                            if (n < need || treeOp != 0n) {
+                            if (n < need || treeOp != 0n || sigUsed) {
                                 halted = true
                             } else {
-                                assert(!sigUsed, 'one attestation per cycle')
                                 sigUsed = true
                                 treeOp = op - 38n
                                 treeArgs = slice(ds, n - need, n)
