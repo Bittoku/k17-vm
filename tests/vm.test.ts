@@ -34,7 +34,7 @@ import {
     readSlot,
     withSlot,
 } from '../src/k17/vm'
-import { EMPTY_HASHES } from '../src/k17/smt'
+import { EMPTY_HASHES, SparseMerkleTree, encodeLeafPre } from '../src/k17/smt'
 import {
     countdownProgram,
     fibonacciProgram,
@@ -155,10 +155,10 @@ describe('K17 v3 tree opcodes and state', function () {
         expect(stepK(s, 0n, 4).treeOp).to.equal('none')
     })
 
-    // Pins the default (unknown-opcode) branch until the handlers land.
-    // REMOVE THIS TEST IN TASK 3, when the first tree handler is added.
-    it('new opcodes fault until their handlers exist', () => {
-        for (const mnemonic of NEW_MNEMONICS) {
+    // Pins the default (unknown-opcode) branch for the opcodes whose
+    // handlers have not landed yet (ATTESTM, PAYLEAF, ADMIT, REMOVE: Tasks 4-5).
+    it('opcodes without handlers yet fault', () => {
+        for (const mnemonic of ['ATTESTM', 'PAYLEAF', 'ADMIT', 'REMOVE']) {
             const r = step(initialState(assemble([mnemonic, 'HALT'])), 0n)
             expect(r.status, mnemonic).to.equal('fault')
             expect(r.state.halted).to.equal(true)
@@ -1001,5 +1001,144 @@ describe('K17 ENDORSE writes a new roster slot', function () {
         const r = run(withSponsor(into2), goodEnv())
         expect(r.status).to.equal('verify_failed')
         expect(readSlot(r.state.mem, 2).empty).to.equal(true)
+    })
+})
+
+/** Decode a data-stack hex string into cell values, bottom first. */
+function outputOf(stackHex: string): bigint[] {
+    const cells: bigint[] = []
+    for (let i = 0; i < stackHex.length; i += 8) {
+        cells.push(decodeCell(stackHex.slice(i, i + 8)))
+    }
+    return cells
+}
+
+describe('K17 v3 MEMBER, LASTROUND, OUTH', () => {
+    const KEY_5 = '11'.repeat(32)
+    const KEY_HIGH = '22'.repeat(32)
+    const PAYOUT = '33'.repeat(20)
+    const tree = new SparseMerkleTree()
+    tree.set(5, encodeLeafPre(KEY_5, PAYOUT, 7n, 1n))
+    tree.set(40000, encodeLeafPre(KEY_HIGH, PAYOUT, 99n))
+
+    /** Fresh state for `mnemonics` whose rosterRoot is the test tree's root. */
+    const machine = (mnemonics: (string | number)[]) =>
+        initialState(assemble(mnemonics), undefined, {
+            rosterRoot: tree.root(),
+        })
+    /** Environment carrying the proof for leaf `index`. */
+    const envFor = (index: number): StepEnv => ({
+        ...envOf(0n),
+        tree: tree.proof(index),
+    })
+
+    it('MEMBER pushes the index and binds the member (index 5 and 40000)', () => {
+        for (const [index, lastRound, key] of [
+            [5, 7n, KEY_5],
+            [40000, 99n, KEY_HIGH],
+        ] as const) {
+            const r = step(machine(['MEMBER', 'HALT']), envFor(index))
+            expect(r.status).to.equal('ok')
+            expect(outputOf(r.state.ds)).to.deep.equal([BigInt(index)])
+            expect(r.treeOp).to.equal('member')
+            expect(r.member?.lastRound).to.equal(lastRound)
+            expect(r.member?.keyHash).to.equal(key)
+            expect(r.member?.leafIndex).to.equal(BigInt(index))
+        }
+    })
+
+    it('a flipped proof byte gives verify_failed with the state unchanged', () => {
+        const s = machine(['MEMBER', 'HALT'])
+        const good = tree.proof(5)
+        const flipped =
+            (good.proof[0] === '0' ? '1' : '0') + good.proof.slice(1)
+        const r = step(s, { ...envOf(0n), tree: { ...good, proof: flipped } })
+        expect(r.status).to.equal('verify_failed')
+        expect(r.state).to.equal(s)
+        expect(r.treeOp).to.equal('none')
+        expect(r.member).to.equal(undefined)
+    })
+
+    it('an empty leaf is verify_failed even with a valid emptiness proof', () => {
+        const r = step(machine(['MEMBER', 'HALT']), {
+            ...envOf(0n),
+            tree: tree.proof(6),
+        })
+        expect(tree.proof(6).leafPre).to.equal('')
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('an out-of-range index or truncated preimage is verify_failed', () => {
+        const good = tree.proof(5)
+        expect(
+            step(machine(['MEMBER']), {
+                ...envOf(0n),
+                tree: { ...good, leafIndex: 65536n },
+            }).status
+        ).to.equal('verify_failed')
+        expect(
+            step(machine(['MEMBER']), {
+                ...envOf(0n),
+                tree: { ...good, leafPre: good.leafPre.slice(2) },
+            }).status
+        ).to.equal('verify_failed')
+    })
+
+    it('MEMBER without env.tree is need_witness', () => {
+        expect(step(machine(['MEMBER']), envOf(0n)).status).to.equal(
+            'need_witness'
+        )
+    })
+
+    it('MEMBER MEMBER faults', () => {
+        const r = stepK(machine(['MEMBER', 'MEMBER', 'HALT']), envFor(5), 2)
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(1n) // second MEMBER did not advance
+    })
+
+    it('LASTROUND without MEMBER faults', () => {
+        const r = step(machine(['LASTROUND', 'HALT']), envFor(5))
+        expect(r.status).to.equal('fault')
+    })
+
+    it('MEMBER DROP LASTROUND pushes lastRound, threaded through stepK and run', () => {
+        const program = ['MEMBER', 'DROP', 'LASTROUND', 'HALT']
+        const cycle = stepK(machine(program), envFor(5), 4)
+        expect(outputOf(cycle.state.ds)).to.deep.equal([7n])
+        expect(cycle.treeOp).to.equal('member')
+        expect(cycle.member?.lastRound).to.equal(7n)
+        const whole = run(machine(program), envFor(5))
+        expect(outputOf(whole.state.ds)).to.deep.equal([7n])
+        expect(whole.member?.lastRound).to.equal(7n)
+    })
+
+    it('OUTH twice matches an inline sha256 chain', () => {
+        const r = run(machine(['LIT', 5, 'OUTH', 'LIT', 9, 'OUTH', 'HALT']), 0n)
+        let expected = '00'.repeat(32)
+        for (const n of [5n, 9n]) {
+            expected = createHash('sha256')
+                .update(Buffer.from(expected + encodeCell(n), 'hex'))
+                .digest('hex')
+        }
+        expect(r.state.logHash).to.equal(expected)
+        expect(r.state.out).to.equal('')
+    })
+
+    it('OUTH underflow faults', () => {
+        expect(step(machine(['OUTH']), 0n).status).to.equal('fault')
+    })
+
+    it('OUTH still works after the output log is full; OUT then faults', () => {
+        const fill = ['LIT', 1, 'OUT']
+        const body: (string | number)[] = []
+        for (let i = 0; i < OUT_MAX; i++) body.push(...fill)
+        const s = machine([...body, 'LIT', 2, 'OUTH', 'LIT', 3, 'OUT', 'HALT'])
+        const r = run(s, 0n, 10_000)
+        // 256 OUTs filled the log; OUTH succeeded; the 257th OUT faulted.
+        expect(r.state.logHash).to.not.equal('00'.repeat(32))
+        expect(outputLog(r.state).length).to.equal(OUT_MAX)
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc < BigInt(r.state.prog.length / 2)).to.equal(true)
     })
 })

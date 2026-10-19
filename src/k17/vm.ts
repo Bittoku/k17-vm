@@ -33,7 +33,7 @@ import {
     slotCells,
     slotOffset,
 } from './isa'
-import { EMPTY_HASHES } from './smt'
+import { EMPTY_HASHES, SparseMerkleTree, decodeLeafPre } from './smt'
 import { keyHash, endorseMessage, attestMessageFor } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
@@ -191,6 +191,30 @@ export interface PaySlot {
 /** Which Merkle-tree operation a cycle has performed (at most one). */
 export type TreeOp = 'none' | 'member' | 'admit' | 'remove'
 
+/**
+ * The roster member a cycle's MEMBER instruction bound.
+ * Purpose: carries the verified leaf (its fields, preimage and proof) to the
+ * later instructions of the same cycle (LASTROUND, and ATTESTM, PAYLEAF,
+ * ADMIT, REMOVE in later tasks). Output of `step`/`stepK`; never stored in
+ * the machine state.
+ */
+export interface BoundMember {
+    /** sha256 of the member's Rabin key, 64 lowercase hex. */
+    keyHash: string
+    /** The member's 20-byte payout address, 40 lowercase hex. */
+    payoutHex: string
+    /** Last round the member attested in. */
+    lastRound: bigint
+    /** Leaf flags cell. */
+    flags: bigint
+    /** Leaf position in the tree, in [0, 65536). */
+    leafIndex: bigint
+    /** The 120-hex-char leaf preimage that was verified. */
+    leafPre: string
+    /** The 16-sibling proof hex (1024 chars) that was verified. */
+    proof: string
+}
+
 /** Result of executing one instruction. */
 export interface StepResult {
     state: K17State
@@ -207,6 +231,8 @@ export interface StepResult {
     payslot?: PaySlot
     /** The tree operation performed so far this cycle; 'none' until Task 3-5 handlers set it. */
     treeOp: TreeOp
+    /** The member bound by MEMBER this cycle, if any. */
+    member?: BoundMember
 }
 
 /**
@@ -341,7 +367,8 @@ export function step(
     bountyDue = 0n,
     sigUsed = false,
     payslot?: PaySlot,
-    treeOp: TreeOp = 'none'
+    treeOp: TreeOp = 'none',
+    member?: BoundMember
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -353,6 +380,7 @@ export function step(
         sigUsed,
         payslot,
         treeOp,
+        member,
     })
     if (s.halted) return unchanged('halted')
 
@@ -367,6 +395,7 @@ export function step(
         sigUsed,
         payslot,
         treeOp,
+        member,
     })
 
     if (pc >= prog.length) return fault()
@@ -389,6 +418,9 @@ export function step(
     let bounty = bountyDue
     let su = sigUsed
     let ps = payslot
+    let nextTreeOp = treeOp
+    let mb = member
+    let logHash = s.logHash
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -726,19 +758,78 @@ export function step(
             ps = { slot: Number(slot), payoutHex: entry.payoutHex, sats }
             break
         }
+        case Op.MEMBER: {
+            // -- IDX   verify the cycle's Merkle proof against rosterRoot and
+            // bind the proven leaf. A second MEMBER, or a member op after an
+            // admin op, is the program's fault. A missing or invalid witness
+            // (index out of range, malformed preimage, failed proof, empty
+            // slot) is the transaction's fault: the VM mirrors the contract,
+            // which treats those as an invalid transaction.
+            if (treeOp !== 'none') return fault()
+            if (!e.tree) return unchanged('need_witness')
+            const { leafPre, proof, leafIndex } = e.tree
+            if (leafIndex < 0n || leafIndex >= 65536n) {
+                return unchanged('verify_failed')
+            }
+            if (!/^[0-9a-f]{120}$/.test(leafPre)) {
+                return unchanged('verify_failed')
+            }
+            if (
+                !SparseMerkleTree.verify(
+                    s.rosterRoot,
+                    leafPre,
+                    proof,
+                    leafIndex
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            if (dsDepth >= DS_MAX) return fault()
+            const fields = decodeLeafPre(leafPre)
+            nextTreeOp = 'member'
+            mb = {
+                keyHash: fields.keyHashHex,
+                payoutHex: fields.payoutHex,
+                lastRound: fields.lastRound,
+                flags: fields.flags,
+                leafIndex,
+                leafPre,
+                proof,
+            }
+            push(leafIndex)
+            break
+        }
+        case Op.LASTROUND: {
+            // -- R   push the bound member's lastRound; faults without MEMBER.
+            if (!mb) return fault()
+            if (dsDepth >= DS_MAX) return fault()
+            push(mb.lastRound)
+            break
+        }
+        case Op.OUTH: {
+            // N1 --   logHash := sha256(logHash || cell(N1)). The output log
+            // `out` is untouched, so OUT_MAX does not apply.
+            if (dsDepth < 1) return fault()
+            const n1 = pop()
+            logHash = createHash('sha256')
+                .update(Buffer.from(s.logHash + encodeCell(n1), 'hex'))
+                .digest('hex')
+            break
+        }
         default:
             return fault()
     }
 
     return {
-        state: { ...s, pc: nextPc, ds, rs, mem, out, halted },
+        state: { ...s, pc: nextPc, ds, rs, mem, out, halted, logHash },
         status: halted ? 'halted' : yielded ? 'yield' : 'ok',
         faulted: false,
         witnessIndex: wi,
         bountyDue: bounty,
         sigUsed: su,
         payslot: ps,
-        treeOp,
+        treeOp: nextTreeOp,
+        member: mb,
     }
 }
 
@@ -753,6 +844,8 @@ export interface CycleOutcome {
     payslot?: PaySlot
     /** The tree operation this cycle performed. */
     treeOp: TreeOp
+    /** The member MEMBER bound this cycle; undefined when none. */
+    member?: BoundMember
 }
 
 /**
@@ -771,9 +864,10 @@ export function stepK(
     let su = false
     let ps: PaySlot | undefined
     let treeOp: TreeOp = 'none'
+    let member: BoundMember | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty, su, ps, treeOp)
+        const r = step(cur, e, wi, bounty, su, ps, treeOp, member)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -782,6 +876,7 @@ export function stepK(
                 bountyDue: bounty,
                 payslot: ps,
                 treeOp,
+                member,
             }
         }
         cur = r.state
@@ -790,6 +885,7 @@ export function stepK(
         su = r.sigUsed
         ps = r.payslot
         treeOp = r.treeOp
+        member = r.member
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
@@ -801,6 +897,7 @@ export function stepK(
         bountyDue: bounty,
         payslot: ps,
         treeOp,
+        member,
     }
 }
 
@@ -818,6 +915,8 @@ export function run(
     status: Status
     bountyDue: bigint
     payslot?: PaySlot
+    treeOp: TreeOp
+    member?: BoundMember
 } {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     let cur = s
@@ -826,9 +925,11 @@ export function run(
     let bounty = 0n
     let su = false
     let ps: PaySlot | undefined
+    let treeOp: TreeOp = 'none'
+    let member: BoundMember | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     while (status === 'ok' && steps < maxSteps) {
-        const r = step(cur, e, wi, bounty, su, ps)
+        const r = step(cur, e, wi, bounty, su, ps, treeOp, member)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -836,6 +937,8 @@ export function run(
                 status: r.status,
                 bountyDue: bounty,
                 payslot: ps,
+                treeOp,
+                member,
             }
         }
         cur = r.state
@@ -843,6 +946,8 @@ export function run(
         bounty = r.bountyDue
         su = r.sigUsed
         ps = r.payslot
+        treeOp = r.treeOp
+        member = r.member
         status =
             r.status === 'fault'
                 ? 'halted'
@@ -851,7 +956,15 @@ export function run(
                 : r.status
         steps++
     }
-    return { state: cur, steps, status, bountyDue: bounty, payslot: ps }
+    return {
+        state: cur,
+        steps,
+        status,
+        bountyDue: bounty,
+        payslot: ps,
+        treeOp,
+        member,
+    }
 }
 
 /** Decode the output log into a list of cell values. */
