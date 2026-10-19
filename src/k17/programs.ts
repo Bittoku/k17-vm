@@ -194,3 +194,33 @@ export function twoStageJobProgram(
         'HALT',
     ])
 }
+
+/**
+ * Enrol-and-attest smoke program for the memory roster (v2 machine).
+ *
+ * Roster slot 0 holds the sponsor, pre-filled in the deployment's initial
+ * memory image (see `withSlot` and `newMachine`). Cycle 1 lets the sponsor
+ * endorse a landowner into slot 1. Cycle 2 reads one witness cell (the
+ * reading), requires the landowner's attestation of (tagA, reading) against
+ * slot 1, logs the reading, pays `bounty` sats to slot 1's payout address
+ * and halts.
+ *
+ * Forth-style listing:
+ *   cycle 1:  tagE 0 1 ENDORSE YIELD
+ *   cycle 2:  tagA IN DUP >R 1 ATTEST R> OUT bounty 1 PAYSLOT HALT
+ *
+ * Input: endorsement tag, attestation tag, bounty in sats.
+ * Output: program hex.
+ */
+export function enrolAndAttestProgram(
+    tagE: number,
+    tagA: number,
+    bounty: number
+): string {
+    // prettier-ignore
+    return assemble([
+        'LIT', tagE, 'LIT', 0, 'LIT', 1, 'ENDORSE', 'YIELD',
+        'LIT', tagA, 'IN', 'DUP', '>R', 'LIT', 1, 'ATTEST', 'R>', 'OUT',
+        'LIT', bounty, 'LIT', 1, 'PAYSLOT', 'HALT',
+    ])
+}

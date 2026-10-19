@@ -26,6 +26,7 @@ import {
     outputLog,
     run,
     initialState,
+    readSlot,
     hashCell,
     whoOf,
     withSlot,
@@ -37,6 +38,7 @@ import {
     factoringBountyProgram,
     twoStageJobProgram,
     attestProgram,
+    enrolAndAttestProgram,
 } from '../src/k17/programs'
 import {
     addrOf,
@@ -54,6 +56,8 @@ import {
     signReading,
     keyHash,
     payoutOf,
+    pubKeyBytes,
+    signEndorsement,
 } from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
 use(chaiAsPromised)
@@ -324,12 +328,20 @@ describe('K17Machine on-chain', function () {
     })
 
     it('differential fuzz: random programs never produce an unverifiable cycle', async () => {
-        // IN, VERIFY and SIGVERIFY make a transaction invalid by design, so
-        // they are left out of the random op set; everything else must
-        // always verify.
+        // IN, VERIFY, SIGVERIFY, ATTEST and ENDORSE make a transaction
+        // invalid by design, so they are left out of the random op set;
+        // everything else (PAYSLOT and VALUE included: they only fault or
+        // succeed) must always verify.
         const ops = (
             Object.values(Op).filter((v) => typeof v === 'number') as number[]
-        ).filter((v) => v !== Op.IN && v !== Op.VERIFY && v !== Op.SIGVERIFY)
+        ).filter(
+            (v) =>
+                v !== Op.IN &&
+                v !== Op.VERIFY &&
+                v !== Op.SIGVERIFY &&
+                v !== Op.ATTEST &&
+                v !== Op.ENDORSE
+        )
         let seed = 12345
         const rnd = (n: number) => {
             seed = (seed * 1103515245 + 12345) & 0x7fffffff
@@ -861,5 +873,300 @@ describe('K17Machine on-chain', function () {
         expect(BigInt(r2.tx.outputs[0].satoshis)).to.equal(
             BigInt(FUNDING) - r2.plan.reward
         )
+    })
+
+    // ------------------------------------------------------------------
+    // v2 machine: ATTEST and ENDORSE against the memory roster
+    // ------------------------------------------------------------------
+
+    const sponsor = newAttester(Buffer.alloc(32, 41))
+    const landowner = newAttester(Buffer.alloc(32, 42))
+    const [, , , landownerAddress] = randomPrivateKey()
+    const LANDOWNER_PAYOUT = payoutOf(landownerAddress)
+    const TAG_E = 77
+    const TAG_A = 88
+    const READING = 2231n
+    const BOUNTY = 5000
+    /** Memory image with roster slot 0 naming the sponsor (zero payout). */
+    const SPONSOR_MEM = withSlot(
+        initialState('').mem,
+        0,
+        slotCells(keyHash(sponsor.pub), '00'.repeat(20))
+    )
+    /** Keys for a sponsor endorsement of the landowner. */
+    const ENDORSE_KEYS: CycleKeys = {
+        attestKey: sponsor.pub,
+        endorseKey: landowner.pub,
+        payoutHex: LANDOWNER_PAYOUT,
+    }
+    /** The sponsor's endorsement of the landowner into `slot`. */
+    const endorsementFor = (slot: bigint): RabinSig =>
+        signEndorsement(
+            sponsor,
+            BigInt(TAG_E),
+            landowner.pub,
+            LANDOWNER_PAYOUT,
+            slot
+        )
+
+    /**
+     * Send `plan` to `m` without the cycle() bookkeeping, so a test can pair
+     * a plan made for one machine with another machine, or override keyA.
+     * Input: machine, plan, lock time, optional keyA hex. Output: the step
+     * call's promise (expected to reject).
+     */
+    function sendPlan(
+        m: K17Machine,
+        plan: CyclePlan,
+        lockTime: bigint,
+        keyAHex: string = plan.keyAHex
+    ) {
+        const opts = bindCycleBuilder(m, plan, keeperA, lockTime)
+        return m.methods.step(
+            addrOf(keeperA),
+            toByteString(plan.witnessHex),
+            plan.sig.s,
+            toByteString(plan.sig.padding),
+            toByteString(keyAHex),
+            toByteString(plan.keyBHex),
+            toByteString(plan.payoutHex),
+            opts
+        )
+    }
+
+    it('enrol, endorse and attest: the landowner is enrolled, attests and is paid', async () => {
+        const m = await deploy(
+            enrolAndAttestProgram(TAG_E, TAG_A, BOUNTY),
+            FUNDING,
+            SPONSOR_MEM
+        )
+        // cycle 1: the sponsor endorses the landowner into slot 1; keeper A relays
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            endorsementFor(1n),
+            ENDORSE_KEYS
+        )
+        expect(r1.plan.halted).to.be.false
+        const enrolled = r1.next as K17Machine
+        expect(readSlot(enrolled.mem, 1)).to.deep.equal({
+            hashHex: keyHash(landowner.pub),
+            payoutHex: LANDOWNER_PAYOUT,
+            empty: false,
+        })
+        // cycle 2: the landowner attests a reading; keeper A relays
+        const r2 = await cycle(
+            enrolled,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperA,
+            {},
+            [READING],
+            signReading(landowner, BigInt(TAG_A), READING),
+            { attestKey: landowner.pub }
+        )
+        expect(r2.plan.halted).to.be.true
+        expect(outputLog(r2.plan.nextState)).to.deep.equal([READING])
+        expect(addressOf(r2.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(addressOf(r2.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(addressOf(r2.tx.outputs[2])).to.equal(
+            landownerAddress.toString()
+        )
+        expect(r2.tx.outputs[2].satoshis).to.equal(BOUNTY)
+        expect(BigInt(r2.tx.outputs[0].satoshis)).to.equal(
+            r1.plan.remaining - r2.plan.reward - BigInt(BOUNTY)
+        )
+        console.log(
+            `      endorsement cycle tx: ${
+                r1.tx.toBuffer().length
+            } bytes, attestation cycle tx: ${r2.tx.toBuffer().length} bytes`
+        )
+    })
+
+    /** Program: attest (5, 2231) against slot 0, then yield. */
+    const ATTEST0 = assemble([
+        'LIT',
+        5,
+        'LIT',
+        2231,
+        'LIT',
+        0,
+        'ATTEST',
+        'YIELD',
+    ])
+    const ATTEST0_SIG = (): RabinSig => signReading(sponsor, 5n, 2231n)
+
+    it('ATTEST accepts the slot key and refuses a 383-byte key', async () => {
+        const m = await deploy(ATTEST0, FUNDING, SPONSOR_MEM)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            ATTEST0_SIG(),
+            {
+                attestKey: sponsor.pub,
+            }
+        )
+        await expect(
+            sendPlan(m, plan, T0 + 1n, pubKeyBytes(sponsor.pub).slice(0, 766))
+        ).to.be.rejectedWith(/key must be 384 bytes/)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(),
+            {
+                attestKey: sponsor.pub,
+            }
+        )
+        expect(r.plan.halted).to.be.false
+        expect((r.next as K17Machine).ds).to.equal('')
+    })
+
+    it('ATTEST refuses a key that is not the slot key', async () => {
+        const m = await deploy(ATTEST0, FUNDING, SPONSOR_MEM)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            ATTEST0_SIG(),
+            {
+                attestKey: sponsor.pub,
+            }
+        )
+        await expect(
+            sendPlan(m, plan, T0 + 1n, pubKeyBytes(landowner.pub))
+        ).to.be.rejectedWith(/key not in roster slot/)
+    })
+
+    it('ATTEST then ENDORSE in one cycle is refused', async () => {
+        // prettier-ignore
+        const both = assemble([
+            'LIT', 5, 'LIT', 2231, 'LIT', 0, 'ATTEST',
+            'LIT', TAG_E, 'LIT', 0, 'LIT', 1, 'ENDORSE', 'YIELD',
+        ])
+        const m = await deploy(both, FUNDING, SPONSOR_MEM)
+        // The reference VM refuses to plan it.
+        expect(() =>
+            planCycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                [],
+                ATTEST0_SIG(),
+                ENDORSE_KEYS
+            )
+        ).to.throw(/needs a witness/)
+        // Build the spend from an ATTEST-only plan: the contract must refuse.
+        const once = newMachine(ATTEST0, ECON, T0, rosterOf(), SPONSOR_MEM)
+        const plan = planCycle(
+            once,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            ATTEST0_SIG(),
+            ENDORSE_KEYS
+        )
+        await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
+            /one attestation per cycle/
+        )
+    })
+
+    it('an endorsement signed for slot 1 is refused when presented with NEWSLOT 2', async () => {
+        const into2 = assemble([
+            'LIT',
+            TAG_E,
+            'LIT',
+            0,
+            'LIT',
+            2,
+            'ENDORSE',
+            'YIELD',
+        ])
+        const m = await deploy(into2, FUNDING, SPONSOR_MEM)
+        // The reference VM refuses to plan it.
+        expect(() =>
+            planCycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                [],
+                endorsementFor(1n),
+                ENDORSE_KEYS
+            )
+        ).to.throw(/witness rejected/)
+        // Build the spend from the honest slot-1 plan: the contract must refuse.
+        const into1 = newMachine(
+            assemble(['LIT', TAG_E, 'LIT', 0, 'LIT', 1, 'ENDORSE', 'YIELD']),
+            ECON,
+            T0,
+            rosterOf(),
+            SPONSOR_MEM
+        )
+        const plan = planCycle(
+            into1,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            [],
+            endorsementFor(1n),
+            ENDORSE_KEYS
+        )
+        await expect(sendPlan(m, plan, T0 + 1n)).to.be.rejectedWith(
+            /signature check failed/
+        )
+    })
+
+    it('ATTEST on an empty slot and ENDORSE into a filled slot fault and refund', async () => {
+        const emptySlot = await deploy(
+            assemble(['LIT', 5, 'LIT', 2231, 'LIT', 1, 'ATTEST', 'YIELD']),
+            FUNDING,
+            SPONSOR_MEM
+        )
+        const a = await cycle(
+            emptySlot,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            ATTEST0_SIG(),
+            {
+                attestKey: sponsor.pub,
+            }
+        )
+        expectFaultRefund(a, BigInt(FUNDING))
+        const filled = await deploy(
+            assemble(['LIT', TAG_E, 'LIT', 0, 'LIT', 0, 'ENDORSE', 'YIELD']),
+            FUNDING,
+            SPONSOR_MEM
+        )
+        const e = await cycle(
+            filled,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            endorsementFor(0n),
+            ENDORSE_KEYS
+        )
+        expectFaultRefund(e, BigInt(FUNDING))
     })
 })

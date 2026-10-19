@@ -112,6 +112,11 @@ export class K17Machine extends SmartContract {
     /** Cells per memory roster slot: 8 key-hash cells, 5 payout cells (ISA SLOT_CELLS). */
     @prop()
     static readonly SLOT_CELLS: bigint = 13n
+    /** Key hash of an empty roster slot: 32 zero bytes. */
+    @prop()
+    static readonly EMPTY_HASH: ByteString = toByteString(
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
 
     // ---- immutable program and economics -------------------------------
 
@@ -235,10 +240,11 @@ export class K17Machine extends SmartContract {
      * Advance the machine by K instructions and pay the keeper.
      * @param keeper address that receives this cycle's reward
      * @param witness cells consumed by IN, concatenated
-     * @param sigS Rabin signature value consumed by SIGVERIFY (0 if none)
-     * @param sigPad Rabin signature padding consumed by SIGVERIFY
-     * @param keyA Rabin key (pubKeyBytes form) that signs for ATTEST or
-     *        sponsors for ENDORSE; empty when unused (no handler reads it yet)
+     * @param sigS Rabin signature value consumed by the cycle's one
+     *        SIGVERIFY, ATTEST or ENDORSE (0 if none)
+     * @param sigPad Rabin signature padding for sigS
+     * @param keyA Rabin key (pubKeyBytes form, 384 bytes) that signs for
+     *        ATTEST or sponsors for ENDORSE; empty when unused
      * @param keyB new member's Rabin key (pubKeyBytes form) for ENDORSE;
      *        empty when unused
      * @param payout new member's 20-byte payout address hash for ENDORSE;
@@ -250,13 +256,8 @@ export class K17Machine extends SmartContract {
         witness: ByteString,
         sigS: bigint,
         sigPad: ByteString,
-        // keyA, keyB and payout are part of the v2 interface; ATTEST and
-        // ENDORSE will read them.
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         keyA: ByteString,
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         keyB: ByteString,
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         payout: ByteString
     ) {
         const progLen = len(this.prog)
@@ -307,6 +308,13 @@ export class K17Machine extends SmartContract {
                     if (!decodeOk) {
                         halted = true
                     } else {
+                        // SIGVERIFY, ATTEST and ENDORSE set these instead of
+                        // calling RabinVerifier themselves; the one check
+                        // after the handlers keeps a single verifier per
+                        // unrolled step in the script.
+                        let verifyNeeded = false
+                        let verifyMsg = toByteString('')
+                        let verifyKey: RabinPubKey = 0n
                         const n = len(ds)
                         const r = len(rs)
                         // Top two data cells, valid only when n >= 8.
@@ -589,15 +597,131 @@ export class K17Machine extends SmartContract {
                                     )
                                     sigUsed = true
                                     // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
-                                    const msg =
+                                    verifyNeeded = true
+                                    verifyMsg =
                                         toByteString('4b313741') +
-                                        K17Machine.cell(second) +
-                                        K17Machine.cell(top)
-                                    assert(
-                                        RabinVerifier.verifySig(msg, sig, pub),
-                                        'attestation failed'
-                                    )
+                                        slice(ds, n - 8n, n)
+                                    verifyKey = pub
                                     ds = ds2
+                                }
+                            }
+                        } else if (op == 32n) {
+                            // ATTEST : TAG VAL SLOT --
+                            // Underflow, bad slot or empty slot: fault. A
+                            // second signature, a key that is not 384 bytes
+                            // or not the slot's, or a bad signature: tx
+                            // invalid.
+                            if (n < 12n || top >= K17Machine.ROSTER_SLOTS_MEM) {
+                                halted = true
+                            } else {
+                                const slotByte =
+                                    (K17Machine.ROSTER_BASE +
+                                        top * K17Machine.SLOT_CELLS) *
+                                    4n
+                                const slotHash = slice(
+                                    mem,
+                                    slotByte,
+                                    slotByte + 32n
+                                )
+                                if (slotHash == K17Machine.EMPTY_HASH) {
+                                    halted = true
+                                } else {
+                                    assert(
+                                        !sigUsed,
+                                        'one attestation per cycle'
+                                    )
+                                    assert(
+                                        len(keyA) == 384n,
+                                        'key must be 384 bytes'
+                                    )
+                                    assert(
+                                        sha256(keyA) == slotHash,
+                                        'key not in roster slot'
+                                    )
+                                    sigUsed = true
+                                    // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
+                                    verifyNeeded = true
+                                    verifyMsg =
+                                        toByteString('4b313741') +
+                                        slice(ds, n - 12n, n - 4n)
+                                    verifyKey = Utils.fromLEUnsigned(keyA)
+                                    ds = slice(ds, 0n, n - 12n)
+                                }
+                            }
+                        } else if (op == 33n) {
+                            // ENDORSE : TAG SLOT NEWSLOT --
+                            // Underflow, bad or empty SLOT, bad or filled
+                            // NEWSLOT: fault. A second signature, keys that
+                            // are not 384 bytes, a payout that is not 20
+                            // bytes, a sponsor key that is not SLOT's, or a
+                            // bad signature: tx invalid.
+                            if (
+                                n < 12n ||
+                                second >= K17Machine.ROSTER_SLOTS_MEM
+                            ) {
+                                halted = true
+                            } else {
+                                const sponsorByte =
+                                    (K17Machine.ROSTER_BASE +
+                                        second * K17Machine.SLOT_CELLS) *
+                                    4n
+                                const sponsorHash = slice(
+                                    mem,
+                                    sponsorByte,
+                                    sponsorByte + 32n
+                                )
+                                const newByte =
+                                    (K17Machine.ROSTER_BASE +
+                                        top * K17Machine.SLOT_CELLS) *
+                                    4n
+                                if (sponsorHash == K17Machine.EMPTY_HASH) {
+                                    halted = true
+                                } else if (top >= K17Machine.ROSTER_SLOTS_MEM) {
+                                    halted = true
+                                } else if (
+                                    slice(mem, newByte, newByte + 32n) !=
+                                    K17Machine.EMPTY_HASH
+                                ) {
+                                    halted = true
+                                } else {
+                                    assert(
+                                        !sigUsed,
+                                        'one attestation per cycle'
+                                    )
+                                    assert(
+                                        len(keyA) == 384n,
+                                        'key must be 384 bytes'
+                                    )
+                                    assert(
+                                        len(keyB) == 384n,
+                                        'new key must be 384 bytes'
+                                    )
+                                    assert(
+                                        len(payout) == 20n,
+                                        'payout must be 20 bytes'
+                                    )
+                                    assert(
+                                        sha256(keyA) == sponsorHash,
+                                        'key not in roster slot'
+                                    )
+                                    sigUsed = true
+                                    const newHash = sha256(keyB)
+                                    // ENDORSE_DOMAIN ("K17E") || cell(TAG) ||
+                                    // cell(NEWSLOT) || sha256(keyB) || payout
+                                    verifyNeeded = true
+                                    verifyMsg =
+                                        toByteString('4b313745') +
+                                        slice(ds, n - 12n, n - 8n) +
+                                        slice(ds, n - 4n, n) +
+                                        newHash +
+                                        payout
+                                    verifyKey = Utils.fromLEUnsigned(keyA)
+                                    mem =
+                                        slice(mem, 0n, newByte) +
+                                        newHash +
+                                        payout +
+                                        slice(mem, newByte + 52n)
+                                    ds = slice(ds, 0n, n - 12n)
                                 }
                             }
                         } else if (op == 34n) {
@@ -614,9 +738,7 @@ export class K17Machine extends SmartContract {
                                     4n
                                 if (
                                     slice(mem, slotByte, slotByte + 32n) ==
-                                    toByteString(
-                                        '0000000000000000000000000000000000000000000000000000000000000000'
-                                    )
+                                    K17Machine.EMPTY_HASH
                                 ) {
                                     halted = true
                                 } else if (second == 0n || payslotUsed) {
@@ -645,9 +767,19 @@ export class K17Machine extends SmartContract {
                                     ds + K17Machine.cell(K17Machine.wrap(value))
                             }
                         } else {
-                            // unknown opcode (ATTEST and ENDORSE are not yet
-                            // handled on chain and fault here)
+                            // unknown opcode
                             halted = true
+                        }
+
+                        if (verifyNeeded) {
+                            assert(
+                                RabinVerifier.verifySig(
+                                    verifyMsg,
+                                    sig,
+                                    verifyKey
+                                ),
+                                'signature check failed'
+                            )
                         }
 
                         if (!halted) {
