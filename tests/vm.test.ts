@@ -30,6 +30,8 @@ import {
     outputLog,
     envOf,
     hashCell,
+    readSlot,
+    withSlot,
 } from '../src/k17/vm'
 import {
     countdownProgram,
@@ -344,6 +346,115 @@ describe('K17 reference VM', () => {
             sig: signReading(b, 1n, 2n),
         })
         expect(r.status).to.equal('need_witness')
+    })
+})
+
+describe('K17 VALUE, PAYSLOT and roster write-protection', function () {
+    const keyHash = 'ab'.repeat(32)
+    const payout = '12'.repeat(20)
+    /** State with roster slot 2 filled and the given program loaded. */
+    const withSlot2 = (prog: string) => {
+        const s = initialState(prog)
+        return { ...s, mem: withSlot(s.mem, 2, slotCells(keyHash, payout)) }
+    }
+
+    it('VALUE pushes the balance', () => {
+        const prog = assemble(['VALUE', 'OUT', 'HALT'])
+        const r = run(initialState(prog), { ...envOf(0n), value: 123456n })
+        expect(r.status).to.equal('halted')
+        expect(outputLog(r.state)).to.deep.equal([123456n])
+        // default balance is zero; larger balances wrap modulo 2^32
+        const d = run(initialState(prog), envOf(0n))
+        expect(outputLog(d.state)).to.deep.equal([0n])
+        const w = run(initialState(prog), {
+            ...envOf(0n),
+            value: CELL_MOD + 7n,
+        })
+        expect(outputLog(w.state)).to.deep.equal([7n])
+    })
+
+    it('VALUE faults on data-stack overflow', () => {
+        const prog = assemble(['LIT', 1, 'VALUE', 'HALT'])
+        let s = initialState(prog)
+        s = { ...s, ds: encodeCell(0n).repeat(DS_MAX - 1) }
+        const ok = step(step(s, envOf(0n)).state, envOf(0n))
+        expect(ok.status).to.equal('fault')
+    })
+
+    it('PAYSLOT records slot payout', () => {
+        const prog = assemble(['LIT', 5000, 'LIT', 2, 'PAYSLOT', 'HALT'])
+        const r = stepK(withSlot2(prog), envOf(0n), 10)
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.deep.equal({
+            slot: 2,
+            payoutHex: payout,
+            sats: 5000n,
+        })
+        expect(r.state.ds).to.equal('')
+        const slot = readSlot(r.state.mem, 2)
+        expect(slot).to.deep.equal({
+            hashHex: keyHash,
+            payoutHex: payout,
+            empty: false,
+        })
+        expect(readSlot(r.state.mem, 3).empty).to.equal(true)
+    })
+
+    it('PAYSLOT on an empty slot faults', () => {
+        const prog = assemble(['LIT', 5000, 'LIT', 3, 'PAYSLOT', 'HALT'])
+        const r = stepK(withSlot2(prog), envOf(0n), 10)
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.equal(undefined)
+        expect(r.state.halted).to.equal(true)
+        expect(r.state.pc).to.equal(10n) // stopped at the PAYSLOT
+    })
+
+    it('PAYSLOT faults on underflow and on a slot out of range', () => {
+        const under = step(
+            withSlot2(assemble(['LIT', 1, 'PAYSLOT'])),
+            envOf(0n)
+        )
+        expect(step(under.state, envOf(0n)).status).to.equal('fault')
+        const prog = assemble(['LIT', 1, 'LIT', ROSTER_SLOTS, 'PAYSLOT'])
+        const r = stepK(withSlot2(prog), envOf(0n), 3)
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.equal(undefined)
+    })
+
+    it('a second PAYSLOT in one cycle is need_witness', () => {
+        // prettier-ignore
+        const prog = assemble([
+            'LIT', 1, 'LIT', 2, 'PAYSLOT', 'LIT', 1, 'LIT', 2, 'PAYSLOT', 'HALT',
+        ])
+        const r = stepK(withSlot2(prog), envOf(0n), 10)
+        expect(r.status).to.equal('need_witness')
+        const full = run(withSlot2(prog), envOf(0n))
+        expect(full.status).to.equal('need_witness')
+    })
+
+    it('STORE into the roster region faults', () => {
+        const bad = run(
+            initialState(assemble(['LIT', 9, 'LIT', ROSTER_BASE, '!', 'HALT'])),
+            envOf(0n)
+        )
+        expect(bad.status).to.equal('halted')
+        expect(bad.state.mem).to.equal(initialState('').mem)
+        const good = run(
+            initialState(
+                assemble(['LIT', 9, 'LIT', ROSTER_BASE - 1, '!', 'HALT'])
+            ),
+            envOf(0n)
+        )
+        expect(
+            good.state.mem.slice((ROSTER_BASE - 1) * 8, ROSTER_BASE * 8)
+        ).to.equal(encodeCell(9n))
+    })
+
+    it('initialState validates the memory image', () => {
+        expect(() => initialState('', '00')).to.throw()
+        expect(initialState('', '11'.repeat(MEM_CELLS * 4)).mem).to.have.length(
+            MEM_CELLS * 8
+        )
     })
 })
 

@@ -50,8 +50,10 @@
  * Roster instructions (stack effects; semantics arrive with the machine):
  *   ATTEST  (0x20)  see the v2 machine; verifies an attested reading
  *   ENDORSE (0x21)  see the v2 machine; verifies a roster endorsement
- *   PAYSLOT (0x22)  see the v2 machine; pays a roster slot's payout
- *   VALUE   (0x23)  -- V    pushes the value of the spent output
+ *   PAYSLOT (0x22)  N SLOT --  pays N sats to roster slot SLOT's payout; faults on
+ *                   underflow, SLOT >= ROSTER_SLOTS or an empty slot; a second
+ *                   PAYSLOT in one cycle invalidates the transaction
+ *   VALUE   (0x23)  -- V    pushes the value of the spent output (mod 2^32)
  * None of the four carries an operand.
  *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
@@ -77,7 +79,7 @@ export const OUT_MAX = 256
 /** Opcode byte values. Mnemonics follow Koopman's Forth notation. */
 export enum Op {
     HALT = 0x00,
-    STORE = 0x01, //  !      N1 ADDR --        mem[ADDR] = N1
+    STORE = 0x01, //  !      N1 ADDR --        mem[ADDR] = N1; faults if ADDR >= ROSTER_BASE
     ADD = 0x02, //    +      N1 N2 -- N3       N3 = N1 + N2
     SUB = 0x03, //    -      N1 N2 -- N3       N3 = N1 - N2
     TO_R = 0x04, //   >R     N1 --             push N1 on return stack

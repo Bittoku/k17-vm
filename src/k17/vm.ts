@@ -23,10 +23,14 @@ import {
     OUT_MAX,
     Op,
     ROSTER_MAX,
+    ROSTER_BASE,
+    ROSTER_SLOTS,
     RS_MAX,
+    SLOT_CELLS,
     attestMessage,
     decodeCell,
     encodeCell,
+    slotOffset,
 } from './isa'
 
 /** Complete machine state. Everything the contract carries between cycles. */
@@ -59,6 +63,8 @@ export interface StepEnv {
     roster?: RabinPubKey[]
     /** The one Rabin signature carried by this transaction (SIGVERIFY). */
     sig?: RabinSig
+    /** Balance of the machine output being spent, in satoshis (VALUE); default 0. */
+    value?: bigint
 }
 
 /** Build an environment; `lockTime` alone is enough for programs without I/O. */
@@ -105,6 +111,13 @@ export type Status =
     | 'verify_failed'
     | 'yield'
 
+/** A payout recorded by PAYSLOT: roster slot, its payout hash (hex) and satoshis. */
+export interface PaySlot {
+    slot: number
+    payoutHex: string
+    sats: bigint
+}
+
 /** Result of executing one instruction. */
 export interface StepResult {
     state: K17State
@@ -117,16 +130,31 @@ export interface StepResult {
     bountyDue: bigint
     /** True once SIGVERIFY has consumed this transaction's signature. */
     sigUsed: boolean
+    /** The payout recorded by PAYSLOT this cycle, if any. */
+    payslot?: PaySlot
 }
 
-/** Build the initial state for a program: empty stacks, zeroed memory. */
-export function initialState(progHex: string): K17State {
+/**
+ * Build the initial state for a program: empty stacks, memory zeroed or
+ * taken from an optional pre-filled image.
+ * Input: program hex; optional memory image hex of exactly MEM_CELLS * CELL * 2
+ * characters (throws otherwise). Output: the starting K17State.
+ */
+export function initialState(progHex: string, memHex?: string): K17State {
+    if (
+        memHex !== undefined &&
+        !new RegExp(`^([0-9a-fA-F]{2}){${MEM_CELLS * CELL}}$`).test(memHex)
+    ) {
+        throw new Error(
+            `memory image must be ${MEM_CELLS * CELL * 2} hex characters`
+        )
+    }
     return {
         prog: progHex,
         pc: 0n,
         ds: '',
         rs: '',
-        mem: '00'.repeat(MEM_CELLS * CELL),
+        mem: memHex ?? '00'.repeat(MEM_CELLS * CELL),
         out: '',
         halted: false,
     }
@@ -148,6 +176,46 @@ function setCell(hex: string, index: number, value: bigint): string {
     return hex.slice(0, start) + encodeCell(value) + hex.slice(start + CELL * 2)
 }
 
+/**
+ * Write a roster slot into a memory image.
+ * Input: memory hex, slot number, SLOT_CELLS cell values (see slotCells).
+ * Output: the memory hex with those cells written at slotOffset(slot).
+ */
+export function withSlot(
+    memHex: string,
+    slot: number,
+    cells: bigint[]
+): string {
+    if (cells.length !== SLOT_CELLS) {
+        throw new Error(`a slot is ${SLOT_CELLS} cells, got ${cells.length}`)
+    }
+    const base = slotOffset(slot)
+    let mem = memHex
+    cells.forEach((value, i) => {
+        mem = setCell(mem, base + i, value)
+    })
+    return mem
+}
+
+/**
+ * Read a roster slot out of a memory image.
+ * Input: memory hex, slot number. Output: the 32-byte key hash (hex), the
+ * 20-byte payout hash (hex) and whether the slot is empty (all eight hash
+ * cells zero).
+ */
+export function readSlot(
+    mem: string,
+    slot: number
+): { hashHex: string; payoutHex: string; empty: boolean } {
+    const base = slotOffset(slot)
+    const hashHex = mem.slice(base * CELL * 2, (base + 8) * CELL * 2)
+    const payoutHex = mem.slice(
+        (base + 8) * CELL * 2,
+        (base + SLOT_CELLS) * CELL * 2
+    )
+    return { hashHex, payoutHex, empty: /^0*$/.test(hashHex) }
+}
+
 /** HASH instruction: first 4 bytes of sha256 over the 4-byte cell, as a cell. */
 export function hashCell(value: bigint): bigint {
     const digest = createHash('sha256')
@@ -165,7 +233,8 @@ export function whoOf(addressHashHex: string): bigint {
  * Execute exactly one instruction.
  *
  * Input: current state, environment, witness index consumed so far, bounty
- * authorised so far, whether the cycle's signature is already consumed.
+ * authorised so far, whether the cycle's signature is already consumed, and
+ * the payout PAYSLOT already recorded this cycle (if any).
  * Output: new state and status. Faults set `halted`; they are never thrown.
  * `need_witness` and `verify_failed` leave the state unchanged and mean the
  * enclosing transaction cannot be valid (SIGVERIFY reports `need_witness`
@@ -176,7 +245,8 @@ export function step(
     env: StepEnv | bigint,
     witnessIndex = 0,
     bountyDue = 0n,
-    sigUsed = false
+    sigUsed = false,
+    payslot?: PaySlot
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -186,6 +256,7 @@ export function step(
         witnessIndex,
         bountyDue,
         sigUsed,
+        payslot,
     })
     if (s.halted) return unchanged('halted')
 
@@ -198,6 +269,7 @@ export function step(
         witnessIndex,
         bountyDue,
         sigUsed,
+        payslot,
     })
 
     if (pc >= prog.length) return fault()
@@ -219,6 +291,7 @@ export function step(
     let wi = witnessIndex
     let bounty = bountyDue
     let su = sigUsed
+    let ps = payslot
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -239,7 +312,7 @@ export function step(
             if (dsDepth < 2) return fault()
             const addr = pop()
             const value = pop()
-            if (addr >= BigInt(MEM_CELLS)) return fault()
+            if (addr >= BigInt(ROSTER_BASE)) return fault() // roster is write-protected
             mem = setCell(mem, Number(addr), value)
             break
         }
@@ -445,6 +518,23 @@ export function step(
             su = true
             break
         }
+        case Op.VALUE: {
+            if (dsDepth >= DS_MAX) return fault()
+            push((e.value ?? 0n) % CELL_MOD)
+            break
+        }
+        case Op.PAYSLOT: {
+            // N SLOT --   pay N sats to the roster slot's payout address
+            if (dsDepth < 2) return fault()
+            const slot = pop()
+            const sats = pop()
+            if (slot >= BigInt(ROSTER_SLOTS)) return fault()
+            const entry = readSlot(mem, Number(slot))
+            if (entry.empty) return fault()
+            if (ps) return unchanged('need_witness')
+            ps = { slot: Number(slot), payoutHex: entry.payoutHex, sats }
+            break
+        }
         default:
             return fault()
     }
@@ -456,6 +546,7 @@ export function step(
         witnessIndex: wi,
         bountyDue: bounty,
         sigUsed: su,
+        payslot: ps,
     }
 }
 
@@ -466,6 +557,8 @@ export interface CycleOutcome {
     status: Status
     witnessUsed: number
     bountyDue: bigint
+    /** The payout PAYSLOT recorded this cycle; undefined when none. */
+    payslot?: PaySlot
 }
 
 /**
@@ -482,26 +575,35 @@ export function stepK(
     let wi = 0
     let bounty = 0n
     let su = false
+    let ps: PaySlot | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty, su)
+        const r = step(cur, e, wi, bounty, su, ps)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
                 status: r.status,
                 witnessUsed: wi,
                 bountyDue: bounty,
+                payslot: ps,
             }
         }
         cur = r.state
         wi = r.witnessIndex
         bounty = r.bountyDue
         su = r.sigUsed
+        ps = r.payslot
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
     if (status === 'yield') status = 'ok'
-    return { state: cur, status, witnessUsed: wi, bountyDue: bounty }
+    return {
+        state: cur,
+        status,
+        witnessUsed: wi,
+        bountyDue: bounty,
+        payslot: ps,
+    }
 }
 
 /**
@@ -512,23 +614,37 @@ export function run(
     s: K17State,
     env: StepEnv | bigint,
     maxSteps = 100_000
-): { state: K17State; steps: number; status: Status; bountyDue: bigint } {
+): {
+    state: K17State
+    steps: number
+    status: Status
+    bountyDue: bigint
+    payslot?: PaySlot
+} {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     let cur = s
     let steps = 0
     let wi = 0
     let bounty = 0n
     let su = false
+    let ps: PaySlot | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     while (status === 'ok' && steps < maxSteps) {
-        const r = step(cur, e, wi, bounty, su)
+        const r = step(cur, e, wi, bounty, su, ps)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
-            return { state: cur, steps, status: r.status, bountyDue: bounty }
+            return {
+                state: cur,
+                steps,
+                status: r.status,
+                bountyDue: bounty,
+                payslot: ps,
+            }
         }
         cur = r.state
         wi = r.witnessIndex
         bounty = r.bountyDue
         su = r.sigUsed
+        ps = r.payslot
         status =
             r.status === 'fault'
                 ? 'halted'
@@ -537,7 +653,7 @@ export function run(
                 : r.status
         steps++
     }
-    return { state: cur, steps, status, bountyDue: bounty }
+    return { state: cur, steps, status, bountyDue: bounty, payslot: ps }
 }
 
 /** Decode the output log into a list of cell values. */
