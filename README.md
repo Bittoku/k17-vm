@@ -183,14 +183,14 @@ state. Each cycle can carry one Merkle proof in the unlocking script.
 ### Instructions
 
 | Instruction | Stack effect   | Function                                                                                                               |
-| ----------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- | --- | --------------------------------------------- |
+| ----------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `MEMBER`    | `-- IDX`       | Checks the proof against `rosterRoot` and binds that member for the cycle. Pushes the leaf index.                      |
 | `LASTROUND` | `-- R`         | Pushes the bound member's `lastRound`.                                                                                 |
 | `ATTESTM`   | `TAG VAL --`   | Checks a reading that the bound member signed with `keyA`.                                                             |
 | `PAYLEAF`   | `N ROUND --`   | Pays `N` sats to the bound member and sets its `lastRound` to `ROUND`. The root changes.                               |
 | `ADMIT`     | `TAG ROUND --` | The sponsor puts a new member (`keyB`, `payout`) into an empty leaf with `lastRound` = `ROUND`. Adds 1 to `rosterSeq`. |
 | `REMOVE`    | `TAG --`       | The sponsor empties an occupied leaf. Adds 1 to `rosterSeq`.                                                           |
-| `OUTH`      | `N1 --`        | Sets `logHash` to `sha256(logHash                                                                                      |     | cell(N1))`. It does not write the output log. |
+| `OUTH`      | `N1 --`        | Sets `logHash` to the SHA-256 of `logHash` followed by `cell(N1)`. It does not write the output log.                   |
 
 ### Signed messages
 

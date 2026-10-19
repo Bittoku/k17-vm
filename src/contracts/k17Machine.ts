@@ -440,7 +440,8 @@ export class K17Machine extends SmartContract {
      * @param keeper address that receives this cycle's reward
      * @param witness cells consumed by IN, concatenated
      * @param sigS Rabin signature value consumed by the cycle's one
-     *        SIGVERIFY, ATTEST or ENDORSE (0 if none)
+     *        SIGVERIFY, ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE (0 if
+     *        none)
      * @param sigPad Rabin signature padding for sigS
      * @param keyA Rabin key (pubKeyBytes form, 384 bytes) that signs for
      *        ATTEST or ATTESTM, sponsors for ENDORSE, or is the sponsor key
@@ -513,10 +514,13 @@ export class K17Machine extends SmartContract {
         let payslotSats = 0n
         // Placeholder until PAYSLOT runs; only read when payslotUsed.
         let payslotAddr: Addr = this.beneficiary
-        // SIGVERIFY, ATTEST and ENDORSE record the message and key here
-        // instead of calling RabinVerifier themselves. sigUsed allows one
-        // signature per cycle, so one verification after the unrolled loop
-        // covers it and the verifier appears once in the script.
+        // SIGVERIFY, ATTEST, ENDORSE and ATTESTM record the message and key
+        // here in the loop; ADMIT and REMOVE record them after the loop, in
+        // the tree block. None of them calls RabinVerifier itself. sigUsed
+        // allows one signature per cycle, so one verification covers it and
+        // the verifier appears once in the script. That verification runs
+        // after the tree block, because the tree block builds the ADMIT and
+        // REMOVE message.
         let verifyNeeded = false
         let verifyMsg = toByteString('')
         let verifyKey: RabinPubKey = 0n
