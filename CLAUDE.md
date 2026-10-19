@@ -15,11 +15,13 @@ publication belong in this repo.
   in `src/k17/vm.ts` (reference VM) and `src/contracts/k17Machine.ts` (on-chain interpreter),
   and covered by a test in both `tests/vm.test.ts` and `tests/k17Machine.test.ts`.
 - Faults halt the machine and release funds; `IN` without a witness, `VERIFY` of zero and
-  `SIGVERIFY`, `ATTEST` or `ENDORSE` with a missing or wrong signature or key invalidate the
-  transaction. Do not blur that distinction.
+  `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` or `REMOVE` with a missing or wrong
+  signature or key, and a missing or wrong tree proof, invalidate the transaction. Do not blur
+  that distinction.
 - `SIGVERIFY` verifies a Rabin signature (scrypt-ts-lib `RabinVerifier`, security level 6);
   `src/k17/attest.ts` signs with the same parameters. One signature per cycle, shared by
-  `SIGVERIFY`, `ATTEST` and `ENDORSE`: a second one in a cycle invalidates the transaction.
+  `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and `REMOVE`: a second one in a cycle
+  invalidates the transaction.
 - Roster in memory (v2 machine): 8 slots of 13 cells at cells 152..255 (slot k at
   `152 + 13k`): 8 cells of SHA-256 key hash, then 5 cells of payout address hash. All-zero
   hash cells mean an empty slot. `!` into cell 152 or higher faults; only `ENDORSE` writes
@@ -31,9 +33,28 @@ publication belong in this repo.
   `"K17E" || instanceId || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout`. SIGVERIFY
   keeps `"K17A" || cell(TAG) || cell(VAL)`. Attesters read `instanceId` from the deployed
   machine before they sign.
-- `step(keeper, witness, sigS, sigPad, keyA, keyB, payout)`: `keyA` is the 384-byte key that
-  signs for `ATTEST` or sponsors for `ENDORSE`, `keyB` the new member's key, `payout` the new
-  member's 20-byte payout hash. Pass empty byte strings when unused.
+- `step` has 10 parameters:
+  `step(keeper, witness, sigS, sigPad, keyA, keyB, payout, leafPre, proof, leafIndex)`. `keyA`
+  is the 384-byte key that signs for `ATTEST` or `ATTESTM`, sponsors for `ENDORSE`, or is the
+  sponsor key for `ADMIT` and `REMOVE`; `keyB` the new member's key, `payout` the new member's
+  20-byte payout hash (`ENDORSE`, `ADMIT`). `leafPre`, `proof` and `leafIndex` are the cycle's
+  one tree proof (60-byte leaf preimage, or empty for `ADMIT`; 512 bytes of siblings, level 0
+  first; index in `[0, 65536)`). Pass empty byte strings and 0 when unused.
+- Tree roster (v3 machine): state `sponsorKeyHash` (immutable), `rosterRoot`, `rosterSeq`,
+  `logHash`. Handlers in the unrolled loop only record (`treeOp`, tag, round, flags); the proof,
+  the `ADMIT`/`REMOVE` keys and message, and the new root are checked and built once after the
+  loop, before the one Rabin verification. Rules:
+  - Programs derive `ROUND` (for `PAYLEAF` and `ADMIT`) from `TIME`, never from `IN`.
+  - One tree instruction per cycle (`MEMBER`, `ADMIT`, `REMOVE`); a second one is a fault.
+    `LASTROUND`, `ATTESTM` and `PAYLEAF` without `MEMBER` fault.
+  - Witness-caused failures (proof, index, leaf preimage, key, payout, signature, `ROUND` not
+    above `lastRound`) are `assert`s; only stack and tree-op conditions in the loop fault.
+  - Sponsor messages (`H` = `instanceId || cell(TAG) || cell(rosterSeq) || cell(leafIndex)`):
+    `ADMIT` signs `"K17D" || H || sha256(keyB) || payout`; `REMOVE` signs
+    `"K17X" || H || sha256("K17L" || leafPre)`. Each adds 1 to `rosterSeq`, so a sponsor
+    signature cannot be replayed.
+  - `PAYSLOT` and `PAYLEAF` share the one payment per cycle; the signature instructions share
+    the one signature per cycle.
 - `PAYSLOT` errors are faults, never invalid transactions: a second `PAYSLOT` in a cycle
   (checked first, whatever its operands), `N == 0`, and `N > value - 1` halt, drop the payout
   and refund the beneficiary. A later unrelated fault in the same cycle keeps the payout. The
@@ -46,7 +67,7 @@ publication belong in this repo.
   bad slot number and still collect the auction reward.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  9 KB per instruction with the current 36 handlers (360 044 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (489 181 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile

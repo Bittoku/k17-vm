@@ -2,12 +2,13 @@
 
 A proof of concept of a UTXO-chained stack computer on Bitcoin SV.
 
-One UTXO locked by `K17Machine` is one suspended process of a 36-instruction
+One UTXO locked by `K17Machine` is one suspended process of a 43-instruction
 stack machine (Koopman's Canonical Stack Machine from _Stack Computers: The
 New Wave_, 1989, plus HALT, 0=, OUT, TIME, the job-bounty extension IN,
 VERIFY, BOUNTY, \*, HASH, WHO, YIELD, the K17+ attested-input extension
-MIN, MAX, /, SIGVERIFY, and the v2 roster extension ATTEST, ENDORSE,
-PAYSLOT, VALUE). Anyone can spend the UTXO. The
+MIN, MAX, /, SIGVERIFY, the v2 roster extension ATTEST, ENDORSE,
+PAYSLOT, VALUE, and the v3 tree roster extension MEMBER, LASTROUND,
+ATTESTM, PAYLEAF, ADMIT, REMOVE, OUTH). Anyone can spend the UTXO. The
 spend is valid only if the next output carries the same program with the
 state advanced by exactly K instructions and the spender takes no more than
 the reward that the liveness Dutch auction permits at the transaction's
@@ -18,16 +19,17 @@ Design notes live in the Obsidian vault:
 
 ## Layout
 
-| Path                          | Purpose                                                                                                                           |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `src/k17/isa.ts`              | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA.                                     |
-| `src/k17/vm.ts`               | Off-chain reference VM. Executable specification; keepers use it to compute the next state.                                       |
-| `src/k17/attest.ts`           | Rabin keys, key encoding and hashing, attestation and endorsement signing.                                                        |
-| `src/k17/programs.ts`         | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job, enrol-and-attest. |
-| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement.                                                     |
-| `src/keeper.ts`               | Helpers to plan a cycle and build the spending transaction.                                                                       |
-| `tests/vm.test.ts`            | ISA and reference VM tests.                                                                                                       |
-| `tests/k17Machine.test.ts`    | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter.                                              |
+| Path                          | Purpose                                                                                                                                                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/k17/isa.ts`              | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA.                                                            |
+| `src/k17/vm.ts`               | Off-chain reference VM. Executable specification; keepers use it to compute the next state.                                                              |
+| `src/k17/attest.ts`           | Rabin keys, key encoding and hashing, attestation, endorsement, admission and removal signing.                                                           |
+| `src/k17/smt.ts`              | Sparse Merkle tree of the roster (depth 16): leaf encoding, proofs, roots.                                                                               |
+| `src/k17/programs.ts`         | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job, enrol-and-attest, tree-consortium smoke. |
+| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement.                                                                            |
+| `src/keeper.ts`               | Helpers to plan a cycle and build the spending transaction.                                                                                              |
+| `tests/vm.test.ts`            | ISA and reference VM tests.                                                                                                                              |
+| `tests/k17Machine.test.ts`    | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter.                                                                     |
 
 ## Requirements
 
@@ -146,6 +148,118 @@ The reference VM does not know the balance rules of the contract, so it
 cannot see the last `PAYSLOT` fault. `planCycle` checks it and calculates
 the smaller reward with `rewardAt`, as the contract does.
 
+## Tree roster (v3 machine)
+
+The v3 machine keeps its roster in a sparse Merkle tree, not in memory. The
+tree has depth 16, so it has 65 536 leaves. Only the root is in the machine
+state. Each cycle can carry one Merkle proof in the unlocking script.
+
+### State
+
+| Property         | Kind      | Content                                                                                                     |
+| ---------------- | --------- | ----------------------------------------------------------------------------------------------------------- |
+| `sponsorKeyHash` | immutable | SHA-256 of the sponsor's 384-byte Rabin key. The sponsor signs `ADMIT` and `REMOVE`. All zeros: no sponsor. |
+| `rosterRoot`     | mutable   | Root of the roster tree. The empty tree has root `EMPTY_HASHES[16]`.                                        |
+| `rosterSeq`      | mutable   | Number of `ADMIT` and `REMOVE` operations so far. It starts at 0.                                           |
+| `logHash`        | mutable   | Running hash of the `OUTH` cells. It starts at 32 zero bytes.                                               |
+
+### Leaf and proof format
+
+- Leaf preimage (60 bytes): `keyHash(32) || payout(20) || cell(lastRound) || cell(flags)`.
+  `keyHash` is the SHA-256 of the member's 384-byte Rabin key.
+- Leaf hash: `sha256("K17L" || leafPre)`. An empty leaf has the hash of 32
+  zero bytes.
+- Proof (512 bytes): 16 sibling hashes of 32 bytes. The level-0 sibling is
+  first.
+- Leaf index: an integer in `[0, 65536)`. Bit k of the index is 1 when the
+  node at level k is the right child. Then the parent is
+  `sha256(sibling || node)`. Else the parent is `sha256(node || sibling)`.
+- `step` takes the proof as its last three arguments: `leafPre`, `proof`
+  and `leafIndex`. For `ADMIT`, `leafPre` is empty, because the leaf must
+  be empty. When the cycle runs no tree instruction, pass `''`, `''` and 0.
+
+`src/k17/smt.ts` builds the tree, the proofs and the roots off chain.
+
+### Instructions
+
+| Instruction | Stack effect   | Function                                                                                                               |
+| ----------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- | --- | --------------------------------------------- |
+| `MEMBER`    | `-- IDX`       | Checks the proof against `rosterRoot` and binds that member for the cycle. Pushes the leaf index.                      |
+| `LASTROUND` | `-- R`         | Pushes the bound member's `lastRound`.                                                                                 |
+| `ATTESTM`   | `TAG VAL --`   | Checks a reading that the bound member signed with `keyA`.                                                             |
+| `PAYLEAF`   | `N ROUND --`   | Pays `N` sats to the bound member and sets its `lastRound` to `ROUND`. The root changes.                               |
+| `ADMIT`     | `TAG ROUND --` | The sponsor puts a new member (`keyB`, `payout`) into an empty leaf with `lastRound` = `ROUND`. Adds 1 to `rosterSeq`. |
+| `REMOVE`    | `TAG --`       | The sponsor empties an occupied leaf. Adds 1 to `rosterSeq`.                                                           |
+| `OUTH`      | `N1 --`        | Sets `logHash` to `sha256(logHash                                                                                      |     | cell(N1))`. It does not write the output log. |
+
+### Signed messages
+
+`I` is the machine's 32-byte `instanceId`. `seq` is `rosterSeq` before the
+cycle.
+
+```
+ATTESTM  "K17T" || I || cell(TAG) || cell(VAL)
+ADMIT    "K17D" || I || cell(TAG) || cell(seq) || cell(leafIndex) || sha256(keyB) || payout
+REMOVE   "K17X" || I || cell(TAG) || cell(seq) || cell(leafIndex) || sha256("K17L" || leafPre)
+```
+
+`ADMIT` and `REMOVE` messages include `rosterSeq`, and each of them adds 1
+to it. Thus a sponsor signature is valid for one operation only. If a
+member is removed, nobody can replay the old admission. The `ADMIT`
+message includes the leaf index and the new member's key and payout, so a
+relayer cannot move the member or change its key.
+
+### Fault or invalid transaction
+
+The rule of the v2 roster applies. A condition that the program causes is a
+fault. A condition that the witness (proof, keys, signature) causes makes
+the transaction invalid.
+
+| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                      | Invalid transaction                                                                                                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MEMBER`    | a second tree instruction in the cycle, full data stack (the proof is checked first)                                                                                      | no proof, `leafPre` not 60 bytes, index out of range, proof not 512 bytes, proof does not lead to `rosterRoot`                                                                                                               |
+| `LASTROUND` | no bound member, full data stack                                                                                                                                          | never                                                                                                                                                                                                                        |
+| `ATTESTM`   | underflow, no bound member                                                                                                                                                | second signature in the cycle, missing key or signature, key not 384 bytes, key hash not the leaf's, bad signature                                                                                                           |
+| `PAYLEAF`   | the payout is dropped: a second payment in the cycle (`PAYSLOT` or `PAYLEAF`, checked first), underflow, no bound member, `N` = 0, `N` larger than the balance less 1 sat | `ROUND` not above the member's `lastRound`                                                                                                                                                                                   |
+| `ADMIT`     | underflow, a second tree instruction in the cycle                                                                                                                         | second signature in the cycle, missing or wrong proof or index, `leafPre` not empty (occupied leaf), payout not 20 bytes, `keyA` or `keyB` not 384 bytes, `keyA` not the sponsor's, bad signature (also a wrong `rosterSeq`) |
+| `REMOVE`    | underflow, a second tree instruction in the cycle                                                                                                                         | second signature in the cycle, missing or wrong proof or index, `leafPre` not 60 bytes (empty leaf), `keyA` not 384 bytes, `keyA` not the sponsor's, bad signature                                                           |
+| `OUTH`      | underflow                                                                                                                                                                 | never                                                                                                                                                                                                                        |
+
+### Rules for each cycle
+
+- One tree instruction. `MEMBER`, `ADMIT` and `REMOVE` share one proof. A
+  second one in the cycle is a fault.
+- One signature. `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and
+  `REMOVE` share it. A second one makes the transaction invalid.
+- One payment. `PAYSLOT` and `PAYLEAF` share it. A second one is a fault
+  and drops the payout.
+- Get `ROUND` from `TIME`, never from `IN`. The keeper controls `IN`. The
+  contract does not let nLockTime go backwards. A member admitted in round
+  r can be paid in round r + 1 at the earliest, because `PAYLEAF` requires
+  `ROUND` above `lastRound`.
+
+`src/k17/programs.ts` has `treeConsortiumSmokeProgram`. In cycle 1 the
+sponsor admits a member. In cycle 2 the member attests a reading, the
+reading goes into `logHash`, and the member gets a bounty.
+
+### Cost
+
+The contract checks the proof once per cycle, after the instruction loop.
+The check walks the proof from the old leaf to `rosterRoot`: 16 SHA-256
+operations. `PAYLEAF`, `ADMIT` and `REMOVE` change the leaf, so the
+contract walks the same proof again from the new leaf to get the new root.
+Thus a cycle with `PAYLEAF`, `ADMIT` or `REMOVE` costs 32 SHA-256
+operations, and a cycle with only `MEMBER` costs 16.
+
+Each `PAYLEAF` changes the root. Thus readings on one machine are
+sequential: one reading per cycle. A cycle that keeps the machine alive is
+about twice the locking script (see the measurements below). A round of
+1 000 members is 1 000 chained cycle transactions, with their fees. The
+design is correct at that size, but the cost is too high until the
+interpreter gets smaller or one cycle can carry more than one reading. v1
+is for hundreds of members, one reading per member per round, and rounds of
+a day or more.
+
 ## Measurements (K = instructions per cycle)
 
 | K   | Handlers | Locking script | Cycle transaction |
@@ -154,16 +268,17 @@ the smaller reward with `rewardAt`, as the contract does.
 | 4   | 21       | 16 247 bytes   | 16 802 bytes      |
 | 40  | 28       | 159 003 bytes  | about 160 KB      |
 | 40  | 32       | 202 468 bytes  | about 204 KB      |
-| 40  | 36       | 360 044 bytes  | about 361 KB      |
+| 40  | 43       | 489 181 bytes  | about 490 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
-roster in memory) of script per unrolled instruction, plus a fixed part
+roster in memory) to about 12 KB (43 handlers, with the tree roster) of
+script per unrolled instruction, plus a fixed part
 (preimage verification, state tail with the memory image, output
 construction). The cycle transaction column is the final (halting) cycle.
 A cycle that continues also carries the next state output, so it is about
 twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
-720 691 bytes at K=40. Set `K17_SIZES=1` to print these sizes during
+978 904 bytes at K=40 (43 handlers). Set `K17_SIZES=1` to print these sizes during
 `npm test`. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.
