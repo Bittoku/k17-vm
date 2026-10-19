@@ -8,6 +8,7 @@
  * differential test: reference VM == on-chain interpreter for that step.
  */
 import { expect, use } from 'chai'
+import { createHash } from 'crypto'
 import chaiAsPromised from 'chai-as-promised'
 import { bsv, int2ByteString, toByteString } from 'scrypt-ts'
 import { RabinSig } from 'scrypt-ts-lib'
@@ -50,7 +51,9 @@ import {
     CyclePlan,
     CycleKeys,
     CycleOverrides,
+    CycleTree,
 } from '../src/keeper'
+import { EMPTY_HASHES, SparseMerkleTree, encodeLeafPre } from '../src/k17/smt'
 import {
     NO_SIG,
     newAttester,
@@ -60,6 +63,7 @@ import {
     payoutOf,
     pubKeyBytes,
     signEndorsement,
+    signMemberReading,
 } from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
 use(chaiAsPromised)
@@ -122,8 +126,10 @@ interface CycleResult {
 /**
  * Perform one cycle at `lockTime` with `keeper`, verify the script with the
  * interpreter, and return the next instance (undefined once halted).
- * `witness`, `sig` and `keys` are forwarded to planCycle; the plan's key and
- * payout byte strings (empty unless `keys` sets them) go to `step`.
+ * `witness`, `sig`, `keys` and `tree` are forwarded to planCycle; the plan's
+ * key and payout byte strings (empty unless `keys` sets them) and its tree
+ * proof (leafPre '', proof '', leafIndex 0 unless `tree` sets them) go to
+ * `step`.
  */
 async function cycle(
     m: K17Machine,
@@ -138,9 +144,10 @@ async function cycle(
     } = {},
     witness: bigint[] = [],
     sig: RabinSig = NO_SIG,
-    keys: CycleKeys = {}
+    keys: CycleKeys = {},
+    tree?: CycleTree
 ): Promise<CycleResult> {
-    const plan = planCycle(m, value, lockTime, keeper, witness, sig, keys)
+    const plan = planCycle(m, value, lockTime, keeper, witness, sig, keys, tree)
     const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
     const sent = overrides.sigArg ?? plan.sig
     const { tx, atInputIndex } = await m.methods.step(
@@ -151,6 +158,9 @@ async function cycle(
         toByteString(plan.keyAHex),
         toByteString(plan.keyBHex),
         toByteString(plan.payoutHex),
+        toByteString(plan.leafPre),
+        toByteString(plan.proof),
+        plan.leafIndex,
         opts
     )
     const verdict = tx.verifyInputScript(atInputIndex)
@@ -1033,6 +1043,9 @@ describe('K17Machine on-chain', function () {
             toByteString(keyAHex),
             toByteString(plan.keyBHex),
             toByteString(plan.payoutHex),
+            toByteString(plan.leafPre),
+            toByteString(plan.proof),
+            plan.leafIndex,
             opts
         )
     }
@@ -1360,12 +1373,16 @@ describe('K17Machine on-chain', function () {
             ECON.rewardMax,
             rosterOf(),
             toByteString('ab'.repeat(31)),
+            toByteString(s0.sponsorKeyHash),
             s0.pc,
             toByteString(s0.ds),
             toByteString(s0.rs),
             toByteString(s0.mem),
             toByteString(s0.out),
-            T0
+            T0,
+            toByteString(s0.rosterRoot),
+            s0.rosterSeq,
+            toByteString(s0.logHash)
         )
         await m.connect(getDefaultSigner())
         await m.deploy(FUNDING)
@@ -1526,5 +1543,339 @@ describe('K17Machine on-chain', function () {
         tamperPush(r.tx, 0, int2ByteString(sigs.b.s), int2ByteString(sigs.a.s))
         tamperPush(r.tx, 0, sigs.b.padding, sigs.a.padding)
         expectScriptRefused(r.tx)
+    })
+    // ------------------------------------------------------------------
+    // v3 machine: the Merkle roster tree
+    // ------------------------------------------------------------------
+
+    /** SHA-256 of a hex string, as hex. Input: hex. Output: 64 hex chars. */
+    const sha256Hex = (hex: string): string =>
+        createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex')
+
+    const [, , , memberAAddress] = randomPrivateKey()
+    const [, , , memberBAddress] = randomPrivateKey()
+    /** Leaf positions of the two tree members: level-0 siblings (left, right). */
+    const INDEX_A = 300
+    const INDEX_B = 301
+    /** Tag of the members' readings and the sats PAYLEAF pays each cycle. */
+    const TAG_M = 99
+    const PAY_M = 3000
+
+    /**
+     * Leaf preimage of member A (attesterA's key) or B (attesterB's key).
+     * Input: which member, its lastRound. Output: 120 hex chars.
+     */
+    const leafOf = (member: 'A' | 'B', lastRound: bigint): string =>
+        member === 'A'
+            ? encodeLeafPre(
+                  keyHash(attesterA.pub),
+                  payoutOf(memberAAddress),
+                  lastRound
+              )
+            : encodeLeafPre(
+                  keyHash(attesterB.pub),
+                  payoutOf(memberBAddress),
+                  lastRound
+              )
+
+    /**
+     * Off-chain tree with members A and B, both at lastRound 0.
+     * Input: none. Output: a fresh SparseMerkleTree.
+     */
+    const twoMemberTree = (): SparseMerkleTree =>
+        new SparseMerkleTree(
+            new Map([
+                [INDEX_A, leafOf('A', 0n)],
+                [INDEX_B, leafOf('B', 0n)],
+            ])
+        )
+
+    /**
+     * Program: bind the member, log its lastRound, check its signed reading
+     * (TAG_M, witness) with ATTESTM, fold the reading into logHash, pay it
+     * PAY_M with ROUND = TIME, yield, then loop back to the start.
+     */
+    const MEMBER_PROG = assemble([
+        'MEMBER',
+        'DROP',
+        'LASTROUND',
+        'OUT',
+        'LIT',
+        TAG_M,
+        'IN',
+        'DUP',
+        '>R',
+        'ATTESTM',
+        'R>',
+        'OUTH',
+        'LIT',
+        PAY_M,
+        'TIME',
+        'PAYLEAF',
+        'YIELD',
+        'LIT',
+        0,
+        'IF',
+        0,
+    ])
+
+    /**
+     * Deploy `prog` with the roster tree root of `tree` and the sponsor's
+     * key hash. Input: program hex, off-chain tree. Output: live instance.
+     */
+    async function deployTree(
+        prog: string,
+        tree: SparseMerkleTree
+    ): Promise<K17Machine> {
+        const m = newMachine(prog, ECON, T0, undefined, undefined, TEST_ID, {
+            rosterRoot: tree.root(),
+            sponsorKeyHash: keyHash(sponsor.pub),
+        })
+        await m.connect(getDefaultSigner())
+        await m.deploy(FUNDING)
+        return m
+    }
+
+    /**
+     * Run one MEMBER_PROG cycle for member A or B with the member's signed
+     * `reading` and its proof from `tree` (or `proofOverride`).
+     * Input: machine, value, lock time, member, tree, reading, optional
+     * proof to present instead. Output: the cycle result.
+     */
+    function memberCycle(
+        m: K17Machine,
+        value: bigint,
+        lockTime: bigint,
+        member: 'A' | 'B',
+        tree: SparseMerkleTree,
+        reading: bigint,
+        proofOverride?: CycleTree
+    ): Promise<CycleResult> {
+        const attester = member === 'A' ? attesterA : attesterB
+        return cycle(
+            m,
+            value,
+            lockTime,
+            keeperA,
+            {},
+            [reading],
+            signMemberReading(attester, m.instanceId, BigInt(TAG_M), reading),
+            { attestKey: attester.pub },
+            proofOverride ?? tree.proof(member === 'A' ? INDEX_A : INDEX_B)
+        )
+    }
+
+    it('the contract embeds the empty-subtree hashes of the off-chain tree', () => {
+        expect(K17Machine.EMPTY_HASHES).to.deep.equal(EMPTY_HASHES)
+        const m = newMachine(MEMBER_PROG, ECON, T0)
+        expect(m.rosterRoot).to.equal(EMPTY_HASHES[16])
+        expect(m.rosterSeq).to.equal(0n)
+        expect(m.logHash).to.equal('00'.repeat(32))
+        expect(m.sponsorKeyHash).to.equal('00'.repeat(32))
+    })
+
+    it('tree member cycle: the member is paid, rosterRoot follows the off-chain tree, logHash chains', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(MEMBER_PROG, tree)
+        expect(m.rosterRoot).to.equal(tree.root())
+        expect(m.sponsorKeyHash).to.equal(keyHash(sponsor.pub))
+
+        // cycle 1: member A (left child at level 0) attests 2231 and is paid
+        const tA = T0 + 1n
+        const r1 = await memberCycle(m, BigInt(FUNDING), tA, 'A', tree, 2231n)
+        expect(r1.plan.halted).to.be.false
+        expect(r1.plan.payslot).to.deep.equal({
+            slot: -1,
+            payoutHex: payoutOf(memberAAddress),
+            sats: BigInt(PAY_M),
+        })
+        expect(addressOf(r1.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(addressOf(r1.tx.outputs[2])).to.equal(memberAAddress.toString())
+        expect(r1.tx.outputs[2].satoshis).to.equal(PAY_M)
+        expect(BigInt(r1.tx.outputs[0].satoshis)).to.equal(
+            BigInt(FUNDING) - r1.plan.reward - BigInt(PAY_M)
+        )
+        tree.set(INDEX_A, leafOf('A', tA))
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(0n)
+        const log1 = sha256Hex('00'.repeat(32) + encodeCell(2231n))
+        expect(n1.logHash).to.equal(log1)
+        expect(outputLog(r1.plan.nextState)).to.deep.equal([0n])
+
+        // cycle 2: member B (right child) attests 4242 with a fresh proof
+        const tB = T0 + 2n
+        const r2 = await memberCycle(
+            n1,
+            r1.plan.remaining,
+            tB,
+            'B',
+            tree,
+            4242n
+        )
+        expect(addressOf(r2.tx.outputs[2])).to.equal(memberBAddress.toString())
+        tree.set(INDEX_B, leafOf('B', tB))
+        const n2 = r2.next as K17Machine
+        expect(n2.rosterRoot).to.equal(tree.root())
+        expect(n2.logHash).to.equal(sha256Hex(log1 + encodeCell(4242n)))
+
+        // cycle 3: member A again in a later round; LASTROUND reads tA
+        const r3 = await memberCycle(
+            n2,
+            r2.plan.remaining,
+            T0 + 3n,
+            'A',
+            tree,
+            7n
+        )
+        expect(outputLog(r3.plan.nextState)).to.deep.equal([0n, 0n, tA])
+        tree.set(INDEX_A, leafOf('A', T0 + 3n))
+        expect((r3.next as K17Machine).rosterRoot).to.equal(tree.root())
+    })
+
+    it('a stale proof against the root before another member was paid is refused (Review Focus 1)', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(MEMBER_PROG, tree)
+        const staleB = tree.proof(INDEX_B)
+        const r1 = await memberCycle(m, BigInt(FUNDING), T0 + 1n, 'A', tree, 1n)
+        tree.set(INDEX_A, leafOf('A', T0 + 1n))
+        const n1 = r1.next as K17Machine
+        const freshB = tree.proof(INDEX_B)
+        expect(staleB.proof).to.not.equal(freshB.proof)
+
+        // the keeper's planner refuses it (the VM says verify_failed) ...
+        await expect(
+            memberCycle(n1, r1.plan.remaining, T0 + 2n, 'B', tree, 2n, staleB)
+        ).to.be.rejectedWith(/rejected/)
+        // ... and so does the script interpreter: an honest cycle with the
+        // fresh proof verifies, the same transaction with the stale proof
+        // does not.
+        const honest = await memberCycle(
+            n1,
+            r1.plan.remaining,
+            T0 + 2n,
+            'B',
+            tree,
+            2n
+        )
+        expect(honest.tx.verifyInputScript(0).success).to.equal(true)
+        tamperPush(honest.tx, 0, freshB.proof, staleB.proof)
+        expectScriptRefused(honest.tx)
+    })
+
+    it('the same member cannot be paid twice in one round (Review Focus 3)', async () => {
+        // ROUND from the witness only to build the attack; real programs
+        // derive ROUND from TIME.
+        const prog = assemble([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            PAY_M,
+            'IN',
+            'PAYLEAF',
+            'YIELD',
+            'LIT',
+            0,
+            'IF',
+            0,
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree)
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [5n],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        tree.set(INDEX_A, leafOf('A', 5n))
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        const again = (round: bigint) =>
+            cycle(
+                n1,
+                r1.plan.remaining,
+                T0 + 2n,
+                keeperA,
+                {},
+                [round],
+                NO_SIG,
+                {},
+                tree.proof(INDEX_A)
+            )
+        // round 5 again (and an older round) is refused by the planner
+        await expect(again(5n)).to.be.rejectedWith(/rejected/)
+        await expect(again(4n)).to.be.rejectedWith(/rejected/)
+        // and by the interpreter when the witness of an honest round-6
+        // cycle is swapped for round 5
+        const honest = await again(6n)
+        tamperPush(honest.tx, 0, encodeCell(6n), encodeCell(5n))
+        expectScriptRefused(honest.tx)
+    })
+
+    it('interpreter refuses a flipped proof byte, a wrong leafIndex and an index past the tree', async () => {
+        const honest = async () => {
+            const tree = twoMemberTree()
+            const m = await deployTree(MEMBER_PROG, tree)
+            const r = await memberCycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                'A',
+                tree,
+                3n
+            )
+            expect(r.tx.verifyInputScript(0).success).to.equal(true)
+            return { r, proof: tree.proof(INDEX_A).proof }
+        }
+        /** Minimal script-number push of a leaf index, as hex. */
+        const indexPush = (index: number): string =>
+            int2ByteString(BigInt(index))
+
+        const flipped = await honest()
+        const badProof =
+            flipped.proof.slice(0, 64) +
+            (parseInt(flipped.proof.slice(64, 66), 16) ^ 1)
+                .toString(16)
+                .padStart(2, '0') +
+            flipped.proof.slice(66)
+        tamperPush(flipped.r.tx, 0, flipped.proof, badProof)
+        expectScriptRefused(flipped.r.tx)
+
+        const wrongIndex = await honest()
+        tamperPush(wrongIndex.r.tx, 0, indexPush(INDEX_A), indexPush(INDEX_B))
+        expectScriptRefused(wrongIndex.r.tx)
+
+        // INDEX_A + 2^16 has the same low 16 bits, so the proof walk alone
+        // would accept it; the range check must refuse it.
+        const pastTree = await honest()
+        tamperPush(
+            pastTree.r.tx,
+            0,
+            indexPush(INDEX_A),
+            indexPush(INDEX_A + 65536)
+        )
+        expectScriptRefused(pastTree.r.tx)
+    })
+
+    it('OUTH chains logHash with the root unchanged; LASTROUND without MEMBER faults and refunds', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(
+            assemble(['LIT', 7, 'OUTH', 'YIELD', 'LASTROUND', 'HALT']),
+            tree
+        )
+        const r1 = await cycle(m, BigInt(FUNDING), T0 + 1n, keeperA)
+        const n1 = r1.next as K17Machine
+        expect(n1.logHash).to.equal(sha256Hex('00'.repeat(32) + encodeCell(7n)))
+        expect(n1.rosterRoot).to.equal(tree.root())
+        const r2 = await cycle(n1, r1.plan.remaining, T0 + 2n, keeperA)
+        expect(r2.plan.halted).to.be.true
+        expect(addressOf(r2.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
     })
 })

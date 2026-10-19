@@ -7,7 +7,12 @@
  *   2. runs the reference VM for K instructions,
  *   3. works out the reward the Dutch auction allows at the chosen nLockTime,
  *   4. builds the spending transaction: state (or beneficiary payout), reward
- *      to itself, the PAYSLOT payout (if the cycle made one), change.
+ *      to itself, the PAYSLOT or PAYLEAF payout (if the cycle made one),
+ *      change.
+ *
+ * A cycle that runs a roster-tree instruction (MEMBER) also supplies the
+ * one Merkle proof of the cycle (`tree` argument of planCycle), which the
+ * plan forwards to `step` as leafPre, proof and leafIndex.
  *
  * The functions here are pure plumbing; the economics live in the contract.
  */
@@ -27,13 +32,13 @@ import {
     K17State,
     PaySlot,
     StepEnv,
+    TreeOp,
     initialState,
     stepK,
     whoOf,
 } from './k17/vm'
 import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
 import { NO_SIG, pubKeyBytes } from './k17/attest'
-import { EMPTY_HASHES } from './k17/smt'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -74,8 +79,11 @@ export function randomInstanceId(): string {
  * fixed SIGVERIFY roster, optional initial memory image (MEM_CELLS cells as
  * hex, e.g. with memory roster slot 0 pre-filled; see `withSlot`), optional
  * 32-byte instance id as 64 lowercase hex chars (default: randomInstanceId;
- * pass a fixed id for deterministic tests). Throws unless the id is exactly
- * 64 lowercase hex chars.
+ * pass a fixed id for deterministic tests), optional roster-tree settings:
+ * `rosterRoot` (the starting tree root, default EMPTY_HASHES[16], the empty
+ * tree) and `sponsorKeyHash` (sha256 of the sponsor's Rabin key, default 32
+ * zero bytes = no sponsor), each 64 lowercase hex chars. Throws unless the
+ * id is exactly 64 lowercase hex chars, or on a malformed tree setting.
  * ATTEST and ENDORSE signatures bind the instance id, and it is random, so
  * attesters must read `instanceId` from the deployed machine (the contract
  * instance or its locking script) before they sign anything for it.
@@ -88,11 +96,13 @@ export function newMachine(
     deployTime: bigint,
     roster: Roster = rosterOf(),
     initialMemHex?: string,
-    instanceIdHex?: string
+    instanceIdHex?: string,
+    tree: { rosterRoot?: string; sponsorKeyHash?: string } = {}
 ): K17Machine {
     const s = initialState(
         progHex,
-        initialMemHex === undefined ? undefined : initialMemHex.toLowerCase()
+        initialMemHex === undefined ? undefined : initialMemHex.toLowerCase(),
+        tree
     )
     const instanceId = instanceIdHex ?? randomInstanceId()
     if (!/^[0-9a-f]{64}$/.test(instanceId)) {
@@ -106,16 +116,24 @@ export function newMachine(
         econ.rewardMax,
         roster,
         toByteString(instanceId),
+        toByteString(s.sponsorKeyHash),
         s.pc,
         toByteString(s.ds),
         toByteString(s.rs),
         toByteString(s.mem),
         toByteString(s.out),
-        deployTime
+        deployTime,
+        toByteString(s.rosterRoot),
+        s.rosterSeq,
+        toByteString(s.logHash)
     )
 }
 
-/** Read the machine state out of a contract instance. */
+/**
+ * Read the machine state out of a contract instance.
+ * Input: contract instance. Output: the VM state, including the roster
+ * tree state (rosterRoot, rosterSeq, logHash, sponsorKeyHash).
+ */
 export function stateOf(m: K17Machine): K17State {
     return {
         prog: m.prog,
@@ -125,11 +143,10 @@ export function stateOf(m: K17Machine): K17State {
         mem: m.mem,
         out: m.outLog,
         halted: false,
-        // The v2 contract has no tree state yet; use the v3 defaults.
-        rosterRoot: EMPTY_HASHES[16],
-        rosterSeq: 0n,
-        logHash: '00'.repeat(32),
-        sponsorKeyHash: '00'.repeat(32),
+        rosterRoot: m.rosterRoot,
+        rosterSeq: m.rosterSeq,
+        logHash: m.logHash,
+        sponsorKeyHash: m.sponsorKeyHash,
     }
 }
 
@@ -181,6 +198,18 @@ export interface CycleKeys {
     payoutHex?: string
 }
 
+/**
+ * The cycle's one roster-tree proof (see `src/k17/smt.ts`): leaf preimage
+ * hex ('' for an empty leaf), 16-sibling proof hex (1024 chars, level 0
+ * first) and the leaf index in [0, 65536). Usually `tree.proof(index)` of
+ * the off-chain SparseMerkleTree that matches the machine's rosterRoot.
+ */
+export interface CycleTree {
+    leafPre: string
+    proof: string
+    leafIndex: bigint
+}
+
 /** What one cycle will produce, computed off-chain before broadcasting. */
 export interface CyclePlan {
     halted: boolean
@@ -198,9 +227,19 @@ export interface CyclePlan {
     keyBHex: string
     /** `payout` argument of `step`: the ENDORSE payout or '' (hex). */
     payoutHex: string
+    /** `leafPre` argument of `step`: the tree leaf preimage or '' (hex). */
+    leafPre: string
+    /** `proof` argument of `step`: the 16-sibling tree proof or '' (hex). */
+    proof: string
+    /** `leafIndex` argument of `step` (a bigint, not a cell); 0 when unused. */
+    leafIndex: bigint
+    /** The tree operation the cycle ran ('none' when no tree instruction). */
+    treeOp: TreeOp
     /**
-     * The PAYSLOT payout this cycle; undefined when none. Its output follows
-     * the keeper reward output when one exists (output 1 when the reward is 0).
+     * The PAYSLOT or PAYLEAF payout this cycle; undefined when none
+     * (`slot` is -1 for a PAYLEAF payout and is not used for the output).
+     * Its output follows the keeper reward output when one exists (output
+     * 1 when the reward is 0).
      */
     payslot?: PaySlot
     /** Next contract instance (undefined when halted). */
@@ -218,11 +257,15 @@ export interface CyclePlan {
  * remaining value.
  * Input: current instance, its UTXO value (also what VALUE pushes), nLockTime
  * to use, keeper address, witness cells, optional signature, optional keys
- * and payout for ATTEST/ENDORSE. Output: the CyclePlan. Throws when the cycle
- * cannot form a valid transaction (missing or rejected witness, signature or
- * key). A PAYSLOT payout has priority over the keeper reward, which shrinks
- * (down to 0) so the payout is paid in full; only N > value - 1 is a fault,
- * as on chain: the plan is halted and carries no payslot.
+ * and payout for ATTEST/ATTESTM/ENDORSE, optional roster-tree proof for
+ * MEMBER. The VM starts from the instance's rosterRoot, rosterSeq, logHash
+ * and sponsorKeyHash. Output: the CyclePlan; `next` carries the predicted
+ * rosterRoot, rosterSeq and logHash. Throws when the cycle cannot form a
+ * valid transaction (missing or rejected witness, signature, key or tree
+ * proof). A PAYSLOT or PAYLEAF payout has priority over the keeper reward,
+ * which shrinks (down to 0) so the payout is paid in full; only
+ * N > value - 1 is a fault, as on chain: the plan is halted and carries no
+ * payslot.
  */
 export function planCycle(
     m: K17Machine,
@@ -231,7 +274,8 @@ export function planCycle(
     keeper?: bsv.Address,
     witness: bigint[] = [],
     sig: RabinSig = NO_SIG,
-    keys: CycleKeys = {}
+    keys: CycleKeys = {},
+    tree?: CycleTree
 ): CyclePlan {
     const cur = stateOf(m)
     assertWellFormed(cur)
@@ -246,6 +290,7 @@ export function planCycle(
         payout: keys.payoutHex,
         value,
         instanceId: m.instanceId,
+        tree,
     }
     // The contract faults a machine whose instanceId is not 32 bytes before
     // its first instruction; mirror that here.
@@ -257,13 +302,14 @@ export function planCycle(
               witnessUsed: 0,
               bountyDue: 0n,
               payslot: undefined,
+              treeOp: 'none' as TreeOp,
           }
     if (outcome.status === 'need_witness') {
         throw new Error('cycle needs a witness cell the solver did not supply')
     }
     if (outcome.status === 'verify_failed') {
         throw new Error(
-            'witness rejected by VERIFY, SIGVERIFY, ATTEST or ENDORSE'
+            'witness rejected by VERIFY, SIGVERIFY, ATTEST, ENDORSE or a tree instruction'
         )
     }
     let nextState = outcome.state
@@ -297,6 +343,10 @@ export function planCycle(
         keyBHex:
             keys.endorseKey === undefined ? '' : pubKeyBytes(keys.endorseKey),
         payoutHex: keys.payoutHex ?? '',
+        leafPre: tree?.leafPre ?? '',
+        proof: tree?.proof ?? '',
+        leafIndex: tree?.leafIndex ?? 0n,
+        treeOp: outcome.treeOp,
         payslot,
     }
     if (nextState.halted) {
@@ -309,6 +359,9 @@ export function planCycle(
     next.mem = toByteString(nextState.mem)
     next.outLog = toByteString(nextState.out)
     next.lastTime = lockTime
+    next.rosterRoot = toByteString(nextState.rosterRoot)
+    next.rosterSeq = nextState.rosterSeq
+    next.logHash = toByteString(nextState.logHash)
     return { halted: false, next, ...common }
 }
 
@@ -329,7 +382,7 @@ export interface CycleOverrides {
  * outputs out exactly as the contract expects:
  *   output 0: next state, or P2PKH to the beneficiary when halted
  *   output 1: reward to the keeper (omitted when the reward is 0)
- *   next:     PAYSLOT payout to the slot's address (omitted when none);
+ *   next:     PAYSLOT/PAYLEAF payout to its address (omitted when none);
  *             output 2, or output 1 when the reward is 0
  *   then:     change
  * Input: instance, plan, keeper address, overrides. Output: MethodCallOptions

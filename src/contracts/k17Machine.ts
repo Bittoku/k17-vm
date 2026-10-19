@@ -51,6 +51,23 @@
  * wait longer before the transaction becomes mineable. Cheap keepers step
  * early for little; expensive keepers only win when the cheap ones are gone.
  *
+ * v3 machine (Merkle roster): the roster also lives in a depth-16 sparse
+ * Merkle tree whose root is the mutable `rosterRoot` (see `src/k17/smt.ts`
+ * for the leaf and proof format). Each cycle carries at most one tree proof
+ * in the unlocking script (`leafPre`, `proof`, `leafIndex`). MEMBER binds the
+ * proven leaf and pushes its index; LASTROUND pushes the bound member's
+ * lastRound; ATTESTM checks a reading signed by the bound member's key
+ * ("K17T" || instanceId || cell(TAG) || cell(VAL)); PAYLEAF pays the bound
+ * member through the PAYSLOT accounting and advances its lastRound, which
+ * changes the leaf and so the root; OUTH folds a cell into the running
+ * `logHash`. Handlers inside the unrolled loop only record what they need
+ * (`treeOp`, the member's lastRound, whether ATTESTM ran and whether the
+ * leaf changed). After the loop, next to the Rabin check, the proof is
+ * checked once against the old root, the ATTESTM key is checked against the
+ * leaf's key hash and, when the leaf changed, the new leaf hash is walked up
+ * the same proof to give the new root. A missing or wrong proof, preimage or index invalidates the
+ * transaction; a tree instruction the program misuses is a fault.
+ *
  * Semantics are defined by `src/k17/isa.ts` and the reference VM in
  * `src/k17/vm.ts`; this file must agree with them exactly.
  *
@@ -124,6 +141,83 @@ export class K17Machine extends SmartContract {
     static readonly EMPTY_HASH: ByteString = toByteString(
         '0000000000000000000000000000000000000000000000000000000000000000'
     )
+    /** Levels of the roster Merkle tree (compile-time constant, smt TREE_DEPTH). */
+    static readonly TREE_DEPTH = 16
+    /** Bytes of a tree proof: TREE_DEPTH sibling hashes of 32 bytes. */
+    @prop()
+    static readonly PROOF_BYTES: bigint = 512n
+    /** Number of leaves of the roster tree, 2^TREE_DEPTH. */
+    @prop()
+    static readonly TREE_LEAVES: bigint = 65536n
+    /** Bytes of a leaf preimage: keyHash(32) || payout(20) || cell(lastRound) || cell(flags). */
+    @prop()
+    static readonly LEAF_PRE_BYTES: bigint = 60n
+    /** Domain prefix of a leaf hash, ASCII "K17L" (smt LEAF_DOMAIN). */
+    @prop()
+    static readonly LEAF_DOMAIN: ByteString = toByteString('4b31374c')
+    /** Domain prefix of an ATTESTM message, ASCII "K17T" (attest MEMBER_DOMAIN). */
+    @prop()
+    static readonly MEMBER_DOMAIN: ByteString = toByteString('4b313754')
+    /**
+     * Root of an all-empty subtree at each height 0..TREE_DEPTH (smt
+     * EMPTY_HASHES): entry 0 is the empty leaf hash (32 zero bytes), entry
+     * k+1 is sha256(entry k || entry k), entry 16 is the root of the empty
+     * tree. Embedded, never recomputed on chain.
+     */
+    @prop()
+    static readonly EMPTY_HASHES: FixedArray<ByteString, 17> = [
+        toByteString(
+            '0000000000000000000000000000000000000000000000000000000000000000'
+        ),
+        toByteString(
+            'f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b'
+        ),
+        toByteString(
+            'db56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71'
+        ),
+        toByteString(
+            'c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c'
+        ),
+        toByteString(
+            '536d98837f2dd165a55d5eeae91485954472d56f246df256bf3cae19352a123c'
+        ),
+        toByteString(
+            '9efde052aa15429fae05bad4d0b1d7c64da64d03d7a1854a588c2cb8430c0d30'
+        ),
+        toByteString(
+            'd88ddfeed400a8755596b21942c1497e114c302e6118290f91e6772976041fa1'
+        ),
+        toByteString(
+            '87eb0ddba57e35f6d286673802a4af5975e22506c7cf4c64bb6be5ee11527f2c'
+        ),
+        toByteString(
+            '26846476fd5fc54a5d43385167c95144f2643f533cc85bb9d16b782f8d7db193'
+        ),
+        toByteString(
+            '506d86582d252405b840018792cad2bf1259f1ef5aa5f887e13cb2f0094f51e1'
+        ),
+        toByteString(
+            'ffff0ad7e659772f9534c195c815efc4014ef1e1daed4404c06385d11192e92b'
+        ),
+        toByteString(
+            '6cf04127db05441cd833107a52be852868890e4317e6a02ab47683aa75964220'
+        ),
+        toByteString(
+            'b7d05f875f140027ef5118a2247bbb84ce8f2f0f1123623085daf7960c329f5f'
+        ),
+        toByteString(
+            'df6af5f5bbdb6be9ef8aa618e4bf8073960867171e29676f8b284dea6a08a85e'
+        ),
+        toByteString(
+            'b58d900f5e182e3c50ef74969ea16c7726c549757cc23523c369587da7293784'
+        ),
+        toByteString(
+            'd49a7502ffcfb0340b1d7885688500ca308161a7f96b62df9d083b71fcc8f2bb'
+        ),
+        toByteString(
+            '8fe6b1689256c0d385f42f5bbe2027a22c1996e110ba97c171d3e5948de92beb'
+        ),
+    ]
 
     // ---- immutable program and economics -------------------------------
 
@@ -158,6 +252,13 @@ export class K17Machine extends SmartContract {
      */
     @prop()
     readonly instanceId: ByteString
+    /**
+     * sha256 of the sponsor's Rabin key (32 bytes), the key that signs
+     * ADMIT and REMOVE (Task 7). All zero means the machine has no sponsor.
+     * Fixed at deployment.
+     */
+    @prop()
+    readonly sponsorKeyHash: ByteString
 
     // ---- mutable machine state ----------------------------------------
 
@@ -179,6 +280,22 @@ export class K17Machine extends SmartContract {
     /** nLockTime of the transaction that produced this state. */
     @prop(true)
     lastTime: bigint
+    /**
+     * Root of the roster Merkle tree (32 bytes). Every MEMBER proof is
+     * checked against it; PAYLEAF (and ADMIT/REMOVE) replace it with the
+     * root after their leaf change. The empty tree's root is EMPTY_HASHES[16].
+     */
+    @prop(true)
+    rosterRoot: ByteString
+    /** Count of roster mutations (ADMIT and REMOVE, Task 7) so far. */
+    @prop(true)
+    rosterSeq: bigint
+    /**
+     * Running hash of the cells OUTH emitted (32 bytes, starts all zero):
+     * logHash := sha256(logHash || cell(N1)) per OUTH.
+     */
+    @prop(true)
+    logHash: ByteString
 
     constructor(
         prog: ByteString,
@@ -188,12 +305,16 @@ export class K17Machine extends SmartContract {
         rewardMax: bigint,
         roster: FixedArray<RabinPubKey, typeof FIXED_ROSTER_SLOTS>,
         instanceId: ByteString,
+        sponsorKeyHash: ByteString,
         pc: bigint,
         ds: ByteString,
         rs: ByteString,
         mem: ByteString,
         outLog: ByteString,
-        lastTime: bigint
+        lastTime: bigint,
+        rosterRoot: ByteString,
+        rosterSeq: bigint,
+        logHash: ByteString
     ) {
         super(...arguments)
         this.prog = prog
@@ -203,12 +324,16 @@ export class K17Machine extends SmartContract {
         this.rewardMax = rewardMax
         this.roster = roster
         this.instanceId = instanceId
+        this.sponsorKeyHash = sponsorKeyHash
         this.pc = pc
         this.ds = ds
         this.rs = rs
         this.mem = mem
         this.outLog = outLog
         this.lastTime = lastTime
+        this.rosterRoot = rosterRoot
+        this.rosterSeq = rosterSeq
+        this.logHash = logHash
     }
 
     // ---- cell helpers --------------------------------------------------
@@ -235,6 +360,37 @@ export class K17Machine extends SmartContract {
             r += K17Machine.MOD
         }
         return r
+    }
+
+    /**
+     * Fold a leaf hash up the roster tree along a proof (smt foldRoot).
+     * At level k the sibling is bytes [32k, 32k + 32) of `proof`; bit k of
+     * `leafIndex` set means the current node is the right child, so the
+     * parent is sha256(sibling || node), else sha256(node || sibling).
+     * Input: 32-byte leaf hash, 512-byte proof (level 0 first), leaf index
+     * in [0, 2^TREE_DEPTH). The caller checks both ranges.
+     * Output: the 32-byte root the proof leads to.
+     */
+    @method()
+    static treeRoot(
+        leafHash: ByteString,
+        proof: ByteString,
+        leafIndex: bigint
+    ): ByteString {
+        let node = leafHash
+        let indexBits = leafIndex
+        let siblingOffset = 0n
+        for (let level = 0; level < K17Machine.TREE_DEPTH; level++) {
+            const sibling = slice(proof, siblingOffset, siblingOffset + 32n)
+            if (indexBits % 2n == 1n) {
+                node = sha256(sibling + node)
+            } else {
+                node = sha256(node + sibling)
+            }
+            indexBits = indexBits / 2n
+            siblingOffset += 32n
+        }
+        return node
     }
 
     /**
@@ -267,6 +423,14 @@ export class K17Machine extends SmartContract {
      *        empty when unused
      * @param payout new member's 20-byte payout address hash for ENDORSE;
      *        empty when unused
+     * @param leafPre the cycle's one roster-tree leaf preimage (60 bytes for
+     *        MEMBER: keyHash || payout || cell(lastRound) || cell(flags));
+     *        empty when no tree instruction runs
+     * @param proof the 16 sibling hashes of that leaf, level 0 first
+     *        (512 bytes); empty when no tree instruction runs
+     * @param leafIndex the leaf's position in [0, 65536); 0 when unused.
+     *        The three tree arguments are only checked when the cycle ran a
+     *        tree instruction (treeOp != 0).
      */
     @method()
     public step(
@@ -276,8 +440,28 @@ export class K17Machine extends SmartContract {
         sigPad: ByteString,
         keyA: ByteString,
         keyB: ByteString,
-        payout: ByteString
+        payout: ByteString,
+        leafPre: ByteString,
+        proof: ByteString,
+        leafIndex: bigint
     ) {
+        // Tree-instruction bookkeeping is declared first so it sits deep on
+        // the stack and the hot loop variables below stay shallow (cheaper
+        // stack access in every unrolled iteration).
+        // Roster-tree operation of this cycle: 0 none, 1 MEMBER, 2 ADMIT,
+        // 3 REMOVE (2 and 3 are Task 7). At most one per cycle; the proof
+        // is checked once after the loop when treeOp != 0.
+        let treeOp = 0n
+        // lastRound of the leaf MEMBER bound (only read when treeOp == 1);
+        // PAYLEAF advances it to ROUND. The other member fields are sliced
+        // from leafPre where needed, so the loop carries no copies of them.
+        let memberLastRound = 0n
+        // True once PAYLEAF replaced the leaf; the new leaf hash and root
+        // are computed after the loop only then.
+        let leafChanged = false
+        // True once ATTESTM ran; its key-to-leaf check runs after the loop.
+        let memberKeyCheck = false
+        let logHash = this.logHash
         const progLen = len(this.prog)
         const value = this.ctx.utxo.value
         const witnessLen = len(witness)
@@ -794,8 +978,104 @@ export class K17Machine extends SmartContract {
                                 ds =
                                     ds + K17Machine.cell(K17Machine.wrap(value))
                             }
+                        } else if (op == 36n) {
+                            // MEMBER : -- IDX
+                            // A second tree instruction this cycle: fault.
+                            // A leafPre that is not 60 bytes: tx invalid.
+                            // The proof and index are checked after the
+                            // loop (tx invalid when wrong), even when a
+                            // full data stack faults here, as in the VM.
+                            if (treeOp != 0n) {
+                                halted = true
+                            } else {
+                                assert(
+                                    len(leafPre) == K17Machine.LEAF_PRE_BYTES,
+                                    'leaf preimage must be 60 bytes'
+                                )
+                                treeOp = 1n
+                                memberLastRound = K17Machine.uncell(
+                                    slice(leafPre, 52n, 56n)
+                                )
+                                if (n >= K17Machine.DS_MAX_BYTES) {
+                                    halted = true
+                                } else {
+                                    ds = ds + K17Machine.cell(leafIndex)
+                                }
+                            }
+                        } else if (op == 37n) {
+                            // LASTROUND : -- R   no bound member: fault
+                            if (treeOp != 1n || n >= K17Machine.DS_MAX_BYTES) {
+                                halted = true
+                            } else {
+                                ds = ds + K17Machine.cell(memberLastRound)
+                            }
+                        } else if (op == 38n) {
+                            // ATTESTM : TAG VAL --
+                            // Underflow or no bound member: fault. A second
+                            // signature, a key that is not 384 bytes or
+                            // not the member's, or a bad signature: tx
+                            // invalid.
+                            if (n < 8n || treeOp != 1n) {
+                                halted = true
+                            } else {
+                                assert(!sigUsed, 'one attestation per cycle')
+                                assert(
+                                    len(keyA) == 384n,
+                                    'key must be 384 bytes'
+                                )
+                                // sha256(keyA) must equal the leaf's key
+                                // hash: checked after the loop.
+                                memberKeyCheck = true
+                                sigUsed = true
+                                // "K17T" || instanceId || cell(TAG) || cell(VAL)
+                                verifyNeeded = true
+                                verifyMsg =
+                                    K17Machine.MEMBER_DOMAIN +
+                                    this.instanceId +
+                                    slice(ds, n - 8n, n)
+                                verifyKey = Utils.fromLEUnsigned(keyA)
+                                ds = ds2
+                            }
+                        } else if (op == 39n) {
+                            // PAYLEAF : N ROUND --
+                            // A second payment this cycle (checked first):
+                            // fault that drops the payout. Underflow, no
+                            // bound member or N == 0: fault. ROUND not above
+                            // the member's lastRound: tx invalid.
+                            if (payslotUsed) {
+                                halted = true
+                                payslotUsed = false
+                                payslotSats = 0n
+                            } else if (n < 8n || treeOp != 1n) {
+                                halted = true
+                            } else if (second == 0n) {
+                                halted = true
+                            } else {
+                                assert(
+                                    top > memberLastRound,
+                                    'round must be above lastRound'
+                                )
+                                payslotUsed = true
+                                payslotSats = second
+                                payslotAddr = Addr(slice(leafPre, 32n, 52n))
+                                // The new leaf hash (lastRound := ROUND) is
+                                // computed after the loop.
+                                leafChanged = true
+                                memberLastRound = top
+                                ds = ds2
+                            }
+                        } else if (op == 42n) {
+                            // OUTH : N1 --   logHash := sha256(logHash || cell(N1))
+                            // Underflow: fault. No capacity limit.
+                            if (n < 4n) {
+                                halted = true
+                            } else {
+                                logHash = sha256(logHash + K17Machine.cell(top))
+                                ds = ds1
+                            }
                         } else {
-                            // unknown opcode
+                            // unknown opcode (ADMIT 0x28 and REMOVE 0x29
+                            // are not on chain yet: Task 7)
                             halted = true
                         }
 
@@ -813,6 +1093,54 @@ export class K17Machine extends SmartContract {
                 RabinVerifier.verifySig(verifyMsg, sig, verifyKey),
                 'signature check failed'
             )
+        }
+
+        // ---- the cycle's one roster-tree proof -----------------------
+        // Checked whenever a tree instruction ran, halted or not: the VM
+        // refuses a bad proof at the instruction, before any later fault.
+        if (treeOp != 0n) {
+            assert(
+                leafIndex >= 0n && leafIndex < K17Machine.TREE_LEAVES,
+                'leaf index out of range'
+            )
+            assert(
+                len(proof) == K17Machine.PROOF_BYTES,
+                'proof must be 512 bytes'
+            )
+            const oldLeafHash =
+                len(leafPre) == 0n
+                    ? K17Machine.EMPTY_HASHES[0]
+                    : sha256(K17Machine.LEAF_DOMAIN + leafPre)
+            assert(
+                K17Machine.treeRoot(oldLeafHash, proof, leafIndex) ==
+                    this.rosterRoot,
+                'proof does not match rosterRoot'
+            )
+            if (memberKeyCheck) {
+                // ATTESTM: the signing key is the bound member's key.
+                assert(
+                    sha256(keyA) == slice(leafPre, 0n, 32n),
+                    'key is not the member key'
+                )
+            }
+            // Task 7 hook: ADMIT (treeOp 2) and REMOVE (treeOp 3) also
+            // change the leaf (their own new leaf hash) and bump rosterSeq
+            // here.
+            if (leafChanged) {
+                // PAYLEAF: the leaf keeps keyHash, payout and flags;
+                // lastRound becomes ROUND (memberLastRound after PAYLEAF).
+                const newLeafHash = sha256(
+                    K17Machine.LEAF_DOMAIN +
+                        slice(leafPre, 0n, 52n) +
+                        K17Machine.cell(memberLastRound) +
+                        slice(leafPre, 56n, 60n)
+                )
+                this.rosterRoot = K17Machine.treeRoot(
+                    newLeafHash,
+                    proof,
+                    leafIndex
+                )
+            }
         }
 
         // ---- anti output-sharing ------------------------------------
@@ -883,6 +1211,7 @@ export class K17Machine extends SmartContract {
             this.mem = mem
             this.outLog = outLog
             this.lastTime = now
+            this.logHash = logHash
             outputs = this.buildStateOutput(remaining)
         }
         if (reward > 0n) {
