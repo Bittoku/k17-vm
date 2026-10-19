@@ -85,42 +85,61 @@ zero is empty. Programs use cells 0..151.
 
 - Write-guard. `!` (STORE) into cell 152 or higher is a fault. Only
   `ENDORSE` writes roster cells. Slot 0 (the sponsor) is pre-filled in the
-  deployment's initial memory image: `newMachine(prog, econ, time, roster,
-initialMemHex)` with `withSlot(...)`.
+  initial memory image of the deployment: pass `initialMemHex` to
+  `newMachine` and build it with `withSlot`.
+- Instance id. Each machine has an immutable 32-byte `instanceId`.
+  `newMachine` makes a random one unless you give one. `ATTEST` and
+  `ENDORSE` signatures include it, so a signature for one machine is not
+  valid on another machine. An attester must read `instanceId` from the
+  deployed machine before it signs.
 - `TAG VAL SLOT ATTEST`. The transaction supplies a 384-byte key (`keyA`)
   and one signature. The key must hash to the slot's hash, and the
-  signature must sign `"K17A" || cell(TAG) || cell(VAL)`.
+  signature must sign `"K17M" || instanceId || cell(TAG) || cell(VAL)`.
+  (`SIGVERIFY` keeps its own `"K17A"` message.)
 - `TAG SLOT NEWSLOT ENDORSE`. The member at `SLOT` (key `keyA`) vouches for
-  a new member (key `keyB`, payout `payout`). The signature must sign
-  `"K17E" || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout`. The
-  contract then writes `sha256(keyB) || payout` into the empty slot
-  `NEWSLOT`. The message binds `NEWSLOT`, so a relayer cannot move the
-  new member to another slot.
-- `N SLOT PAYSLOT`. Pays `N` sats to the slot's payout address in output 2
-  of the cycle transaction, whoever relays it.
+  a new member (key `keyB`, payout `payout`). The signature must sign this
+  message:
+
+  ```
+  "K17E" || instanceId || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout
+  ```
+
+  The contract then writes `sha256(keyB) || payout` into the
+  empty slot `NEWSLOT`. The message includes `NEWSLOT`, so a relayer
+  cannot move the new member to a different slot.
+
+- `N SLOT PAYSLOT`. Pays `N` sats to the slot's payout address, whoever
+  relays the cycle. The payout output comes after the keeper's reward
+  output. The payout has priority: if the balance cannot pay the full
+  reward, the payout and one satoshi, the keeper's reward becomes smaller
+  (to zero, when there is no reward output). A late keeper can thus not
+  make the payout fail.
 - `VALUE`. Pushes the balance of the machine output being spent (mod 2^32).
 
 `SIGVERIFY`, `ATTEST` and `ENDORSE` share one signature per cycle.
 `src/k17/programs.ts` has `enrolAndAttestProgram`: the sponsor enrols a
 landowner in cycle 1, and in cycle 2 the landowner attests a reading and
-is paid a bounty.
+gets a bounty.
 
 A fault halts the machine and releases the balance to the beneficiary. An
 invalid transaction cannot be mined; the machine waits for a correct one.
 A condition that the program causes is a fault. A condition that the
 witness (keys, signatures) causes makes the transaction invalid.
 
-| Instruction | Fault (halt, refund the beneficiary)                                                                                                                              | Invalid transaction                                                                                                |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `!`         | address 152 or higher (roster), stack underflow                                                                                                                   | never                                                                                                              |
-| `ATTEST`    | underflow, `SLOT` 8 or higher, empty slot                                                                                                                         | second signature in the cycle, missing key or signature, key not 384 bytes, key hash not the slot's, bad signature |
-| `ENDORSE`   | underflow, `SLOT` or `NEWSLOT` 8 or higher, empty `SLOT`, filled `NEWSLOT`                                                                                        | as `ATTEST`, plus `keyB` not 384 bytes, payout not 20 bytes                                                        |
-| `PAYSLOT`   | underflow, `SLOT` 8 or higher, empty slot, `N` = 0, second `PAYSLOT` in the cycle, `N` larger than the balance less the reward less 1 sat. The payout is dropped. | never                                                                                                              |
-| `VALUE`     | full data stack                                                                                                                                                   | never                                                                                                              |
+| Instruction | Fault (halt, refund the beneficiary)                                                                                                                                                                          | Invalid transaction                                                                                                |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `!`         | address 152 or higher (roster), stack underflow                                                                                                                                                               | never                                                                                                              |
+| `ATTEST`    | underflow, `SLOT` 8 or higher, empty slot                                                                                                                                                                     | second signature in the cycle, missing key or signature, key not 384 bytes, key hash not the slot's, bad signature |
+| `ENDORSE`   | underflow, `SLOT` or `NEWSLOT` 8 or higher, empty `SLOT`, filled `NEWSLOT`                                                                                                                                    | as `ATTEST`, plus `keyB` not 384 bytes, payout not 20 bytes                                                        |
+| `PAYSLOT`   | always a fault, and the payout is dropped: a second `PAYSLOT` in the cycle (checked first, whatever its operands), underflow, `SLOT` 8 or higher, empty slot, `N` = 0, `N` larger than the balance less 1 sat | never                                                                                                              |
+| `VALUE`     | full data stack                                                                                                                                                                                               | never                                                                                                              |
 
-The reference VM does not know the auction reward, so it cannot see the
-last `PAYSLOT` fault. `planCycle` checks it with `rewardAt` and marks the
-cycle halted with no payout, as the contract does.
+A fault that comes later in the cycle, after a `PAYSLOT` that succeeded,
+does not drop that payout.
+
+The reference VM does not know the balance rules of the contract, so it
+cannot see the last `PAYSLOT` fault. `planCycle` checks it and calculates
+the smaller reward with `rewardAt`, as the contract does.
 
 ## Measurements (K = instructions per cycle)
 
@@ -130,7 +149,7 @@ cycle halted with no payout, as the contract does.
 | 4   | 21       | 16 247 bytes   | 16 802 bytes      |
 | 40  | 28       | 159 003 bytes  | about 160 KB      |
 | 40  | 32       | 202 468 bytes  | about 204 KB      |
-| 40  | 36       | 362 432 bytes  | about 363 KB      |
+| 40  | 36       | 365 326 bytes  | about 366 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
@@ -139,7 +158,8 @@ roster in memory) of script per unrolled instruction, plus a fixed part
 construction). The cycle transaction column is the final (halting) cycle.
 A cycle that continues also carries the next state output, so it is about
 twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
-725 470 bytes at K=40. Fibonacci(10) is 247
+731 257 bytes at K=40. Set `K17_SIZES=1` to print these sizes during
+`npm test`. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.
 
