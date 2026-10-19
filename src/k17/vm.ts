@@ -33,8 +33,18 @@ import {
     slotCells,
     slotOffset,
 } from './isa'
-import { EMPTY_HASHES, SparseMerkleTree, decodeLeafPre } from './smt'
-import { keyHash, endorseMessage, attestMessageFor } from './attest'
+import {
+    EMPTY_HASHES,
+    SparseMerkleTree,
+    decodeLeafPre,
+    encodeLeafPre,
+} from './smt'
+import {
+    keyHash,
+    endorseMessage,
+    attestMessageFor,
+    memberMessage,
+} from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
 export interface K17State {
@@ -140,6 +150,26 @@ export function verifyAttestationFor(
 }
 
 /**
+ * Check an ATTESTM signature exactly as the contract does.
+ * Input: instance id hex, tag and value cells, signature, member key.
+ * Output: true when `sig` signs memberMessage(instanceId, tag, value)
+ * (domain "K17T") under `pub`.
+ */
+export function verifyMemberAttestation(
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint,
+    sig: RabinSig,
+    pub: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(memberMessage(instanceIdHex, tag, value)),
+        sig,
+        pub
+    )
+}
+
+/**
  * Check a roster endorsement signature.
  * Input: instance id hex, tag cell, new member key, payout hex, target slot
  * cell, signature, endorser's key.
@@ -181,7 +211,10 @@ export type Status =
     | 'verify_failed'
     | 'yield'
 
-/** A payout recorded by PAYSLOT: roster slot, its payout hash (hex) and satoshis. */
+/**
+ * A payout recorded by PAYSLOT or PAYLEAF: roster slot (-1 for a PAYLEAF
+ * payout to a tree member), its payout hash (hex) and satoshis.
+ */
 export interface PaySlot {
     slot: number
     payoutHex: string
@@ -194,8 +227,8 @@ export type TreeOp = 'none' | 'member' | 'admit' | 'remove'
 /**
  * The roster member a cycle's MEMBER instruction bound.
  * Purpose: carries the verified leaf (its fields, preimage and proof) to the
- * later instructions of the same cycle (LASTROUND, and ATTESTM, PAYLEAF,
- * ADMIT, REMOVE in later tasks). Output of `step`/`stepK`; never stored in
+ * later instructions of the same cycle (LASTROUND, ATTESTM, PAYLEAF, and
+ * ADMIT, REMOVE in a later task). Output of `step`/`stepK`; never stored in
  * the machine state.
  */
 export interface BoundMember {
@@ -421,6 +454,7 @@ export function step(
     let nextTreeOp = treeOp
     let mb = member
     let logHash = s.logHash
+    let rosterRoot = s.rosterRoot
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -806,6 +840,68 @@ export function step(
             push(mb.lastRound)
             break
         }
+        case Op.ATTESTM: {
+            // TAG VAL --   ATTEST under the key of the member MEMBER bound.
+            // No member is the program's fault; a missing signature or key,
+            // a key that does not hash to the member's leaf, or a bad
+            // signature over memberMessage(instanceId, TAG, VAL) makes the
+            // transaction invalid (state and stack unchanged). Success
+            // consumes the cycle's one signature.
+            if (dsDepth < 2) return fault()
+            if (!mb) return fault()
+            if (
+                su ||
+                !e.sig ||
+                e.attestKey === undefined ||
+                e.instanceId === undefined
+            ) {
+                return unchanged('need_witness')
+            }
+            if (keyHash(e.attestKey) !== mb.keyHash) {
+                return unchanged('verify_failed')
+            }
+            const value = pop()
+            const tag = pop()
+            if (
+                !verifyMemberAttestation(
+                    e.instanceId,
+                    tag,
+                    value,
+                    e.sig,
+                    e.attestKey
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            su = true
+            break
+        }
+        case Op.PAYLEAF: {
+            // N ROUND --   pay N sats to the bound member's payout address
+            // and advance its leaf to lastRound := ROUND, updating
+            // rosterRoot from the proof MEMBER verified. Program errors
+            // (second payment, underflow, no member, N == 0) are faults, a
+            // second payment dropping the first, as in PAYSLOT. A ROUND not
+            // above the stored lastRound invalidates the transaction (state
+            // and stack unchanged). Whether N is affordable is NOT checked
+            // here: planCycle and the contract check it at payout
+            // accounting, exactly as for PAYSLOT.
+            if (ps) return { ...fault(), payslot: undefined }
+            if (dsDepth < 2) return fault()
+            if (!mb) return fault()
+            const round = pop()
+            const sats = pop()
+            if (sats === 0n) return fault()
+            if (round <= mb.lastRound) return unchanged('verify_failed')
+            ps = { slot: -1, payoutHex: mb.payoutHex, sats }
+            rosterRoot = SparseMerkleTree.rootAfter(
+                encodeLeafPre(mb.keyHash, mb.payoutHex, round, mb.flags),
+                mb.proof,
+                mb.leafIndex
+            )
+            mb = { ...mb, lastRound: round }
+            break
+        }
         case Op.OUTH: {
             // N1 --   logHash := sha256(logHash || cell(N1)). The output log
             // `out` is untouched, so OUT_MAX does not apply.
@@ -821,7 +917,17 @@ export function step(
     }
 
     return {
-        state: { ...s, pc: nextPc, ds, rs, mem, out, halted, logHash },
+        state: {
+            ...s,
+            pc: nextPc,
+            ds,
+            rs,
+            mem,
+            out,
+            halted,
+            logHash,
+            rosterRoot,
+        },
         status: halted ? 'halted' : yielded ? 'yield' : 'ok',
         faulted: false,
         witnessIndex: wi,

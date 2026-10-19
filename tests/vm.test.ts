@@ -30,6 +30,8 @@ import {
     outputLog,
     envOf,
     StepEnv,
+    TreeOp,
+    BoundMember,
     hashCell,
     readSlot,
     withSlot,
@@ -52,6 +54,7 @@ import {
     endorseMessage,
     signEndorsement,
     payoutOf,
+    signMemberReading,
 } from '../src/k17/attest'
 import { RabinVerifier } from 'scrypt-ts-lib'
 import { bsv, toByteString, Utils } from 'scrypt-ts'
@@ -156,9 +159,9 @@ describe('K17 v3 tree opcodes and state', function () {
     })
 
     // Pins the default (unknown-opcode) branch for the opcodes whose
-    // handlers have not landed yet (ATTESTM, PAYLEAF, ADMIT, REMOVE: Tasks 4-5).
+    // handlers have not landed yet (ADMIT, REMOVE: Task 5).
     it('opcodes without handlers yet fault', () => {
-        for (const mnemonic of ['ATTESTM', 'PAYLEAF', 'ADMIT', 'REMOVE']) {
+        for (const mnemonic of ['ADMIT', 'REMOVE']) {
             const r = step(initialState(assemble([mnemonic, 'HALT'])), 0n)
             expect(r.status, mnemonic).to.equal('fault')
             expect(r.state.halted).to.equal(true)
@@ -1140,5 +1143,264 @@ describe('K17 v3 MEMBER, LASTROUND, OUTH', () => {
         expect(outputLog(r.state).length).to.equal(OUT_MAX)
         expect(r.state.halted).to.equal(true)
         expect(r.state.pc < BigInt(r.state.prog.length / 2)).to.equal(true)
+    })
+})
+
+describe('K17 v3 ATTESTM and PAYLEAF', function () {
+    this.timeout(120_000)
+    const attester = newAttester(Buffer.alloc(32, 41))
+    const stranger = newAttester(Buffer.alloc(32, 42))
+    const PAYOUT = '44'.repeat(20)
+    const OTHER_PAYOUT = '55'.repeat(20)
+    const OTHER_KEY = '66'.repeat(32)
+    const MEMBER_INDEX = 9
+    const OTHER_INDEX = 300
+    const LAST_ROUND = 7n
+    const buildTree = (): SparseMerkleTree => {
+        const t = new SparseMerkleTree()
+        t.set(
+            MEMBER_INDEX,
+            encodeLeafPre(keyHash(attester.pub), PAYOUT, LAST_ROUND, 1n)
+        )
+        t.set(OTHER_INDEX, encodeLeafPre(OTHER_KEY, OTHER_PAYOUT, 3n))
+        return t
+    }
+    const tree = buildTree()
+    const machine = (mnemonics: (string | number)[], root = tree.root()) =>
+        initialState(assemble(mnemonics), undefined, { rosterRoot: root })
+    /** Environment with the proof for `index` and a valid ATTESTM signature. */
+    const envFor = (
+        index: number,
+        extra: Partial<StepEnv> = {},
+        proofTree: SparseMerkleTree = tree
+    ): StepEnv => ({
+        ...envOf(0n),
+        tree: proofTree.proof(index),
+        sig: signMemberReading(attester, ID, 5n, 2231n),
+        attestKey: attester.pub,
+        instanceId: ID,
+        ...extra,
+    })
+
+    it('full member cycle: MEMBER DROP LASTROUND ... ATTESTM OUTH PAYLEAF', () => {
+        // prettier-ignore
+        const prog = [
+            'MEMBER', 'DROP', 'LASTROUND', 'DROP',
+            'LIT', 5, 'LIT', 2231, 'ATTESTM',
+            'LIT', 8, 'OUTH',
+            'LIT', 25, 'LIT', 8, 'PAYLEAF', 'HALT',
+        ]
+        const r = stepK(machine(prog), envFor(MEMBER_INDEX), 40)
+        expect(r.status).to.equal('halted')
+        expect(r.treeOp).to.equal('member')
+        expect(r.payslot).to.deep.equal({
+            slot: -1,
+            payoutHex: PAYOUT,
+            sats: 25n,
+        })
+        const expected = buildTree()
+        expected.set(
+            MEMBER_INDEX,
+            encodeLeafPre(keyHash(attester.pub), PAYOUT, 8n, 1n)
+        )
+        expect(r.state.rosterRoot).to.equal(expected.root())
+        expect(r.state.rosterRoot).to.not.equal(tree.root())
+        expect(r.member?.lastRound).to.equal(8n)
+        expect(r.state.ds).to.equal('')
+    })
+
+    it('ATTESTM with a wrong key is verify_failed', () => {
+        const bad = run(
+            machine(['MEMBER', 'LIT', 5, 'LIT', 2231, 'ATTESTM', 'HALT']),
+            envFor(MEMBER_INDEX, {
+                attestKey: stranger.pub,
+                sig: signMemberReading(stranger, ID, 5n, 2231n),
+            })
+        )
+        expect(bad.status).to.equal('verify_failed')
+    })
+
+    it('ATTESTM with a signature over the wrong tag is verify_failed', () => {
+        const bad = run(
+            machine(['MEMBER', 'LIT', 5, 'LIT', 2231, 'ATTESTM', 'HALT']),
+            envFor(MEMBER_INDEX, {
+                sig: signMemberReading(attester, ID, 6n, 2231n),
+            })
+        )
+        expect(bad.status).to.equal('verify_failed')
+    })
+
+    it('ATTESTM without MEMBER faults', () => {
+        const r = run(
+            machine(['LIT', 5, 'LIT', 2231, 'ATTESTM', 'HALT']),
+            envFor(MEMBER_INDEX)
+        )
+        expect(r.status).to.equal('halted')
+        // stopped at the ATTESTM fault, not at the HALT
+        expect(r.state.pc).to.equal(10n)
+    })
+
+    it('ATTESTM when the signature was already used is need_witness', () => {
+        const r = run(
+            machine([
+                'MEMBER',
+                'LIT',
+                5,
+                'LIT',
+                2231,
+                'ATTESTM',
+                'LIT',
+                5,
+                'LIT',
+                2231,
+                'ATTESTM',
+                'HALT',
+            ]),
+            envFor(MEMBER_INDEX)
+        )
+        expect(r.status).to.equal('need_witness')
+    })
+
+    it('ATTESTM with missing signature material is need_witness', () => {
+        const r = run(
+            machine(['MEMBER', 'LIT', 5, 'LIT', 2231, 'ATTESTM', 'HALT']),
+            envFor(MEMBER_INDEX, { sig: undefined })
+        )
+        expect(r.status).to.equal('need_witness')
+    })
+
+    it('PAYLEAF without MEMBER faults', () => {
+        const r = run(machine(['LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT']), 0n)
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.equal(undefined)
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('PAYLEAF with N == 0 faults', () => {
+        const r = run(
+            machine(['MEMBER', 'DROP', 'LIT', 0, 'LIT', 8, 'PAYLEAF', 'HALT']),
+            envFor(MEMBER_INDEX)
+        )
+        expect(r.status).to.equal('halted')
+        expect(r.payslot).to.equal(undefined)
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('PAYLEAF ROUND == lastRound is verify_failed; lastRound + 1 succeeds', () => {
+        const same = run(
+            machine(['MEMBER', 'DROP', 'LIT', 1, 'LIT', 7, 'PAYLEAF', 'HALT']),
+            envFor(MEMBER_INDEX)
+        )
+        expect(same.status).to.equal('verify_failed')
+        expect(same.payslot).to.equal(undefined)
+        const next = run(
+            machine(['MEMBER', 'DROP', 'LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT']),
+            envFor(MEMBER_INDEX)
+        )
+        expect(next.status).to.equal('halted')
+        expect(next.payslot?.sats).to.equal(1n)
+    })
+
+    it('PAYLEAF verify_failed leaves state and stack unchanged', () => {
+        const env = envFor(MEMBER_INDEX)
+        let cur = machine([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            1,
+            'LIT',
+            7,
+            'PAYLEAF',
+            'HALT',
+        ])
+        let treeOp: TreeOp = 'none'
+        let member: BoundMember | undefined
+        for (let i = 0; i < 4; i++) {
+            const r = step(cur, env, 0, 0n, false, undefined, treeOp, member)
+            expect(r.status).to.equal('ok')
+            cur = r.state
+            treeOp = r.treeOp
+            member = r.member
+        }
+        const r = step(cur, env, 0, 0n, false, undefined, treeOp, member)
+        expect(r.status).to.equal('verify_failed')
+        expect(r.state).to.equal(cur)
+        expect(outputOf(r.state.ds)).to.deep.equal([1n, 7n])
+    })
+
+    it('a second PAYLEAF in one cycle faults and drops the first payslot', () => {
+        // prettier-ignore
+        const prog = [
+            'MEMBER', 'DROP',
+            'LIT', 1, 'LIT', 8, 'PAYLEAF',
+            'LIT', 1, 'LIT', 9, 'PAYLEAF', 'HALT',
+        ]
+        const r = stepK(machine(prog), envFor(MEMBER_INDEX), 40)
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.payslot).to.equal(undefined)
+    })
+
+    it('LASTROUND after PAYLEAF sees the new round', () => {
+        const r = run(
+            machine([
+                'MEMBER',
+                'DROP',
+                'LIT',
+                1,
+                'LIT',
+                8,
+                'PAYLEAF',
+                'LASTROUND',
+                'HALT',
+            ]),
+            envFor(MEMBER_INDEX)
+        )
+        expect(outputOf(r.state.ds)).to.deep.equal([8n])
+    })
+
+    it('a proof against the previous root fails after another member paid', () => {
+        // Another member's PAYLEAF changes the root; the old proof no longer
+        // verifies against it, so MEMBER fails with the stale proof.
+        const first = run(
+            machine(['MEMBER', 'DROP', 'LIT', 1, 'LIT', 4, 'PAYLEAF', 'HALT']),
+            envFor(OTHER_INDEX)
+        )
+        expect(first.state.rosterRoot).to.not.equal(tree.root())
+        const stale = step(
+            machine(['MEMBER', 'HALT'], first.state.rosterRoot),
+            envFor(MEMBER_INDEX)
+        )
+        expect(stale.status).to.equal('verify_failed')
+        // a proof against the new tree still works
+        const updated = buildTree()
+        updated.set(OTHER_INDEX, encodeLeafPre(OTHER_KEY, OTHER_PAYOUT, 4n))
+        expect(updated.root()).to.equal(first.state.rosterRoot)
+        const fresh = step(
+            machine(['MEMBER', 'HALT'], first.state.rosterRoot),
+            envFor(MEMBER_INDEX, {}, updated)
+        )
+        expect(fresh.status).to.equal('ok')
+    })
+
+    it('the same member and round again is verify_failed', () => {
+        const first = run(
+            machine(['MEMBER', 'DROP', 'LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT']),
+            envFor(MEMBER_INDEX)
+        )
+        const updated = buildTree()
+        updated.set(
+            MEMBER_INDEX,
+            encodeLeafPre(keyHash(attester.pub), PAYOUT, 8n, 1n)
+        )
+        expect(first.state.rosterRoot).to.equal(updated.root())
+        const again = run(
+            machine(
+                ['MEMBER', 'DROP', 'LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT'],
+                first.state.rosterRoot
+            ),
+            envFor(MEMBER_INDEX, {}, updated)
+        )
+        expect(again.status).to.equal('verify_failed')
     })
 })
