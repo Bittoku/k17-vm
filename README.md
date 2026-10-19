@@ -2,11 +2,12 @@
 
 A proof of concept of a UTXO-chained stack computer on Bitcoin SV.
 
-One UTXO locked by `K17Machine` is one suspended process of a 32-instruction
+One UTXO locked by `K17Machine` is one suspended process of a 36-instruction
 stack machine (Koopman's Canonical Stack Machine from _Stack Computers: The
 New Wave_, 1989, plus HALT, 0=, OUT, TIME, the job-bounty extension IN,
-VERIFY, BOUNTY, \*, HASH, WHO, YIELD, and the K17+ attested-input extension
-MIN, MAX, /, SIGVERIFY). Anyone can spend the UTXO. The
+VERIFY, BOUNTY, \*, HASH, WHO, YIELD, the K17+ attested-input extension
+MIN, MAX, /, SIGVERIFY, and the v2 roster extension ATTEST, ENDORSE,
+PAYSLOT, VALUE). Anyone can spend the UTXO. The
 spend is valid only if the next output carries the same program with the
 state advanced by exactly K instructions and the spender takes no more than
 the reward that the liveness Dutch auction permits at the transaction's
@@ -17,15 +18,16 @@ Design notes live in the Obsidian vault:
 
 ## Layout
 
-| Path                          | Purpose                                                                                                         |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `src/k17/isa.ts`              | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA.                   |
-| `src/k17/vm.ts`               | Off-chain reference VM. Executable specification; keepers use it to compute the next state.                     |
-| `src/k17/programs.ts`         | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job. |
-| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement.                                   |
-| `src/keeper.ts`               | Helpers to plan a cycle and build the spending transaction.                                                     |
-| `tests/vm.test.ts`            | ISA and reference VM tests.                                                                                     |
-| `tests/k17Machine.test.ts`    | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter.                            |
+| Path                          | Purpose                                                                                                                           |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `src/k17/isa.ts`              | Opcode table, cell encoding, assembler, disassembler. The single source of truth for the ISA.                                     |
+| `src/k17/vm.ts`               | Off-chain reference VM. Executable specification; keepers use it to compute the next state.                                       |
+| `src/k17/attest.ts`           | Rabin keys, key encoding and hashing, attestation and endorsement signing.                                                        |
+| `src/k17/programs.ts`         | Sample programs: Fibonacci, countdown with CALL/EXIT, heartbeat, factoring bounty, two-stage commit-reveal job, enrol-and-attest. |
+| `src/contracts/k17Machine.ts` | The sCrypt contract: on-chain interpreter, Dutch auction, output enforcement.                                                     |
+| `src/keeper.ts`               | Helpers to plan a cycle and build the spending transaction.                                                                       |
+| `tests/vm.test.ts`            | ISA and reference VM tests.                                                                                                       |
+| `tests/k17Machine.test.ts`    | On-chain tests. Every cycle is verified with the bundled Bitcoin script interpreter.                                              |
 
 ## Requirements
 
@@ -73,6 +75,53 @@ aggregation programs in the companion repository `k17-dc4cd`. Signing
 helpers are in `src/k17/attest.ts`; the verifier is scrypt-ts-lib's
 `RabinVerifier` (3072-bit modulus).
 
+## Roster in memory (v2 machine)
+
+The top of memory holds the roster: 8 slots of 13 cells each, at cells
+152..255 (slot k starts at cell `152 + 13k`). A slot is the SHA-256 hash of
+a member's Rabin public key (32 bytes, 8 cells) followed by the member's
+20-byte payout address hash (5 cells). A slot whose 8 hash cells are all
+zero is empty. Programs use cells 0..151.
+
+- Write-guard. `!` (STORE) into cell 152 or higher is a fault. Only
+  `ENDORSE` writes roster cells. Slot 0 (the sponsor) is pre-filled in the
+  deployment's initial memory image: `newMachine(prog, econ, time, roster,
+initialMemHex)` with `withSlot(...)`.
+- `TAG VAL SLOT ATTEST`. The transaction supplies a 384-byte key (`keyA`)
+  and one signature. The key must hash to the slot's hash, and the
+  signature must sign `"K17A" || cell(TAG) || cell(VAL)`.
+- `TAG SLOT NEWSLOT ENDORSE`. The member at `SLOT` (key `keyA`) vouches for
+  a new member (key `keyB`, payout `payout`). The signature must sign
+  `"K17E" || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout`. The
+  contract then writes `sha256(keyB) || payout` into the empty slot
+  `NEWSLOT`. The message binds `NEWSLOT`, so a relayer cannot move the
+  new member to another slot.
+- `N SLOT PAYSLOT`. Pays `N` sats to the slot's payout address in output 2
+  of the cycle transaction, whoever relays it.
+- `VALUE`. Pushes the balance of the machine output being spent (mod 2^32).
+
+`SIGVERIFY`, `ATTEST` and `ENDORSE` share one signature per cycle.
+`src/k17/programs.ts` has `enrolAndAttestProgram`: the sponsor enrols a
+landowner in cycle 1, and in cycle 2 the landowner attests a reading and
+is paid a bounty.
+
+A fault halts the machine and releases the balance to the beneficiary. An
+invalid transaction cannot be mined; the machine waits for a correct one.
+A condition that the program causes is a fault. A condition that the
+witness (keys, signatures) causes makes the transaction invalid.
+
+| Instruction | Fault (halt, refund the beneficiary)                                                                                                                              | Invalid transaction                                                                                                |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `!`         | address 152 or higher (roster), stack underflow                                                                                                                   | never                                                                                                              |
+| `ATTEST`    | underflow, `SLOT` 8 or higher, empty slot                                                                                                                         | second signature in the cycle, missing key or signature, key not 384 bytes, key hash not the slot's, bad signature |
+| `ENDORSE`   | underflow, `SLOT` or `NEWSLOT` 8 or higher, empty `SLOT`, filled `NEWSLOT`                                                                                        | as `ATTEST`, plus `keyB` not 384 bytes, payout not 20 bytes                                                        |
+| `PAYSLOT`   | underflow, `SLOT` 8 or higher, empty slot, `N` = 0, second `PAYSLOT` in the cycle, `N` larger than the balance less the reward less 1 sat. The payout is dropped. | never                                                                                                              |
+| `VALUE`     | full data stack                                                                                                                                                   | never                                                                                                              |
+
+The reference VM does not know the auction reward, so it cannot see the
+last `PAYSLOT` fault. `planCycle` checks it with `rewardAt` and marks the
+cycle halted with no payout, as the contract does.
+
 ## Measurements (K = instructions per cycle)
 
 | K   | Handlers | Locking script | Cycle transaction |
@@ -81,11 +130,16 @@ helpers are in `src/k17/attest.ts`; the verifier is scrypt-ts-lib's
 | 4   | 21       | 16 247 bytes   | 16 802 bytes      |
 | 40  | 28       | 159 003 bytes  | about 160 KB      |
 | 40  | 32       | 202 468 bytes  | about 204 KB      |
+| 40  | 36       | 362 432 bytes  | about 363 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
-of which SIGVERIFY alone is about 0.8 KB) of script per unrolled
-instruction plus about 6.6 KB fixed (preimage verification, state tail with
-a 256-byte memory image, output construction). Fibonacci(10) is 247
+of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
+roster in memory) of script per unrolled instruction, plus a fixed part
+(preimage verification, state tail with the memory image, output
+construction). The cycle transaction column is the final (halting) cycle.
+A cycle that continues also carries the next state output, so it is about
+twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
+725 470 bytes at K=40. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.
 

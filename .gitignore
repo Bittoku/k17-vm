@@ -10,3 +10,4 @@ tsconfig-scryptTS.json
 !.vscode/tasks.json
 !.vscode/settings.json
 .omc/
+.eslintcache

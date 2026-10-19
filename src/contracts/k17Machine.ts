@@ -31,8 +31,12 @@
  * v2 machine: the top of memory (cells ROSTER_BASE..MEM_CELLS-1) holds
  * ROSTER_SLOTS_MEM roster slots of SLOT_CELLS cells each (32-byte key hash,
  * then 20-byte payout address hash). The region is write-protected: STORE
- * into it faults. VALUE pushes the balance of the machine output being
- * spent. PAYSLOT pays N sats to slot k's payout address in output 2. A
+ * into it faults. ATTEST checks a reading signed by the key whose hash is
+ * in a slot (keyA); ENDORSE checks that a slot member signed for a new
+ * member (keyB, payout) and writes sha256(keyB) || payout into an empty
+ * slot. SIGVERIFY, ATTEST and ENDORSE share one signature per cycle; a bad
+ * key or signature invalidates the transaction. VALUE pushes the balance of
+ * the machine output being spent. PAYSLOT pays N sats to slot k's payout address in output 2. A
  * PAYSLOT the program gets wrong (N == 0, a second one in a cycle, or one
  * that would leave the machine below one satoshi) is a fault: the machine
  * halts, the payout is dropped and the beneficiary is refunded.
