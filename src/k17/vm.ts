@@ -33,6 +33,7 @@ import {
     slotCells,
     slotOffset,
 } from './isa'
+import { EMPTY_HASHES } from './smt'
 import { keyHash, endorseMessage, attestMessageFor } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
@@ -51,6 +52,14 @@ export interface K17State {
     out: string
     /** True once HALT or a fault has been executed. */
     halted: boolean
+    /** Merkle root (64 lowercase hex) of the member roster tree; default EMPTY_HASHES[16]. */
+    rosterRoot: string
+    /** Count of roster mutations (admissions and removals) so far. */
+    rosterSeq: bigint
+    /** Running output-log hash (64 hex), advanced by OUTH; default all zero. */
+    logHash: string
+    /** sha256 of the sponsor's Rabin key (64 hex); all zero means no sponsor. */
+    sponsorKeyHash: string
 }
 
 /** Per-transaction environment visible to the program. */
@@ -75,6 +84,12 @@ export interface StepEnv {
     instanceId?: string
     /** Balance of the machine output being spent, in satoshis (VALUE); default 0. */
     value?: bigint
+    /**
+     * The cycle's single Merkle proof, consumed by MEMBER, ADMIT and REMOVE:
+     * the leaf preimage hex ('' for an empty leaf), the 16-sibling proof hex
+     * and the leaf index.
+     */
+    tree?: { leafPre: string; proof: string; leafIndex: bigint }
 }
 
 /** Build an environment; `lockTime` alone is enough for programs without I/O. */
@@ -173,6 +188,9 @@ export interface PaySlot {
     sats: bigint
 }
 
+/** Which Merkle-tree operation a cycle has performed (at most one). */
+export type TreeOp = 'none' | 'member' | 'admit' | 'remove'
+
 /** Result of executing one instruction. */
 export interface StepResult {
     state: K17State
@@ -187,6 +205,8 @@ export interface StepResult {
     sigUsed: boolean
     /** The payout recorded by PAYSLOT this cycle, if any. */
     payslot?: PaySlot
+    /** The tree operation performed so far this cycle; 'none' until Task 3-5 handlers set it. */
+    treeOp: TreeOp
 }
 
 /**
@@ -194,9 +214,21 @@ export interface StepResult {
  * taken from an optional pre-filled image.
  * Input: program hex; optional memory image hex of exactly MEM_CELLS * CELL * 2
  * characters (throws otherwise; either case, stored lowercase).
+ * Optional `opts` sets the starting rosterRoot (default: the empty tree
+ * root) and sponsorKeyHash (default: 32 zero bytes); each must be 64
+ * lowercase hex chars or this throws.
  * Output: the starting K17State.
  */
-export function initialState(progHex: string, memHex?: string): K17State {
+export function initialState(
+    progHex: string,
+    memHex?: string,
+    opts: { rosterRoot?: string; sponsorKeyHash?: string } = {}
+): K17State {
+    for (const [name, value] of Object.entries(opts)) {
+        if (value !== undefined && !/^[0-9a-f]{64}$/.test(value)) {
+            throw new Error(`${name} must be 64 lowercase hex characters`)
+        }
+    }
     if (
         memHex !== undefined &&
         !new RegExp(`^([0-9a-fA-F]{2}){${MEM_CELLS * CELL}}$`).test(memHex)
@@ -215,6 +247,10 @@ export function initialState(progHex: string, memHex?: string): K17State {
         mem: memHex?.toLowerCase() ?? '00'.repeat(MEM_CELLS * CELL),
         out: '',
         halted: false,
+        rosterRoot: opts.rosterRoot ?? EMPTY_HASHES[16],
+        rosterSeq: 0n,
+        logHash: '00'.repeat(32),
+        sponsorKeyHash: opts.sponsorKeyHash ?? '00'.repeat(32),
     }
 }
 
@@ -304,7 +340,8 @@ export function step(
     witnessIndex = 0,
     bountyDue = 0n,
     sigUsed = false,
-    payslot?: PaySlot
+    payslot?: PaySlot,
+    treeOp: TreeOp = 'none'
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -315,6 +352,7 @@ export function step(
         bountyDue,
         sigUsed,
         payslot,
+        treeOp,
     })
     if (s.halted) return unchanged('halted')
 
@@ -328,6 +366,7 @@ export function step(
         bountyDue,
         sigUsed,
         payslot,
+        treeOp,
     })
 
     if (pc >= prog.length) return fault()
@@ -699,6 +738,7 @@ export function step(
         bountyDue: bounty,
         sigUsed: su,
         payslot: ps,
+        treeOp,
     }
 }
 
@@ -711,6 +751,8 @@ export interface CycleOutcome {
     bountyDue: bigint
     /** The payout PAYSLOT recorded this cycle; undefined when none. */
     payslot?: PaySlot
+    /** The tree operation this cycle performed. */
+    treeOp: TreeOp
 }
 
 /**
@@ -728,9 +770,10 @@ export function stepK(
     let bounty = 0n
     let su = false
     let ps: PaySlot | undefined
+    let treeOp: TreeOp = 'none'
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty, su, ps)
+        const r = step(cur, e, wi, bounty, su, ps, treeOp)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -738,6 +781,7 @@ export function stepK(
                 witnessUsed: wi,
                 bountyDue: bounty,
                 payslot: ps,
+                treeOp,
             }
         }
         cur = r.state
@@ -745,6 +789,7 @@ export function stepK(
         bounty = r.bountyDue
         su = r.sigUsed
         ps = r.payslot
+        treeOp = r.treeOp
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
@@ -755,6 +800,7 @@ export function stepK(
         witnessUsed: wi,
         bountyDue: bounty,
         payslot: ps,
+        treeOp,
     }
 }
 

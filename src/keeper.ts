@@ -33,6 +33,7 @@ import {
 } from './k17/vm'
 import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
 import { NO_SIG, pubKeyBytes } from './k17/attest'
+import { EMPTY_HASHES } from './k17/smt'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -124,6 +125,11 @@ export function stateOf(m: K17Machine): K17State {
         mem: m.mem,
         out: m.outLog,
         halted: false,
+        // The v2 contract has no tree state yet; use the v3 defaults.
+        rosterRoot: EMPTY_HASHES[16],
+        rosterSeq: 0n,
+        logHash: '00'.repeat(32),
+        sponsorKeyHash: '00'.repeat(32),
     }
 }
 

@@ -34,6 +34,7 @@ import {
     readSlot,
     withSlot,
 } from '../src/k17/vm'
+import { EMPTY_HASHES } from '../src/k17/smt'
 import {
     countdownProgram,
     fibonacciProgram,
@@ -93,6 +94,75 @@ describe('K17 ISA encoding', () => {
         expect(assemble(['VALUE', 'ATTEST', 'ENDORSE', 'PAYSLOT'])).to.equal(
             '23202122'
         )
+    })
+})
+
+describe('K17 v3 tree opcodes and state', function () {
+    const NEW_OPS = [
+        Op.MEMBER,
+        Op.LASTROUND,
+        Op.ATTESTM,
+        Op.PAYLEAF,
+        Op.ADMIT,
+        Op.REMOVE,
+        Op.OUTH,
+    ]
+    const NEW_MNEMONICS = [
+        'MEMBER',
+        'LASTROUND',
+        'ATTESTM',
+        'PAYLEAF',
+        'ADMIT',
+        'REMOVE',
+        'OUTH',
+    ]
+
+    it('seven new opcodes have no operand and assemble to 24..2a', () => {
+        for (const op of NEW_OPS) expect(HAS_OPERAND.has(op)).to.be.false
+        expect(assemble(NEW_MNEMONICS)).to.equal('2425262728292a')
+    })
+
+    it('initialState has the v3 defaults', () => {
+        const s = initialState(assemble(['HALT']))
+        expect(s.rosterRoot).to.equal(EMPTY_HASHES[16])
+        expect(s.rosterSeq).to.equal(0n)
+        expect(s.logHash).to.equal('00'.repeat(32))
+        expect(s.sponsorKeyHash).to.equal('00'.repeat(32))
+    })
+
+    it('initialState accepts options and validates them', () => {
+        const root = 'ab'.repeat(32)
+        const sponsor = 'cd'.repeat(32)
+        const s = initialState(assemble(['HALT']), undefined, {
+            rosterRoot: root,
+            sponsorKeyHash: sponsor,
+        })
+        expect(s.rosterRoot).to.equal(root)
+        expect(s.sponsorKeyHash).to.equal(sponsor)
+        expect(() =>
+            initialState(assemble(['HALT']), undefined, { rosterRoot: 'ab' })
+        ).to.throw()
+        expect(() =>
+            initialState(assemble(['HALT']), undefined, {
+                sponsorKeyHash: 'AB'.repeat(32),
+            })
+        ).to.throw()
+    })
+
+    it('treeOp starts as none in step and stepK', () => {
+        const s = initialState(assemble(['HALT']))
+        expect(step(s, 0n).treeOp).to.equal('none')
+        expect(stepK(s, 0n, 4).treeOp).to.equal('none')
+    })
+
+    // Pins the default (unknown-opcode) branch until the handlers land.
+    // REMOVE THIS TEST IN TASK 3, when the first tree handler is added.
+    it('new opcodes fault until their handlers exist', () => {
+        for (const mnemonic of NEW_MNEMONICS) {
+            const r = step(initialState(assemble([mnemonic, 'HALT'])), 0n)
+            expect(r.status, mnemonic).to.equal('fault')
+            expect(r.state.halted).to.equal(true)
+        }
     })
 })
 

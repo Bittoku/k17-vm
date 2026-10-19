@@ -174,10 +174,32 @@ describe('K17 sparse Merkle tree', function () {
         expect(incremental.root()).to.equal(EMPTY_HASHES[16])
     })
 
+    it('literal two-leaf direction: bit 1 means right child', () => {
+        const preA = encodeLeafPre(KEY_HASH, PAYOUT, 1n)
+        const preB = encodeLeafPre('33'.repeat(32), PAYOUT, 2n)
+        const tree = new SparseMerkleTree()
+        tree.set(0, preA)
+        tree.set(1, preB)
+        // Level-1 node over leaves 0 and 1, computed inline.
+        let node = sha(sha('4b31374c' + preA) + sha('4b31374c' + preB))
+        for (let level = 1; level < 16; level++) {
+            node = sha(node + EMPTY_HASHES[level])
+        }
+        expect(tree.root()).to.equal(node)
+        const p1 = tree.proof(1)
+        expect(p1.proof.slice(0, 64)).to.equal(sha('4b31374c' + preA))
+        expect(SparseMerkleTree.verify(node, preB, p1.proof, 1n)).to.equal(true)
+        expect(SparseMerkleTree.verify(node, preB, p1.proof, 0n)).to.equal(
+            false
+        )
+    })
+
     it('rejects out-of-range indexes and malformed leaves', () => {
         const tree = new SparseMerkleTree()
         expect(() => tree.set(65536, '')).to.throw()
         expect(() => tree.set(-1, '')).to.throw()
+        expect(() => tree.set(1.5, '')).to.throw()
+        expect(() => tree.proof(NaN)).to.throw()
         expect(() => tree.proof(65536)).to.throw()
         expect(() => tree.set(1, 'abcd')).to.throw()
         expect(() => encodeLeafPre('11', PAYOUT, 1n)).to.throw()

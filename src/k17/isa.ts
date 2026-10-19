@@ -75,6 +75,26 @@
  *       Pushes the value of the spent output (mod 2^32).
  * None of the four carries an operand.
  *
+ * v3 machine: Merkle roster. The roster is a sparse Merkle tree (smt.ts)
+ * whose root lives in the machine state; each cycle carries one Merkle
+ * proof. None of these seven carries an operand.
+ *   MEMBER    (0x24)  -- IDX
+ *       Verifies the cycle's proof against rosterRoot and binds that
+ *       member for the cycle; pushes the leaf index.
+ *   LASTROUND (0x25)  -- R
+ *       Pushes the bound member's lastRound.
+ *   ATTESTM   (0x26)  TAG VAL --
+ *       ATTEST under the bound member's key; message domain "K17T".
+ *   PAYLEAF   (0x27)  N ROUND --
+ *       Pays N sats to the bound member and sets lastRound := ROUND; the
+ *       root is recomputed.
+ *   ADMIT     (0x28)  TAG ROUND --
+ *       Sponsor-signed insertion of a new member; message domain "K17D".
+ *   REMOVE    (0x29)  TAG --
+ *       Sponsor-signed deletion of a member; message domain "K17X".
+ *   OUTH      (0x2a)  N1 --
+ *       logHash := sha256(logHash || cell(N1)). Never faults on capacity.
+ *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
  * past the end, output log full) is a FAULT. A fault is treated exactly as
  * HALT: the machine stops and the contract releases its funds to the
@@ -136,6 +156,14 @@ export enum Op {
     ENDORSE = 0x21, // ENDORSE verify a roster endorsement (no operand)
     PAYSLOT = 0x22, // PAYSLOT pay a roster slot's payout (no operand)
     VALUE = 0x23, //   VALUE  -- V   push the value of the spent output
+    // ---- v3 machine: Merkle roster (no operands) ----
+    MEMBER = 0x24, //    MEMBER    -- IDX      verify the cycle's proof, bind the member
+    LASTROUND = 0x25, // LASTROUND -- R        push the bound member's lastRound
+    ATTESTM = 0x26, //   ATTESTM   TAG VAL --  ATTEST under the bound member's key
+    PAYLEAF = 0x27, //   PAYLEAF   N ROUND --  pay the member, set lastRound := ROUND
+    ADMIT = 0x28, //     ADMIT     TAG ROUND -- sponsor-signed insertion
+    REMOVE = 0x29, //    REMOVE    TAG --      sponsor-signed deletion
+    OUTH = 0x2a, //      OUTH      N1 --       logHash := sha256(logHash || cell(N1))
 }
 
 /**
@@ -224,6 +252,13 @@ export const MNEMONIC: Record<string, Op> = {
     ENDORSE: Op.ENDORSE,
     PAYSLOT: Op.PAYSLOT,
     VALUE: Op.VALUE,
+    MEMBER: Op.MEMBER,
+    LASTROUND: Op.LASTROUND,
+    ATTESTM: Op.ATTESTM,
+    PAYLEAF: Op.PAYLEAF,
+    ADMIT: Op.ADMIT,
+    REMOVE: Op.REMOVE,
+    OUTH: Op.OUTH,
 }
 
 /**

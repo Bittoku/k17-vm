@@ -109,6 +109,9 @@ export function leafHashOf(leafPreHex: string): string {
 
 /** Throw unless `index` is an integer leaf position in [0, 2^TREE_DEPTH). */
 function checkIndex(index: number | bigint): void {
+    if (typeof index === 'number' && !Number.isInteger(index)) {
+        throw new Error('leaf index must be an integer: ' + index)
+    }
     if (index < 0 || index >= 2 ** TREE_DEPTH) {
         throw new Error('leaf index out of range: ' + index)
     }
