@@ -1918,6 +1918,72 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         expect(r.status).to.equal('verify_failed')
     })
 
+    it('v3.1: a removal replayed after re-admission of the same member at the same index is verify_failed', () => {
+        // Under v3.1 the removal message binds keyHash || payout, which is
+        // the same after the member is admitted again at the same index.
+        // rosterSeq is then the only guard, and this test pins it.
+        const tree = new SparseMerkleTree()
+        tree.set(NEW_INDEX, newcomerLeaf(2n))
+        const member = decodeLeafPre(newcomerLeaf(2n))
+        // the sponsor signs the removal at seq 0
+        const oldSig = signRemoval(
+            sponsor,
+            ID,
+            TAG,
+            0n,
+            BigInt(NEW_INDEX),
+            member.keyHashHex,
+            member.payoutHex
+        )
+        // prettier-ignore
+        const prog = [
+            'LIT', 5, 'REMOVE', 'YIELD',
+            'LIT', 5, 'LIT', 6, 'ADMIT', 'YIELD',
+            'LIT', 5, 'REMOVE', 'HALT',
+        ]
+        // cycle 1: REMOVE (seq 0 -> 1)
+        const removed = stepK(
+            machine(prog, tree.root()),
+            removeEnv(tree, NEW_INDEX, 0n, { sig: oldSig }),
+            40
+        )
+        expect(removed.status).to.equal('ok')
+        expect(removed.state.rosterSeq).to.equal(1n)
+        tree.set(NEW_INDEX, '')
+        expect(removed.state.rosterRoot).to.equal(tree.root())
+        // cycle 2: ADMIT the same key and payout at the same index (1 -> 2)
+        const readmitted = stepK(
+            removed.state,
+            admitEnv(tree, NEW_INDEX, 1n),
+            40
+        )
+        expect(readmitted.status).to.equal('ok')
+        expect(readmitted.state.rosterSeq).to.equal(2n)
+        tree.set(NEW_INDEX, newcomerLeaf(ADMIT_ROUND))
+        expect(readmitted.state.rosterRoot).to.equal(tree.root())
+        // the 52-byte identity the removal binds is unchanged
+        expect(tree.proof(NEW_INDEX).leafPre.slice(0, 104)).to.equal(
+            newcomerLeaf(2n).slice(0, 104)
+        )
+        // cycle 3: the seq-0 removal with a fresh proof is refused
+        const replay = stepK(
+            readmitted.state,
+            removeEnv(tree, NEW_INDEX, 0n, { sig: oldSig }),
+            40
+        )
+        expect(replay.status).to.equal('verify_failed')
+        expect(replay.state.rosterRoot).to.equal(readmitted.state.rosterRoot)
+        expect(replay.state.rosterSeq).to.equal(2n)
+        // control: a removal signed at the current seq is accepted
+        const fresh = stepK(
+            readmitted.state,
+            removeEnv(tree, NEW_INDEX, 2n),
+            40
+        )
+        expect(fresh.status).to.equal('halted')
+        expect(fresh.state.rosterSeq).to.equal(3n)
+    })
+
     describe('a removal signed before a PAYLEAF (v3.1)', () => {
         // One program, two cycles: cycle 1 pays the member at OLD_INDEX
         // (lastRound 2 -> 8, so the leaf and the root change), cycle 2

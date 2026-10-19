@@ -2562,10 +2562,11 @@ describe('K17Machine on-chain', function () {
     }
 
     /**
-     * Program for the replay test: witness 1 runs `TAG_D TIME ADMIT`,
-     * witness 0 runs `TAG_X REMOVE`; each ends the cycle and loops back.
+     * Program for the replay tests: witness 1 runs `TAG_D TIME ADMIT`,
+     * witness 0 runs `tagX REMOVE` (default TAG_X); each ends the cycle
+     * and loops back. Input: optional REMOVE tag. Output: program hex.
      */
-    const ADMIN_PROG = (): string =>
+    const ADMIN_PROG = (tagX: number = TAG_X): string =>
         assemble([
             'IN',
             'IF',
@@ -2581,7 +2582,7 @@ describe('K17Machine on-chain', function () {
             0,
             'remove:',
             'LIT',
-            TAG_X,
+            tagX,
             'REMOVE',
             'YIELD',
             'LIT',
@@ -3109,21 +3110,22 @@ describe('K17Machine on-chain', function () {
     }
 
     /**
-     * Removal signature of the TEST_ID instance at rosterSeq 0.
+     * Removal signature of the TEST_ID instance at `seq` (default 0).
      * Input: signer, tag, leaf index, the removed member's key hash and
-     * payout. Output: Rabin signature.
+     * payout, rosterSeq to sign. Output: Rabin signature.
      */
     const removalSig = (
         signer: Attester,
         tag: number,
         index: number,
-        member: RemovedMember
+        member: RemovedMember,
+        seq = 0n
     ): RabinSig =>
         signRemoval(
             signer,
             TEST_ID,
             BigInt(tag),
-            0n,
+            seq,
             BigInt(index),
             member.keyHashHex,
             member.payoutHex
@@ -3173,7 +3175,7 @@ describe('K17Machine on-chain', function () {
         expectScriptRefused(honest.tx)
     })
 
-    it('REMOVE of an empty leaf is refused (leaf preimage must be 60 bytes)', async () => {
+    it('REMOVE of an empty leaf is refused by the planner and the interpreter', async () => {
         const tree = twoMemberTree()
         const m = await deployTree(REMOVE_PROG(TAG_X), tree)
         const t1 = T0 + 1n
@@ -3371,5 +3373,97 @@ describe('K17Machine on-chain', function () {
             tamperPush(honest.tx, 0, sigs.honest.padding, bad.padding)
             expectScriptRefused(honest.tx)
         }
+    })
+
+    it('v3.1: a removal replayed after re-admission of the same member at the same index is refused', async () => {
+        // Under v3.1 the removal message binds keyHash || payout, which is
+        // the same after member A is admitted again at INDEX_A with the
+        // same key and payout. rosterSeq is then the only guard.
+        // A REMOVE tag for which the seq-0 and seq-2 signatures have
+        // unique, non-empty pushes, so tamperPush can exchange them. The
+        // REMOVE cycles push the witness cell(0) ('00000000'), and member
+        // A's payout is random per run, so a padding of four zero bytes
+        // would collide with that push: skip such tags too.
+        const witnessPush = encodeCell(0n)
+        let tag = 4000
+        const sigsFor = (t: number) => ({
+            old: removalSig(sponsor, t, INDEX_A, MEMBER_A, 0n),
+            current: removalSig(sponsor, t, INDEX_A, MEMBER_A, 2n),
+        })
+        let sigs = sigsFor(tag)
+        while (
+            !swappable(sigs.old, sigs.current) ||
+            sigs.old.padding === witnessPush ||
+            sigs.current.padding === witnessPush
+        ) {
+            if (tag - 4000 >= SEARCH_CAP) throw new Error('no REMOVE tag found')
+            sigs = sigsFor(++tag)
+        }
+        const tree = twoMemberTree()
+        const m = await deployTree(ADMIN_PROG(tag), tree)
+
+        // cycle 1: remove A with the seq-0 signature (seq 0 -> 1)
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [0n],
+            sigs.old,
+            { attestKey: sponsor.pub },
+            tree.proof(INDEX_A)
+        )
+        expect(r1.plan.treeOp).to.equal('remove')
+        tree.set(INDEX_A, '')
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(1n)
+
+        // cycle 2: admit A again at INDEX_A, same key and payout (1 -> 2)
+        const t2 = T0 + 2n
+        const r2 = await admitCycle(n1, r1.plan.remaining, t2, tree, {
+            index: INDEX_A,
+            witness: [1n],
+        })
+        tree.set(INDEX_A, admittedLeaf(t2))
+        const n2 = r2.next as K17Machine
+        expect(n2.rosterRoot).to.equal(tree.root())
+        expect(n2.rosterSeq).to.equal(2n)
+        // the 52-byte identity the removal binds is unchanged
+        expect(admittedLeaf(t2).slice(0, 104)).to.equal(
+            leafOf('A', 0n).slice(0, 104)
+        )
+
+        // cycle 3: the seq-0 removal with a fresh proof is refused by the
+        // planner ...
+        const t3 = T0 + 3n
+        const removeAt3 = (sig: RabinSig) =>
+            cycle(
+                n2,
+                r2.plan.remaining,
+                t3,
+                keeperA,
+                {},
+                [0n],
+                sig,
+                { attestKey: sponsor.pub },
+                tree.proof(INDEX_A)
+            )
+        await expect(removeAt3(sigs.old)).to.be.rejectedWith(/rejected/)
+        // ... and by the interpreter: the honest seq-2 removal verifies,
+        // and the same transaction with the seq-0 signature does not.
+        const honest = await removeAt3(sigs.current)
+        expect(honest.tx.verifyInputScript(0).success).to.equal(true)
+        const n3 = honest.next as K17Machine
+        expect(n3.rosterSeq).to.equal(3n)
+        tamperPush(
+            honest.tx,
+            0,
+            int2ByteString(sigs.current.s),
+            int2ByteString(sigs.old.s)
+        )
+        tamperPush(honest.tx, 0, sigs.current.padding, sigs.old.padding)
+        expectScriptRefused(honest.tx)
     })
 })
