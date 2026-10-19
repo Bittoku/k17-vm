@@ -13,6 +13,14 @@ import {
     Op,
     DS_MAX,
     CELL_MOD,
+    HAS_OPERAND,
+    MEM_CELLS,
+    OUT_MAX,
+    ROSTER_BASE,
+    ROSTER_SLOTS,
+    SLOT_CELLS,
+    slotCells,
+    slotOffset,
 } from '../src/k17/isa'
 import {
     initialState,
@@ -45,6 +53,25 @@ describe('K17 ISA encoding', () => {
         expect(hex.length / 2).to.equal(12)
         expect(hex.slice(0, 2)).to.equal(Op.LIT.toString(16).padStart(2, '0'))
         expect(disassemble(hex)).to.equal('0: LIT 7\n5: DUP\n6: IF 5\n11: HALT')
+    })
+
+    it('roster layout: slot cells and offsets', () => {
+        expect(ROSTER_BASE + ROSTER_SLOTS * SLOT_CELLS).to.equal(MEM_CELLS)
+        expect(slotOffset(0)).to.equal(152)
+        expect(slotOffset(7)).to.equal(243)
+        const cells = slotCells('00'.repeat(31) + '01', 'ab'.repeat(20))
+        expect(cells.length).to.equal(13)
+        expect(cells[7]).to.equal(0x01000000n) // last 4 hash bytes, little-endian
+        expect(cells[8]).to.equal(0xababababn)
+    })
+
+    it('new opcodes have no operand and assemble', () => {
+        for (const op of [Op.ATTEST, Op.ENDORSE, Op.PAYSLOT, Op.VALUE]) {
+            expect(HAS_OPERAND.has(op)).to.be.false
+        }
+        expect(assemble(['VALUE', 'ATTEST', 'ENDORSE', 'PAYSLOT'])).to.equal(
+            '23202122'
+        )
     })
 })
 
@@ -85,7 +112,7 @@ describe('K17 reference VM', () => {
         )
         expect(state.halted).to.be.true
         const log = outputLog(state)
-        expect(log.length).to.equal(64)
+        expect(log.length).to.equal(OUT_MAX)
         expect(log[0]).to.equal(1_700_000_123n)
     })
 

@@ -40,6 +40,20 @@
  *   - Output log: byte string of cells, append-only, capped at OUT_MAX cells.
  *   - Program counter: byte offset into the program.
  *
+ * Roster (v2 machine). The top of memory holds ROSTER_SLOTS roster slots of
+ * SLOT_CELLS cells each, starting at cell ROSTER_BASE (slot k starts at
+ * ROSTER_BASE + k * SLOT_CELLS). A slot is the 32-byte key hash as 8
+ * little-endian cells followed by the 20-byte payout hash as 5 cells.
+ * ROSTER_BASE + ROSTER_SLOTS * SLOT_CELLS == MEM_CELLS, so the roster
+ * occupies cells 152..255 and programs use cells 0..151.
+ *
+ * Roster instructions (stack effects; semantics arrive with the machine):
+ *   ATTEST  (0x20)  see the v2 machine; verifies an attested reading
+ *   ENDORSE (0x21)  see the v2 machine; verifies a roster endorsement
+ *   PAYSLOT (0x22)  see the v2 machine; pays a roster slot's payout
+ *   VALUE   (0x23)  -- V    pushes the value of the spent output
+ * None of the four carries an operand.
+ *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
  * past the end, output log full) is a FAULT. A fault is treated exactly as
  * HALT: the machine stops and the contract releases its funds to the
@@ -56,9 +70,9 @@ export const DS_MAX = 32
 /** Maximum return-stack depth in cells. */
 export const RS_MAX = 32
 /** Number of memory cells. */
-export const MEM_CELLS = 64
+export const MEM_CELLS = 256
 /** Maximum number of cells in the output log. */
-export const OUT_MAX = 64
+export const OUT_MAX = 256
 
 /** Opcode byte values. Mnemonics follow Koopman's Forth notation. */
 export enum Op {
@@ -96,6 +110,11 @@ export enum Op {
     SIGVERIFY = 0x1e, // SIGVERIFY k  TAG VAL --  tx invalid unless the cycle's Rabin
     //                  signature, under roster key k, signs cell(TAG)||cell(VAL)
     DIV = 0x1f, //    /      N1 N2 -- N3       N3 = floor(N1 / N2); fault if N2 == 0
+    // ---- v2 machine: roster attestation, endorsement and payout ----
+    ATTEST = 0x20, //  ATTEST  verify an attested reading (no operand)
+    ENDORSE = 0x21, // ENDORSE verify a roster endorsement (no operand)
+    PAYSLOT = 0x22, // PAYSLOT pay a roster slot's payout (no operand)
+    VALUE = 0x23, //   VALUE  -- V   push the value of the spent output
 }
 
 /**
@@ -104,6 +123,19 @@ export enum Op {
  * slot holding the zero key, is a fault.
  */
 export const ROSTER_MAX = 4
+
+/** Number of roster slots held at the top of memory. */
+export const ROSTER_SLOTS = 8
+/** Cells per roster slot: 8 for the 32-byte key hash, 5 for the 20-byte payout. */
+export const SLOT_CELLS = 13
+/** Cell index of roster slot 0; slot k starts at ROSTER_BASE + k * SLOT_CELLS. */
+export const ROSTER_BASE = 152
+
+/**
+ * Domain prefix of every endorsement message, ASCII "K17E". Separates
+ * endorsement signatures from attestations (ATTEST_DOMAIN).
+ */
+export const ENDORSE_DOMAIN = '4b313745'
 
 /**
  * Domain prefix of every attestation message, ASCII "K17A". It stops a
@@ -167,6 +199,42 @@ export const MNEMONIC: Record<string, Op> = {
     MAX: Op.MAX,
     SIGVERIFY: Op.SIGVERIFY,
     '/': Op.DIV,
+    ATTEST: Op.ATTEST,
+    ENDORSE: Op.ENDORSE,
+    PAYSLOT: Op.PAYSLOT,
+    VALUE: Op.VALUE,
+}
+
+/**
+ * Cell index of the first cell of a roster slot.
+ * Input: slot number (0..ROSTER_SLOTS-1). Output: ROSTER_BASE + slot * SLOT_CELLS.
+ */
+export function slotOffset(slot: number): number {
+    if (!Number.isInteger(slot) || slot < 0 || slot >= ROSTER_SLOTS) {
+        throw new Error(`roster slot out of range: ${slot}`)
+    }
+    return ROSTER_BASE + slot * SLOT_CELLS
+}
+
+/**
+ * Memory cells that describe one roster slot.
+ * Input: keyHashHex (32 bytes, 64 hex chars), payoutHex (20 bytes, 40 hex chars).
+ * Output: SLOT_CELLS bigints; the key hash as 8 little-endian 4-byte cells
+ * followed by the payout as 5 little-endian 4-byte cells.
+ */
+export function slotCells(keyHashHex: string, payoutHex: string): bigint[] {
+    if (!/^([0-9a-fA-F]{2}){32}$/.test(keyHashHex)) {
+        throw new Error(`bad key hash: ${keyHashHex}`)
+    }
+    if (!/^([0-9a-fA-F]{2}){20}$/.test(payoutHex)) {
+        throw new Error(`bad payout: ${payoutHex}`)
+    }
+    const bytes = Buffer.from(keyHashHex + payoutHex, 'hex')
+    const cells: bigint[] = []
+    for (let i = 0; i < bytes.length; i += CELL) {
+        cells.push(BigInt(bytes.readUInt32LE(i)))
+    }
+    return cells
 }
 
 /**

@@ -81,10 +81,10 @@ export class K17Machine extends SmartContract {
     static readonly RS_MAX_BYTES: bigint = 128n
     /** Number of memory cells. */
     @prop()
-    static readonly MEM_CELLS: bigint = 64n
-    /** Maximum output-log size in bytes (64 cells). */
+    static readonly MEM_CELLS: bigint = 256n
+    /** Maximum output-log size in bytes (256 cells). */
     @prop()
-    static readonly OUT_MAX_BYTES: bigint = 256n
+    static readonly OUT_MAX_BYTES: bigint = 1024n
     /** nLockTime values at or above this are unix timestamps, not heights. */
     @prop()
     static readonly UNIX_TIME_MIN: bigint = 500000000n
