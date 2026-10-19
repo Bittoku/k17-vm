@@ -1700,8 +1700,8 @@ describe('K17Machine on-chain', function () {
         )
     }
 
-    it('the contract embeds the empty-subtree hashes of the off-chain tree', () => {
-        expect(K17Machine.EMPTY_HASHES).to.deep.equal(EMPTY_HASHES)
+    it("the contract's empty leaf hash is the off-chain tree's; a new machine starts on the empty tree", () => {
+        expect(K17Machine.EMPTY_HASH).to.equal(EMPTY_HASHES[0])
         const m = newMachine(MEMBER_PROG, ECON, T0)
         expect(m.rosterRoot).to.equal(EMPTY_HASHES[16])
         expect(m.rosterSeq).to.equal(0n)

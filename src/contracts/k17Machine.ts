@@ -144,7 +144,11 @@ export class K17Machine extends SmartContract {
     /** Cells per memory roster slot: 8 key-hash cells, 5 payout cells (ISA SLOT_CELLS). */
     @prop()
     static readonly SLOT_CELLS: bigint = 13n
-    /** Key hash of an empty roster slot: 32 zero bytes. */
+    /**
+     * 32 zero bytes: the key hash of an empty memory roster slot, and the
+     * hash of an empty tree leaf (smt EMPTY_HASHES[0]). The contract reads
+     * no other empty-subtree hash; proofs carry the siblings.
+     */
     @prop()
     static readonly EMPTY_HASH: ByteString = toByteString(
         '0000000000000000000000000000000000000000000000000000000000000000'
@@ -178,66 +182,6 @@ export class K17Machine extends SmartContract {
     /** Bytes of a payout address hash. */
     @prop()
     static readonly PAYOUT_BYTES: bigint = 20n
-    /**
-     * Root of an all-empty subtree at each height 0..TREE_DEPTH (smt
-     * EMPTY_HASHES): entry 0 is the empty leaf hash (32 zero bytes), entry
-     * k+1 is sha256(entry k || entry k), entry 16 is the root of the empty
-     * tree. Embedded, never recomputed on chain.
-     */
-    @prop()
-    static readonly EMPTY_HASHES: FixedArray<ByteString, 17> = [
-        toByteString(
-            '0000000000000000000000000000000000000000000000000000000000000000'
-        ),
-        toByteString(
-            'f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b'
-        ),
-        toByteString(
-            'db56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71'
-        ),
-        toByteString(
-            'c78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c'
-        ),
-        toByteString(
-            '536d98837f2dd165a55d5eeae91485954472d56f246df256bf3cae19352a123c'
-        ),
-        toByteString(
-            '9efde052aa15429fae05bad4d0b1d7c64da64d03d7a1854a588c2cb8430c0d30'
-        ),
-        toByteString(
-            'd88ddfeed400a8755596b21942c1497e114c302e6118290f91e6772976041fa1'
-        ),
-        toByteString(
-            '87eb0ddba57e35f6d286673802a4af5975e22506c7cf4c64bb6be5ee11527f2c'
-        ),
-        toByteString(
-            '26846476fd5fc54a5d43385167c95144f2643f533cc85bb9d16b782f8d7db193'
-        ),
-        toByteString(
-            '506d86582d252405b840018792cad2bf1259f1ef5aa5f887e13cb2f0094f51e1'
-        ),
-        toByteString(
-            'ffff0ad7e659772f9534c195c815efc4014ef1e1daed4404c06385d11192e92b'
-        ),
-        toByteString(
-            '6cf04127db05441cd833107a52be852868890e4317e6a02ab47683aa75964220'
-        ),
-        toByteString(
-            'b7d05f875f140027ef5118a2247bbb84ce8f2f0f1123623085daf7960c329f5f'
-        ),
-        toByteString(
-            'df6af5f5bbdb6be9ef8aa618e4bf8073960867171e29676f8b284dea6a08a85e'
-        ),
-        toByteString(
-            'b58d900f5e182e3c50ef74969ea16c7726c549757cc23523c369587da7293784'
-        ),
-        toByteString(
-            'd49a7502ffcfb0340b1d7885688500ca308161a7f96b62df9d083b71fcc8f2bb'
-        ),
-        toByteString(
-            '8fe6b1689256c0d385f42f5bbe2027a22c1996e110ba97c171d3e5948de92beb'
-        ),
-    ]
 
     // ---- immutable program and economics -------------------------------
 
@@ -304,7 +248,8 @@ export class K17Machine extends SmartContract {
     /**
      * Root of the roster Merkle tree (32 bytes). Every MEMBER proof is
      * checked against it; PAYLEAF (and ADMIT/REMOVE) replace it with the
-     * root after their leaf change. The empty tree's root is EMPTY_HASHES[16].
+     * root after their leaf change. The empty tree's root is smt
+     * EMPTY_HASHES[16].
      */
     @prop(true)
     rosterRoot: ByteString
@@ -1047,19 +992,15 @@ export class K17Machine extends SmartContract {
                         } else if (op == 38n) {
                             // ATTESTM : TAG VAL --
                             // Underflow or no bound member: fault. A second
-                            // signature, a key that is not 384 bytes or
-                            // not the member's, or a bad signature: tx
-                            // invalid.
+                            // signature, a key that is not the member's, or
+                            // a bad signature: tx invalid.
                             if (n < 8n || treeOp != 1n) {
                                 halted = true
                             } else {
                                 assert(!sigUsed, 'one attestation per cycle')
-                                assert(
-                                    len(keyA) == 384n,
-                                    'key must be 384 bytes'
-                                )
                                 // sha256(keyA) must equal the leaf's key
-                                // hash: checked after the loop.
+                                // hash: checked after the loop. That check
+                                // pins keyA, so no length check is needed.
                                 memberKeyCheck = true
                                 sigUsed = true
                                 // "K17T" || instanceId || cell(TAG) || cell(VAL)
@@ -1155,7 +1096,7 @@ export class K17Machine extends SmartContract {
             )
             const oldLeafHash =
                 len(leafPre) == 0n
-                    ? K17Machine.EMPTY_HASHES[0]
+                    ? K17Machine.EMPTY_HASH
                     : sha256(K17Machine.LEAF_DOMAIN + leafPre)
             assert(
                 K17Machine.treeRoot(oldLeafHash, proof, leafIndex) ==
@@ -1171,7 +1112,7 @@ export class K17Machine extends SmartContract {
             }
             // New leaf hash when the leaf changes; REMOVE keeps the empty
             // leaf hash.
-            let newLeafHash = K17Machine.EMPTY_HASHES[0]
+            let newLeafHash = K17Machine.EMPTY_HASH
             if (treeOp == 1n) {
                 // PAYLEAF: the leaf keeps keyHash, payout and flags;
                 // lastRound becomes ROUND (memberLastRound after PAYLEAF).
@@ -1183,11 +1124,8 @@ export class K17Machine extends SmartContract {
                         slice(leafPre, 56n, 60n)
                 )
             } else {
-                // ADMIT or REMOVE: the signer is the sponsor.
-                assert(
-                    len(keyA) == K17Machine.KEY_BYTES,
-                    'key must be 384 bytes'
-                )
+                // ADMIT or REMOVE: the signer is the sponsor. The hash
+                // check pins keyA, so no length check is needed.
                 assert(
                     sha256(keyA) == this.sponsorKeyHash,
                     'key is not the sponsor key'
