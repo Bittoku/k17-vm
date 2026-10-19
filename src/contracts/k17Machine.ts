@@ -1167,11 +1167,13 @@ export class K17Machine extends SmartContract {
                         len(leafPre) == K17Machine.LEAF_PRE_BYTES,
                         'leaf preimage must be 60 bytes'
                     )
-                    // ... || sha256("K17L" || leafPre)
+                    // ... || keyHash32 || payout20, the first 52 bytes of
+                    // leafPre (v3.1). PAYLEAF never changes them, so a
+                    // removal signed before a payment still verifies.
                     verifyMsg =
                         K17Machine.REMOVE_DOMAIN +
                         msgHead +
-                        sha256(K17Machine.LEAF_DOMAIN + leafPre)
+                        slice(leafPre, 0n, 52n)
                 }
                 verifyNeeded = true
                 verifyKey = Utils.fromLEUnsigned(keyA)

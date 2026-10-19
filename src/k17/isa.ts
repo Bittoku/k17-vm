@@ -92,6 +92,8 @@
  *       Sponsor-signed insertion of a new member; message domain "K17D".
  *   REMOVE    (0x29)  TAG --
  *       Sponsor-signed deletion of a member; message domain "K17X".
+ *       The message binds the member's keyHash and payout (leafPre bytes
+ *       0..52), not the leaf hash, so a PAYLEAF does not invalidate it.
  *   OUTH      (0x2a)  N1 --
  *       logHash := sha256(logHash || cell(N1)). Never faults on capacity.
  * Programs must derive ROUND (for PAYLEAF and ADMIT) from TIME, never from

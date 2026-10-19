@@ -35,12 +35,13 @@ import {
     hashCell,
     readSlot,
     withSlot,
+    K17State,
 } from '../src/k17/vm'
 import {
     EMPTY_HASHES,
     SparseMerkleTree,
+    decodeLeafPre,
     encodeLeafPre,
-    leafHashOf,
 } from '../src/k17/smt'
 import {
     countdownProgram,
@@ -63,7 +64,7 @@ import {
     signAdmission,
     signRemoval,
 } from '../src/k17/attest'
-import { RabinVerifier } from 'scrypt-ts-lib'
+import { RabinSig, RabinVerifier } from 'scrypt-ts-lib'
 import { bsv, toByteString, Utils } from 'scrypt-ts'
 
 /** Instance id used by the ATTEST and ENDORSE tests (any 32 bytes). */
@@ -1466,17 +1467,27 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         extra: Partial<StepEnv> = {}
     ): StepEnv => {
         const proof = tree.proof(index)
+        // Sign over the member's keyHash || payout (v3.1) unless the caller
+        // brings its own signature (an empty leaf has no member to sign).
+        const sig =
+            'sig' in extra
+                ? extra.sig
+                : (() => {
+                      const member = decodeLeafPre(proof.leafPre)
+                      return signRemoval(
+                          sponsor,
+                          ID,
+                          TAG,
+                          seq,
+                          BigInt(index),
+                          member.keyHashHex,
+                          member.payoutHex
+                      )
+                  })()
         return {
             ...envOf(0n),
             tree: proof,
-            sig: signRemoval(
-                sponsor,
-                ID,
-                TAG,
-                seq,
-                BigInt(index),
-                leafHashOf(proof.leafPre)
-            ),
+            sig,
             attestKey: sponsor.pub,
             instanceId: ID,
             ...extra,
@@ -1869,13 +1880,16 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         const r = stepK(
             machine(REMOVE_PROG, tree.root()),
             removeEnv(tree, NEW_INDEX, 0n, {
+                // a sponsor signature over an all-zero identity: the
+                // empty leaf is refused before the signature is checked
                 sig: signRemoval(
                     sponsor,
                     ID,
                     TAG,
                     0n,
                     BigInt(NEW_INDEX),
-                    leafHashOf('')
+                    '00'.repeat(32),
+                    '00'.repeat(20)
                 ),
             }),
             40
@@ -1895,12 +1909,103 @@ describe('K17 v3 ADMIT and REMOVE', function () {
                     TAG,
                     0n,
                     BigInt(OLD_INDEX),
-                    leafHashOf(tree.proof(OLD_INDEX).leafPre)
+                    OLD_KEY,
+                    OLD_PAYOUT
                 ),
             }),
             40
         )
         expect(r.status).to.equal('verify_failed')
+    })
+
+    describe('a removal signed before a PAYLEAF (v3.1)', () => {
+        // One program, two cycles: cycle 1 pays the member at OLD_INDEX
+        // (lastRound 2 -> 8, so the leaf and the root change), cycle 2
+        // removes it with a signature made before cycle 1.
+        // prettier-ignore
+        const PAY_THEN_REMOVE = [
+            'MEMBER', 'DROP', 'LIT', 1, 'LIT', 8, 'PAYLEAF', 'YIELD',
+            'LIT', 5, 'REMOVE', 'HALT',
+        ]
+        /**
+         * Run cycle 1 (the payment) from a fresh machine.
+         * Input: the off-chain tree, which is updated to the paid leaf.
+         * Output: the cycle result.
+         */
+        const payCycle = (tree: SparseMerkleTree) => {
+            const paid = stepK(
+                machine(PAY_THEN_REMOVE, tree.root()),
+                { ...envOf(0n), tree: tree.proof(OLD_INDEX), instanceId: ID },
+                40
+            )
+            tree.set(OLD_INDEX, encodeLeafPre(OLD_KEY, OLD_PAYOUT, 8n))
+            return paid
+        }
+        /**
+         * Run cycle 2 (the removal) with a fresh proof and `sig`.
+         * Input: state after cycle 1, tree after cycle 1, signature.
+         * Output: the cycle result.
+         */
+        const removeCycle = (
+            state: K17State,
+            tree: SparseMerkleTree,
+            sig: RabinSig
+        ) =>
+            stepK(
+                state,
+                {
+                    ...envOf(0n),
+                    tree: tree.proof(OLD_INDEX),
+                    sig,
+                    attestKey: sponsor.pub,
+                    instanceId: ID,
+                },
+                40
+            )
+        /** Sponsor signature at seq 0 for OLD_INDEX over key and payout. */
+        const earlySig = (key: string, payout: string) =>
+            signRemoval(sponsor, ID, TAG, 0n, BigInt(OLD_INDEX), key, payout)
+
+        it('is accepted against the new root after the payment', () => {
+            const tree = buildTree()
+            const sig = earlySig(OLD_KEY, OLD_PAYOUT)
+            const oldRoot = tree.root()
+            const paid = payCycle(tree)
+            expect(paid.status).to.equal('ok')
+            expect(paid.state.rosterSeq).to.equal(0n)
+            expect(paid.state.rosterRoot).to.not.equal(oldRoot)
+            expect(paid.state.rosterRoot).to.equal(tree.root())
+            const removed = removeCycle(paid.state, tree, sig)
+            expect(removed.status).to.equal('halted')
+            expect(removed.treeOp).to.equal('remove')
+            expect(removed.state.rosterSeq).to.equal(1n)
+            tree.set(OLD_INDEX, '')
+            expect(removed.state.rosterRoot).to.equal(tree.root())
+        })
+
+        it('with a swapped payout (same key) is verify_failed', () => {
+            const tree = buildTree()
+            const paid = payCycle(tree)
+            const r = removeCycle(
+                paid.state,
+                tree,
+                earlySig(OLD_KEY, '78'.repeat(20))
+            )
+            expect(r.status).to.equal('verify_failed')
+            expect(r.state.rosterRoot).to.equal(paid.state.rosterRoot)
+        })
+
+        it('with a swapped keyHash (same payout) is verify_failed', () => {
+            const tree = buildTree()
+            const paid = payCycle(tree)
+            const r = removeCycle(
+                paid.state,
+                tree,
+                earlySig('87'.repeat(32), OLD_PAYOUT)
+            )
+            expect(r.status).to.equal('verify_failed')
+            expect(r.state.rosterRoot).to.equal(paid.state.rosterRoot)
+        })
     })
 
     it('REMOVE needs a witness when the signature is missing and faults on an empty stack', () => {

@@ -286,33 +286,50 @@ export function signAdmission(
 }
 
 /**
- * Message a sponsor signs to remove the member at a leaf index.
- * Input: instance id hex, tag, seq, leaf index, hash of the leaf being
- * removed (64 hex chars).
+ * Message a sponsor signs to remove the member at a leaf index (v3.1).
+ * The message binds the member's identity (key hash and payout), not the
+ * leaf hash. The leaf also holds lastRound, which every PAYLEAF changes, so
+ * a removal signed over the leaf hash stopped verifying after the member
+ * was paid. The key hash and payout change only by ADMIT and REMOVE, and
+ * those also add one to the roster sequence number in the message.
+ * Input: instance id hex, tag, seq (roster sequence number), leaf index,
+ * the removed member's 32-byte key hash (64 lowercase hex) and 20-byte
+ * payout (40 lowercase hex), that is the first 52 bytes of its leaf
+ * preimage.
  * Output: hex of REMOVE_DOMAIN + instanceId + cell(tag) + cell(seq) +
- * cell(leafIndex) + leafHash.
+ * cell(leafIndex) + keyHash + payout. Throws when the key hash or the
+ * payout is not lowercase hex of the right length.
  */
 export function removeMessage(
     instanceIdHex: string,
     tag: bigint,
     seq: bigint,
     leafIndex: bigint,
-    leafHashHex: string
+    keyHashHex: string,
+    payoutHex: string
 ): string {
+    if (!/^[0-9a-f]{64}$/.test(keyHashHex)) {
+        throw new Error('key hash must be 32 bytes of lowercase hex')
+    }
+    if (!/^[0-9a-f]{40}$/.test(payoutHex)) {
+        throw new Error('payout must be 20 bytes of lowercase hex')
+    }
     return (
         REMOVE_DOMAIN +
         instanceIdHex +
         encodeCell(tag) +
         encodeCell(seq) +
         encodeCell(leafIndex) +
-        leafHashHex
+        keyHashHex +
+        payoutHex
     )
 }
 
 /**
  * Sign a removal.
- * Input: sponsor, instance id hex, tag, seq, leaf index, leaf hash hex.
- * Output: Rabin signature over removeMessage.
+ * Input: sponsor, instance id hex, tag, seq, leaf index, the removed
+ * member's key hash hex (64) and payout hex (40).
+ * Output: Rabin signature over removeMessage. Throws as removeMessage does.
  */
 export function signRemoval(
     sponsor: Attester,
@@ -320,11 +337,19 @@ export function signRemoval(
     tag: bigint,
     seq: bigint,
     leafIndex: bigint,
-    leafHashHex: string
+    keyHashHex: string,
+    payoutHex: string
 ): RabinSig {
     return toRabinSig(
         rabin.sign(
-            removeMessage(instanceIdHex, tag, seq, leafIndex, leafHashHex),
+            removeMessage(
+                instanceIdHex,
+                tag,
+                seq,
+                leafIndex,
+                keyHashHex,
+                payoutHex
+            ),
             sponsor.priv
         )
     )

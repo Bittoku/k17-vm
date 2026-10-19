@@ -38,7 +38,6 @@ import {
     SparseMerkleTree,
     decodeLeafPre,
     encodeLeafPre,
-    leafHashOf,
 } from './smt'
 import {
     keyHash,
@@ -199,24 +198,34 @@ export function verifyAdmission(
 }
 
 /**
- * Check a REMOVE signature exactly as the contract does.
+ * Check a REMOVE signature exactly as the contract does (v3.1 layout).
  * Input: instance id hex, tag cell, roster sequence number, leaf index,
- * hash of the leaf being removed (64 hex), signature, sponsor's key.
+ * the removed member's key hash (64 hex) and payout (40 hex), signature,
+ * sponsor's key.
  * Output: true when `sig` signs removeMessage(instanceId, tag, seq,
- * leafIndex, leafHashHex) under `sponsor`.
+ * leafIndex, keyHashHex, payoutHex) under `sponsor`. Throws as
+ * removeMessage does on a malformed key hash or payout.
  */
 export function verifyRemoval(
     instanceIdHex: string,
     tag: bigint,
     seq: bigint,
     leafIndex: bigint,
-    leafHashHex: string,
+    keyHashHex: string,
+    payoutHex: string,
     sig: RabinSig,
     sponsor: RabinPubKey
 ): boolean {
     return RabinVerifier.verifySig(
         toByteString(
-            removeMessage(instanceIdHex, tag, seq, leafIndex, leafHashHex)
+            removeMessage(
+                instanceIdHex,
+                tag,
+                seq,
+                leafIndex,
+                keyHashHex,
+                payoutHex
+            )
         ),
         sig,
         sponsor
@@ -1028,7 +1037,10 @@ export function step(
             // cycle's proof names. Same fault / need_witness / verify_failed
             // split as ADMIT, except the leaf must be occupied (120 lowercase
             // hex; an empty leaf cannot be removed) and the signature covers
-            // removeMessage with the leaf's hash. A sponsorKeyHash of all
+            // removeMessage with the member's key hash and payout (the
+            // first 52 bytes of the leaf, which PAYLEAF never changes, so
+            // a removal signed before a payment still verifies after it;
+            // rosterSeq stops a replay). A sponsorKeyHash of all
             // zeros means no sponsor, so REMOVE then never verifies. TAG is
             // peeked and popped only on success.
             if (dsDepth < 1) return fault()
@@ -1063,13 +1075,17 @@ export function step(
                 return unchanged('verify_failed')
             }
             const removeTag = cellAt(ds, dsDepth - 1)
+            // leafPre is 120 lowercase hex (checked above), so decoding
+            // cannot throw and both fields pass removeMessage's checks.
+            const removed = decodeLeafPre(leafPre)
             if (
                 !verifyRemoval(
                     e.instanceId,
                     removeTag,
                     s.rosterSeq,
                     leafIndex,
-                    leafHashOf(leafPre),
+                    removed.keyHashHex,
+                    removed.payoutHex,
                     e.sig,
                     e.attestKey
                 )

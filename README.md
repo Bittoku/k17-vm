@@ -200,7 +200,7 @@ cycle.
 ```
 ATTESTM  "K17T" || I || cell(TAG) || cell(VAL)
 ADMIT    "K17D" || I || cell(TAG) || cell(seq) || cell(leafIndex) || sha256(keyB) || payout
-REMOVE   "K17X" || I || cell(TAG) || cell(seq) || cell(leafIndex) || sha256("K17L" || leafPre)
+REMOVE   "K17X" || I || cell(TAG) || cell(seq) || cell(leafIndex) || keyHash || payout
 ```
 
 `ADMIT` and `REMOVE` messages include `rosterSeq`, and each of them adds 1
@@ -208,6 +208,13 @@ to it. Thus a sponsor signature is valid for one operation only. If a
 member is removed, nobody can replay the old admission. The `ADMIT`
 message includes the leaf index and the new member's key and payout, so a
 relayer cannot move the member or change its key.
+
+The `REMOVE` message ends with the removed member's `keyHash` (32 bytes)
+and `payout` (20 bytes). These are the first 52 bytes of `leafPre`. It does
+not include `lastRound`. `PAYLEAF` changes `lastRound` but not these 52
+bytes. Thus a removal that the sponsor signs before a payment to the member
+is still valid after that payment. The sponsor does not have to wait for the
+payments of a round to stop (v3.1).
 
 ### Fault or invalid transaction
 
@@ -272,7 +279,7 @@ a day or more.
 | 4   | 21       | 16 247 bytes   | 16 802 bytes      |
 | 40  | 28       | 159 003 bytes  | about 160 KB      |
 | 40  | 32       | 202 468 bytes  | about 204 KB      |
-| 40  | 43       | 469 384 bytes  | about 470 KB      |
+| 40  | 43       | 469 386 bytes  | about 470 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the

@@ -276,28 +276,67 @@ describe('K17 member / admission / removal messages', function () {
         ).to.equal(false)
     })
 
-    it('removal layout and signature', () => {
-        const leafHash = leafHashOf(encodeLeafPre(KEY_HASH, PAYOUT, 4n))
-        const message = removeMessage(ID, 5n, 2n, 300n, leafHash)
+    it('removal layout and signature bind keyHash || payout (v3.1)', () => {
+        const message = removeMessage(ID, 5n, 2n, 300n, KEY_HASH, PAYOUT)
         expect(message).to.equal(
             '4b313758' +
                 ID +
                 encodeCell(5n) +
                 encodeCell(2n) +
                 encodeCell(300n) +
-                leafHash
+                KEY_HASH +
+                PAYOUT
         )
-        const sig = signRemoval(sponsor, ID, 5n, 2n, 300n, leafHash)
+        // The tail is the first 52 bytes of the leaf preimage, whatever
+        // lastRound and flags hold.
+        for (const round of [4n, 99n]) {
+            const pre = encodeLeafPre(KEY_HASH, PAYOUT, round)
+            expect(message.endsWith(pre.slice(0, 104))).to.equal(true)
+        }
+        const sig = signRemoval(sponsor, ID, 5n, 2n, 300n, KEY_HASH, PAYOUT)
         expect(ok(message, sig, sponsor.pub)).to.equal(true)
         expect(
-            ok(removeMessage(ID, 5n, 3n, 300n, leafHash), sig, sponsor.pub)
+            ok(
+                removeMessage(ID, 5n, 3n, 300n, KEY_HASH, PAYOUT),
+                sig,
+                sponsor.pub
+            )
         ).to.equal(false)
+        expect(
+            ok(
+                removeMessage(ID, 5n, 2n, 300n, KEY_HASH, '33'.repeat(20)),
+                sig,
+                sponsor.pub
+            )
+        ).to.equal(false)
+        expect(
+            ok(
+                removeMessage(ID, 5n, 2n, 300n, '44'.repeat(32), PAYOUT),
+                sig,
+                sponsor.pub
+            )
+        ).to.equal(false)
+    })
+
+    it('removeMessage rejects a malformed key hash or payout', () => {
+        expect(() =>
+            removeMessage(ID, 5n, 2n, 300n, KEY_HASH.slice(2), PAYOUT)
+        ).to.throw('key hash')
+        expect(() =>
+            removeMessage(ID, 5n, 2n, 300n, 'AB'.repeat(32), PAYOUT)
+        ).to.throw('key hash')
+        expect(() =>
+            removeMessage(ID, 5n, 2n, 300n, KEY_HASH, PAYOUT + '00')
+        ).to.throw('payout')
+        expect(() =>
+            removeMessage(ID, 5n, 2n, 300n, KEY_HASH, 'zz'.repeat(20))
+        ).to.throw('payout')
     })
 
     it('the three domains never collide for the same field values', () => {
         const a = memberMessage(ID, 1n, 1n).slice(0, 8)
         const b = admitMessage(ID, 1n, 1n, 1n, newcomer.pub, PAYOUT).slice(0, 8)
-        const c = removeMessage(ID, 1n, 1n, 1n, EMPTY_LEAF).slice(0, 8)
+        const c = removeMessage(ID, 1n, 1n, 1n, KEY_HASH, PAYOUT).slice(0, 8)
         expect(new Set([a, b, c]).size).to.equal(3)
     })
 })

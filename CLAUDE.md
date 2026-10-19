@@ -51,8 +51,9 @@ publication belong in this repo.
     above `lastRound`) are `assert`s; only stack and tree-op conditions in the loop fault.
   - Sponsor messages (`H` = `instanceId || cell(TAG) || cell(rosterSeq) || cell(leafIndex)`):
     `ADMIT` signs `"K17D" || H || sha256(keyB) || payout`; `REMOVE` signs
-    `"K17X" || H || sha256("K17L" || leafPre)`. Each adds 1 to `rosterSeq`, so a sponsor
-    signature cannot be replayed.
+    `"K17X" || H || keyHash32 || payout20` (v3.1: `leafPre[0..52]`, so `lastRound` is not
+    signed and a `PAYLEAF` does not invalidate a pending removal). Each adds 1 to
+    `rosterSeq`, so a sponsor signature cannot be replayed.
   - `PAYSLOT` and `PAYLEAF` share the one payment per cycle; the signature instructions share
     the one signature per cycle.
 - `PAYSLOT` errors are faults, never invalid transactions: a second `PAYSLOT` in a cycle
@@ -70,7 +71,7 @@ publication belong in this repo.
   bound without bounding them first (for example with `VERIFY`), as for `SLOT`.
 - The contract requires the machine at input index 0 (`this.prevouts`). Keep it.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (469 384 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (469 386 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile

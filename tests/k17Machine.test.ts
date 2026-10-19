@@ -57,8 +57,8 @@ import {
 import {
     EMPTY_HASHES,
     SparseMerkleTree,
+    decodeLeafPre,
     encodeLeafPre,
-    leafHashOf,
 } from '../src/k17/smt'
 import {
     NO_SIG,
@@ -2773,7 +2773,8 @@ describe('K17Machine on-chain', function () {
                 BigInt(TAG_X),
                 1n,
                 BigInt(ADMIT_INDEX),
-                leafHashOf(admittedLeaf(t1))
+                decodeLeafPre(admittedLeaf(t1)).keyHashHex,
+                decodeLeafPre(admittedLeaf(t1)).payoutHex
             ),
             { attestKey: sponsor.pub },
             tree.proof(ADMIT_INDEX)
@@ -2970,7 +2971,8 @@ describe('K17Machine on-chain', function () {
                 BigInt(TAG_X),
                 0n,
                 BigInt(INDEX_A),
-                leafHashOf(leafOf('A', 0n))
+                keyHash(attesterA.pub),
+                payoutOf(memberAAddress)
             ),
             { attestKey: sponsor.pub },
             staleA
@@ -3088,15 +3090,34 @@ describe('K17Machine on-chain', function () {
     const REMOVE_PROG = (tag: number): string =>
         assemble(['LIT', tag, 'REMOVE', 'YIELD', 'HALT'])
 
+    /** Identity a removal message binds (v3.1): leafPre bytes 0..52. */
+    interface RemovedMember {
+        keyHashHex: string
+        payoutHex: string
+    }
+
+    /** Identity of member A as twoMemberTree holds it. */
+    const MEMBER_A: RemovedMember = {
+        keyHashHex: keyHash(attesterA.pub),
+        payoutHex: payoutOf(memberAAddress),
+    }
+
+    /** All-zero identity, signed for an empty leaf that has no member. */
+    const NOBODY: RemovedMember = {
+        keyHashHex: '00'.repeat(32),
+        payoutHex: '00'.repeat(20),
+    }
+
     /**
      * Removal signature of the TEST_ID instance at rosterSeq 0.
-     * Input: signer, tag, leaf index, leaf hash hex. Output: Rabin signature.
+     * Input: signer, tag, leaf index, the removed member's key hash and
+     * payout. Output: Rabin signature.
      */
     const removalSig = (
         signer: Attester,
         tag: number,
         index: number,
-        leafHashHex: string
+        member: RemovedMember
     ): RabinSig =>
         signRemoval(
             signer,
@@ -3104,18 +3125,18 @@ describe('K17Machine on-chain', function () {
             BigInt(tag),
             0n,
             BigInt(index),
-            leafHashHex
+            member.keyHashHex,
+            member.payoutHex
         )
 
     it('interpreter refuses a REMOVE signed by a key that is not the sponsor', async () => {
-        const leafHashA = leafHashOf(leafOf('A', 0n))
         // a tag for which the sponsor's and attesterB's signatures over the
         // same removeMessage have unique, non-empty pushes
         let tag = 2000
         while (
             !swappable(
-                removalSig(sponsor, tag, INDEX_A, leafHashA),
-                removalSig(attesterB, tag, INDEX_A, leafHashA)
+                removalSig(sponsor, tag, INDEX_A, MEMBER_A),
+                removalSig(attesterB, tag, INDEX_A, MEMBER_A)
             )
         ) {
             if (tag - 2000 >= SEARCH_CAP) throw new Error('no REMOVE tag found')
@@ -3131,7 +3152,7 @@ describe('K17Machine on-chain', function () {
                 keeperA,
                 {},
                 [],
-                removalSig(signer, tag, INDEX_A, leafHashA),
+                removalSig(signer, tag, INDEX_A, MEMBER_A),
                 { attestKey: signer.pub },
                 tree.proof(INDEX_A)
             )
@@ -3140,7 +3161,7 @@ describe('K17Machine on-chain', function () {
         // sha256(keyA) == sponsorKeyHash can refuse the swapped cycle.
         const honest = await removeA(sponsor)
         const sigS = honest.plan.sig
-        const sigB = removalSig(attesterB, tag, INDEX_A, leafHashA)
+        const sigB = removalSig(attesterB, tag, INDEX_A, MEMBER_A)
         tamperPush(
             honest.tx,
             0,
@@ -3167,7 +3188,7 @@ describe('K17Machine on-chain', function () {
                 keeperA,
                 {},
                 [],
-                removalSig(sponsor, TAG_X, ADMIT_INDEX, '00'.repeat(32)),
+                removalSig(sponsor, TAG_X, ADMIT_INDEX, NOBODY),
                 { attestKey: sponsor.pub },
                 emptyPath
             )
@@ -3175,17 +3196,19 @@ describe('K17Machine on-chain', function () {
         // ... and so does the interpreter. Start from an honest removal of
         // A (same time, same reward), then present the empty index with
         // leafPre '' and its real path. The old-root walk accepts the empty
-        // leaf. The sponsor signs the message that a contract without the
-        // length check would build (leaf hash sha256("K17L")), and the
-        // outputs carry the root it would compute (unchanged) and
-        // rosterSeq 1. Only the leafPre length check can refuse it.
+        // leaf. The sponsor signs a removal of an all-zero identity, and
+        // the outputs carry the root a removal would compute (unchanged)
+        // and rosterSeq 1. The leafPre length check is the first check
+        // on this path that refuses it. (In v3.1 the message tail is
+        // slice(leafPre, 0, 52), so this test no longer shows that the
+        // length check is the only guard.)
         const planA = planCycle(
             m,
             BigInt(FUNDING),
             t1,
             keeperA,
             [],
-            removalSig(sponsor, TAG_X, INDEX_A, leafHashOf(leafOf('A', 0n))),
+            removalSig(sponsor, TAG_X, INDEX_A, MEMBER_A),
             { attestKey: sponsor.pub },
             tree.proof(INDEX_A)
         )
@@ -3197,11 +3220,156 @@ describe('K17Machine on-chain', function () {
         emptyNext.rosterSeq = 1n
         const emptyPlan: CyclePlan = {
             ...planA,
-            sig: removalSig(sponsor, TAG_X, ADMIT_INDEX, sha256Hex('4b31374c')),
+            sig: removalSig(sponsor, TAG_X, ADMIT_INDEX, NOBODY),
             leafPre: '',
             proof: emptyPath.proof,
             leafIndex: BigInt(ADMIT_INDEX),
         }
         expectScriptRefused(await buildStepTx(m, emptyPlan, t1, '', emptyNext))
+    })
+
+    // ------------------------------------------------------------------
+    // v3.1: a removal signed before a PAYLEAF still verifies after it
+    // ------------------------------------------------------------------
+
+    /**
+     * Program for the v3.1 race tests. Cycle 1 binds the member, pays it
+     * PAY_M with ROUND from the witness (lastRound changes, so the leaf and
+     * the root change) and yields. Cycle 2 removes the member with TAG
+     * `tag` and yields. Input: tag. Output: program hex.
+     */
+    const PAY_THEN_REMOVE_PROG = (tag: number): string =>
+        assemble([
+            'MEMBER',
+            'DROP',
+            'LIT',
+            PAY_M,
+            'IN',
+            'PAYLEAF',
+            'YIELD',
+            'LIT',
+            tag,
+            'REMOVE',
+            'YIELD',
+            'HALT',
+        ])
+
+    /** Member A's identity with a payout that is not A's (B's payout). */
+    const A_WRONG_PAYOUT: RemovedMember = {
+        keyHashHex: keyHash(attesterA.pub),
+        payoutHex: payoutOf(memberBAddress),
+    }
+    /** Member A's payout with a key hash that is not A's (B's key). */
+    const A_WRONG_KEY: RemovedMember = {
+        keyHashHex: keyHash(attesterB.pub),
+        payoutHex: payoutOf(memberAAddress),
+    }
+
+    /**
+     * Deploy PAY_THEN_REMOVE_PROG(tag) over twoMemberTree and run cycle 1:
+     * member A is paid with ROUND 5. The tree is updated to match.
+     * Input: tag. Output: the deployed machine, cycle 1 result and the
+     * off-chain tree after cycle 1.
+     */
+    const payA = async (tag: number) => {
+        const tree = twoMemberTree()
+        const m = await deployTree(PAY_THEN_REMOVE_PROG(tag), tree)
+        const oldRoot = tree.root()
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [5n],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        tree.set(INDEX_A, leafOf('A', 5n))
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.not.equal(oldRoot)
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(0n)
+        return { r1, n1, tree }
+    }
+
+    /**
+     * Cycle 2 of the race tests: REMOVE member A with `sig` and a fresh
+     * proof against the post-payment root.
+     * Input: cycle 1 result, machine after cycle 1, tree after cycle 1,
+     * signature. Output: the cycle result (rejects when the planner or the
+     * interpreter refuses).
+     */
+    const removeA = (
+        r1: CycleResult,
+        n1: K17Machine,
+        tree: SparseMerkleTree,
+        sig: RabinSig
+    ) =>
+        cycle(
+            n1,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperA,
+            {},
+            [],
+            sig,
+            { attestKey: sponsor.pub },
+            tree.proof(INDEX_A)
+        )
+
+    it('v3.1: a removal signed before a PAYLEAF is accepted after it', async () => {
+        // the sponsor signs at rosterSeq 0, before the payment
+        const sig = removalSig(sponsor, TAG_X, INDEX_A, MEMBER_A)
+        const { r1, n1, tree } = await payA(TAG_X)
+        const r2 = await removeA(r1, n1, tree, sig)
+        expect(r2.tx.verifyInputScript(0).success).to.equal(true)
+        expect(r2.plan.treeOp).to.equal('remove')
+        tree.set(INDEX_A, '')
+        const n2 = r2.next as K17Machine
+        expect(n2.rosterRoot).to.equal(tree.root())
+        expect(n2.rosterSeq).to.equal(1n)
+    })
+
+    it('v3.1: a removal signature with a swapped payout or key hash is refused after a PAYLEAF', async () => {
+        // a tag for which the honest signature and both swapped ones have
+        // unique, non-empty pushes, so tamperPush can exchange them
+        const sigsFor = (tag: number) => ({
+            honest: removalSig(sponsor, tag, INDEX_A, MEMBER_A),
+            payout: removalSig(sponsor, tag, INDEX_A, A_WRONG_PAYOUT),
+            key: removalSig(sponsor, tag, INDEX_A, A_WRONG_KEY),
+        })
+        let tag = 3000
+        let sigs = sigsFor(tag)
+        while (
+            !swappable(sigs.honest, sigs.payout) ||
+            !swappable(sigs.honest, sigs.key)
+        ) {
+            if (tag - 3000 >= SEARCH_CAP) throw new Error('no REMOVE tag found')
+            sigs = sigsFor(++tag)
+        }
+        const { r1, n1, tree } = await payA(tag)
+        // the planner refuses both swapped signatures ...
+        await expect(removeA(r1, n1, tree, sigs.payout)).to.be.rejectedWith(
+            /rejected/
+        )
+        await expect(removeA(r1, n1, tree, sigs.key)).to.be.rejectedWith(
+            /rejected/
+        )
+        // ... and so does the interpreter: the honest removal verifies,
+        // and the same transaction with a swapped signature does not.
+        for (const bad of [sigs.payout, sigs.key]) {
+            const honest = await removeA(r1, n1, tree, sigs.honest)
+            expect(honest.tx.verifyInputScript(0).success).to.equal(true)
+            tamperPush(
+                honest.tx,
+                0,
+                int2ByteString(sigs.honest.s),
+                int2ByteString(bad.s)
+            )
+            tamperPush(honest.tx, 0, sigs.honest.padding, bad.padding)
+            expectScriptRefused(honest.tx)
+        }
     })
 })
