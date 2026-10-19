@@ -36,7 +36,12 @@ import {
     readSlot,
     withSlot,
 } from '../src/k17/vm'
-import { EMPTY_HASHES, SparseMerkleTree, encodeLeafPre } from '../src/k17/smt'
+import {
+    EMPTY_HASHES,
+    SparseMerkleTree,
+    encodeLeafPre,
+    leafHashOf,
+} from '../src/k17/smt'
 import {
     countdownProgram,
     fibonacciProgram,
@@ -55,6 +60,8 @@ import {
     signEndorsement,
     payoutOf,
     signMemberReading,
+    signAdmission,
+    signRemoval,
 } from '../src/k17/attest'
 import { RabinVerifier } from 'scrypt-ts-lib'
 import { bsv, toByteString, Utils } from 'scrypt-ts'
@@ -156,16 +163,6 @@ describe('K17 v3 tree opcodes and state', function () {
         const s = initialState(assemble(['HALT']))
         expect(step(s, 0n).treeOp).to.equal('none')
         expect(stepK(s, 0n, 4).treeOp).to.equal('none')
-    })
-
-    // Pins the default (unknown-opcode) branch for the opcodes whose
-    // handlers have not landed yet (ADMIT, REMOVE: Task 5).
-    it('opcodes without handlers yet fault', () => {
-        for (const mnemonic of ['ADMIT', 'REMOVE']) {
-            const r = step(initialState(assemble([mnemonic, 'HALT'])), 0n)
-            expect(r.status, mnemonic).to.equal('fault')
-            expect(r.state.halted).to.equal(true)
-        }
     })
 })
 
@@ -1402,5 +1399,435 @@ describe('K17 v3 ATTESTM and PAYLEAF', function () {
             envFor(MEMBER_INDEX, {}, updated)
         )
         expect(again.status).to.equal('verify_failed')
+    })
+})
+
+describe('K17 v3 ADMIT and REMOVE', function () {
+    this.timeout(180_000)
+    const sponsor = newAttester(Buffer.alloc(32, 51))
+    const newcomer = newAttester(Buffer.alloc(32, 52))
+    const stranger = newAttester(Buffer.alloc(32, 53))
+    const NEW_PAYOUT = '77'.repeat(20)
+    const OLD_KEY = '88'.repeat(32)
+    const OLD_PAYOUT = '99'.repeat(20)
+    const OLD_INDEX = 12
+    const NEW_INDEX = 4242
+    const TAG = 5n
+    const ADMIT_ROUND = 6n
+    /** Off-chain mirror holding one existing member at OLD_INDEX. */
+    const buildTree = (): SparseMerkleTree => {
+        const t = new SparseMerkleTree()
+        t.set(OLD_INDEX, encodeLeafPre(OLD_KEY, OLD_PAYOUT, 2n))
+        return t
+    }
+    const newcomerLeaf = (round: bigint) =>
+        encodeLeafPre(keyHash(newcomer.pub), NEW_PAYOUT, round, 0n)
+    /** Machine whose sponsor is `sponsor`, at `root` and optional seq. */
+    const machine = (
+        mnemonics: (string | number)[],
+        root: string,
+        seq = 0n
+    ) => {
+        const s = initialState(assemble(mnemonics), undefined, {
+            rosterRoot: root,
+            sponsorKeyHash: keyHash(sponsor.pub),
+        })
+        return { ...s, rosterSeq: seq }
+    }
+    /** Environment for ADMIT at `index` signed for `seq`, overridable. */
+    const admitEnv = (
+        tree: SparseMerkleTree,
+        index = NEW_INDEX,
+        seq = 0n,
+        extra: Partial<StepEnv> = {}
+    ): StepEnv => ({
+        ...envOf(0n),
+        tree: tree.proof(index),
+        sig: signAdmission(
+            sponsor,
+            ID,
+            TAG,
+            seq,
+            BigInt(index),
+            newcomer.pub,
+            NEW_PAYOUT
+        ),
+        attestKey: sponsor.pub,
+        endorseKey: newcomer.pub,
+        payout: NEW_PAYOUT,
+        instanceId: ID,
+        ...extra,
+    })
+    /** Environment for REMOVE at `index` signed for `seq`, overridable. */
+    const removeEnv = (
+        tree: SparseMerkleTree,
+        index = OLD_INDEX,
+        seq = 0n,
+        extra: Partial<StepEnv> = {}
+    ): StepEnv => {
+        const proof = tree.proof(index)
+        return {
+            ...envOf(0n),
+            tree: proof,
+            sig: signRemoval(
+                sponsor,
+                ID,
+                TAG,
+                seq,
+                BigInt(index),
+                leafHashOf(proof.leafPre)
+            ),
+            attestKey: sponsor.pub,
+            instanceId: ID,
+            ...extra,
+        }
+    }
+    const ADMIT_PROG = ['LIT', 5, 'LIT', 6, 'ADMIT', 'HALT']
+    const REMOVE_PROG = ['LIT', 5, 'REMOVE', 'HALT']
+
+    it('admits into an empty index, then the member attests and is paid against the new root', () => {
+        const tree = buildTree()
+        // prettier-ignore
+        const prog = [
+            'LIT', 5, 'LIT', 6, 'ADMIT', 'YIELD',
+            'MEMBER', 'DROP', 'LIT', 5, 'LIT', 2231, 'ATTESTM',
+            'LIT', 9, 'LIT', 7, 'PAYLEAF', 'HALT',
+        ]
+        const first = stepK(machine(prog, tree.root()), admitEnv(tree), 40)
+        expect(first.status).to.equal('ok')
+        expect(first.treeOp).to.equal('admit')
+        expect(first.state.rosterSeq).to.equal(1n)
+        expect(first.state.ds).to.equal('')
+        tree.set(NEW_INDEX, newcomerLeaf(ADMIT_ROUND))
+        expect(first.state.rosterRoot).to.equal(tree.root())
+
+        const second = stepK(
+            first.state,
+            {
+                ...envOf(0n),
+                tree: tree.proof(NEW_INDEX),
+                sig: signMemberReading(newcomer, ID, 5n, 2231n),
+                attestKey: newcomer.pub,
+                instanceId: ID,
+            },
+            40
+        )
+        expect(second.status).to.equal('halted')
+        expect(second.treeOp).to.equal('member')
+        expect(second.payslot).to.deep.equal({
+            slot: -1,
+            payoutHex: NEW_PAYOUT,
+            sats: 9n,
+        })
+        tree.set(NEW_INDEX, newcomerLeaf(7n))
+        expect(second.state.rosterRoot).to.equal(tree.root())
+        // the sponsor's roster counter does not move on a member payment
+        expect(second.state.rosterSeq).to.equal(1n)
+    })
+
+    it('a member admitted in round r cannot be paid in r but can in r+1', () => {
+        const tree = buildTree()
+        const first = stepK(
+            machine(ADMIT_PROG.slice(0, 5).concat('YIELD'), tree.root()),
+            admitEnv(tree),
+            40
+        )
+        tree.set(NEW_INDEX, newcomerLeaf(ADMIT_ROUND))
+        const payEnv = (): StepEnv => ({
+            ...envOf(0n),
+            tree: tree.proof(NEW_INDEX),
+        })
+        const payProg = (round: number) => [
+            'MEMBER',
+            'DROP',
+            'LIT',
+            1,
+            'LIT',
+            round,
+            'PAYLEAF',
+            'HALT',
+        ]
+        const withProg = (round: number) => ({
+            ...first.state,
+            prog: assemble(payProg(round)),
+            pc: 0n,
+        })
+        const same = stepK(withProg(6), payEnv(), 40)
+        expect(same.status).to.equal('verify_failed')
+        const next = stepK(withProg(7), payEnv(), 40)
+        expect(next.status).to.equal('halted')
+        expect(next.payslot?.sats).to.equal(1n)
+    })
+
+    it('ADMIT with a stale rosterSeq in the signed message is verify_failed', () => {
+        const tree = buildTree()
+        const s = machine(ADMIT_PROG, tree.root(), 3n)
+        const stale = stepK(s, admitEnv(tree, NEW_INDEX, 2n), 40)
+        expect(stale.status).to.equal('verify_failed')
+        expect(stale.state.rosterRoot).to.equal(tree.root())
+        expect(stale.state.rosterSeq).to.equal(3n)
+        const fresh = stepK(s, admitEnv(tree, NEW_INDEX, 3n), 40)
+        expect(fresh.status).to.equal('halted')
+        expect(fresh.state.rosterSeq).to.equal(4n)
+    })
+
+    it('ADMIT onto an occupied index is verify_failed', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(ADMIT_PROG, tree.root()),
+            admitEnv(tree, OLD_INDEX),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('ADMIT signed by a non-sponsor key is verify_failed', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(ADMIT_PROG, tree.root()),
+            admitEnv(tree, NEW_INDEX, 0n, {
+                attestKey: stranger.pub,
+                sig: signAdmission(
+                    stranger,
+                    ID,
+                    TAG,
+                    0n,
+                    BigInt(NEW_INDEX),
+                    newcomer.pub,
+                    NEW_PAYOUT
+                ),
+            }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('ADMIT with no sponsor configured is verify_failed', () => {
+        const tree = buildTree()
+        const s = initialState(assemble(ADMIT_PROG), undefined, {
+            rosterRoot: tree.root(),
+        })
+        expect(stepK(s, admitEnv(tree), 40).status).to.equal('verify_failed')
+    })
+
+    it('ADMIT with an uppercase payout is verify_failed', () => {
+        const tree = buildTree()
+        const upper = NEW_PAYOUT.replace(/7/g, 'A')
+        const r = stepK(
+            machine(ADMIT_PROG, tree.root()),
+            admitEnv(tree, NEW_INDEX, 0n, { payout: upper }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('ADMIT needs a witness without a tree, signature or key, or after a signature', () => {
+        const tree = buildTree()
+        const s = machine(ADMIT_PROG, tree.root())
+        for (const missing of [
+            'tree',
+            'sig',
+            'attestKey',
+            'endorseKey',
+            'payout',
+        ]) {
+            const r = stepK(
+                s,
+                admitEnv(tree, NEW_INDEX, 0n, { [missing]: undefined }),
+                40
+            )
+            expect(r.status, missing).to.equal('need_witness')
+        }
+        const twice = stepK(
+            machine(
+                ['LIT', 5, 'LIT', 6, 'ADMIT', 'LIT', 5, 'LIT', 6, 'ADMIT'],
+                tree.root()
+            ),
+            admitEnv(tree),
+            40
+        )
+        // second ADMIT: a member/admin op was already bound, so it faults
+        expect(twice.status).to.equal('halted')
+    })
+
+    it('ADMIT faults on a short stack', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(['LIT', 5, 'ADMIT', 'HALT'], tree.root()),
+            admitEnv(tree),
+            40
+        )
+        expect(r.status).to.equal('halted')
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('MEMBER after ADMIT in one cycle faults', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(
+                ['LIT', 5, 'LIT', 6, 'ADMIT', 'MEMBER', 'HALT'],
+                tree.root()
+            ),
+            admitEnv(tree),
+            40
+        )
+        expect(r.status).to.equal('halted')
+        expect(r.treeOp).to.equal('admit')
+        expect(r.state.pc).to.equal(11n)
+    })
+
+    it('ADMIT after MEMBER in one cycle faults', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(
+                ['MEMBER', 'DROP', 'LIT', 5, 'LIT', 6, 'ADMIT', 'HALT'],
+                tree.root()
+            ),
+            { ...admitEnv(tree, OLD_INDEX) },
+            40
+        )
+        expect(r.status).to.equal('halted')
+        expect(r.treeOp).to.equal('member')
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('removes a member and updates root and seq', () => {
+        const tree = buildTree()
+        const r = stepK(machine(REMOVE_PROG, tree.root()), removeEnv(tree), 40)
+        expect(r.status).to.equal('halted')
+        expect(r.treeOp).to.equal('remove')
+        expect(r.state.rosterSeq).to.equal(1n)
+        expect(r.state.ds).to.equal('')
+        tree.set(OLD_INDEX, '')
+        expect(r.state.rosterRoot).to.equal(tree.root())
+    })
+
+    it('after REMOVE the removed member proof and the original admission are verify_failed', () => {
+        // admit in cycle 1, remove in cycle 2, then replay the admission
+        const tree = buildTree()
+        const admitted = stepK(
+            machine(ADMIT_PROG.slice(0, 5).concat('YIELD'), tree.root()),
+            admitEnv(tree),
+            40
+        )
+        tree.set(NEW_INDEX, newcomerLeaf(ADMIT_ROUND))
+        const removing = {
+            ...admitted.state,
+            prog: assemble(REMOVE_PROG),
+            pc: 0n,
+        }
+        const removed = stepK(removing, removeEnv(tree, NEW_INDEX, 1n), 40)
+        expect(removed.status).to.equal('halted')
+        expect(removed.state.rosterSeq).to.equal(2n)
+        const afterRemove = new SparseMerkleTree()
+        afterRemove.set(OLD_INDEX, encodeLeafPre(OLD_KEY, OLD_PAYOUT, 2n))
+        expect(removed.state.rosterRoot).to.equal(afterRemove.root())
+
+        // the removed member's old proof no longer verifies
+        const asMember = stepK(
+            {
+                ...removed.state,
+                halted: false,
+                prog: assemble(['MEMBER', 'HALT']),
+                pc: 0n,
+            },
+            { ...envOf(0n), tree: tree.proof(NEW_INDEX) },
+            40
+        )
+        expect(asMember.status).to.equal('verify_failed')
+
+        // replaying the cycle-1 admission (seq 0) fails: stale seq
+        const replay = stepK(
+            {
+                ...removed.state,
+                halted: false,
+                prog: assemble(ADMIT_PROG),
+                pc: 0n,
+            },
+            admitEnv(afterRemove),
+            40
+        )
+        expect(replay.status).to.equal('verify_failed')
+        // a fresh admission at the current seq succeeds
+        const fresh = stepK(
+            {
+                ...removed.state,
+                halted: false,
+                prog: assemble(ADMIT_PROG),
+                pc: 0n,
+            },
+            admitEnv(afterRemove, NEW_INDEX, 2n),
+            40
+        )
+        expect(fresh.status).to.equal('halted')
+        expect(fresh.state.rosterSeq).to.equal(3n)
+    })
+
+    it('REMOVE with a wrong rosterSeq is verify_failed', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(REMOVE_PROG, tree.root(), 1n),
+            removeEnv(tree, OLD_INDEX, 0n),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('REMOVE on an empty index is verify_failed', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(REMOVE_PROG, tree.root()),
+            removeEnv(tree, NEW_INDEX, 0n, {
+                sig: signRemoval(
+                    sponsor,
+                    ID,
+                    TAG,
+                    0n,
+                    BigInt(NEW_INDEX),
+                    leafHashOf('')
+                ),
+            }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('REMOVE signed by a non-sponsor key is verify_failed', () => {
+        const tree = buildTree()
+        const r = stepK(
+            machine(REMOVE_PROG, tree.root()),
+            removeEnv(tree, OLD_INDEX, 0n, {
+                attestKey: stranger.pub,
+                sig: signRemoval(
+                    stranger,
+                    ID,
+                    TAG,
+                    0n,
+                    BigInt(OLD_INDEX),
+                    leafHashOf(tree.proof(OLD_INDEX).leafPre)
+                ),
+            }),
+            40
+        )
+        expect(r.status).to.equal('verify_failed')
+    })
+
+    it('REMOVE needs a witness when the signature is missing and faults on an empty stack', () => {
+        const tree = buildTree()
+        expect(
+            stepK(
+                machine(REMOVE_PROG, tree.root()),
+                removeEnv(tree, OLD_INDEX, 0n, { sig: undefined }),
+                40
+            ).status
+        ).to.equal('need_witness')
+        const empty = stepK(
+            machine(['REMOVE', 'HALT'], tree.root()),
+            removeEnv(tree),
+            40
+        )
+        expect(empty.status).to.equal('halted')
+        expect(empty.state.rosterRoot).to.equal(tree.root())
     })
 })

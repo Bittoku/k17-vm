@@ -38,12 +38,15 @@ import {
     SparseMerkleTree,
     decodeLeafPre,
     encodeLeafPre,
+    leafHashOf,
 } from './smt'
 import {
     keyHash,
     endorseMessage,
     attestMessageFor,
     memberMessage,
+    admitMessage,
+    removeMessage,
 } from './attest'
 
 /** Complete machine state. Everything the contract carries between cycles. */
@@ -166,6 +169,57 @@ export function verifyMemberAttestation(
         toByteString(memberMessage(instanceIdHex, tag, value)),
         sig,
         pub
+    )
+}
+
+/**
+ * Check an ADMIT signature exactly as the contract does.
+ * Input: instance id hex, tag cell, roster sequence number, leaf index,
+ * the new member's key, payout hex, signature, sponsor's key.
+ * Output: true when `sig` signs admitMessage(instanceId, tag, seq,
+ * leafIndex, newPub, payoutHex) under `sponsor`.
+ */
+export function verifyAdmission(
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string,
+    sig: RabinSig,
+    sponsor: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(
+            admitMessage(instanceIdHex, tag, seq, leafIndex, newPub, payoutHex)
+        ),
+        sig,
+        sponsor
+    )
+}
+
+/**
+ * Check a REMOVE signature exactly as the contract does.
+ * Input: instance id hex, tag cell, roster sequence number, leaf index,
+ * hash of the leaf being removed (64 hex), signature, sponsor's key.
+ * Output: true when `sig` signs removeMessage(instanceId, tag, seq,
+ * leafIndex, leafHashHex) under `sponsor`.
+ */
+export function verifyRemoval(
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    leafHashHex: string,
+    sig: RabinSig,
+    sponsor: RabinPubKey
+): boolean {
+    return RabinVerifier.verifySig(
+        toByteString(
+            removeMessage(instanceIdHex, tag, seq, leafIndex, leafHashHex)
+        ),
+        sig,
+        sponsor
     )
 }
 
@@ -455,6 +509,7 @@ export function step(
     let mb = member
     let logHash = s.logHash
     let rosterRoot = s.rosterRoot
+    let rosterSeq = s.rosterSeq
 
     const dsDepth = depth(ds)
     const rsDepth = depth(rs)
@@ -902,6 +957,132 @@ export function step(
             mb = { ...mb, lastRound: round }
             break
         }
+        case Op.ADMIT: {
+            // TAG ROUND --   the sponsor admits e.endorseKey into the empty
+            // leaf the cycle's proof names, with lastRound := ROUND. A member
+            // or admin op already this cycle, or a short stack, is the
+            // program's fault. Missing witnesses are need_witness; every
+            // other failure (index range, occupied leaf, proof not against
+            // rosterRoot, malformed payout, signer not the sponsor, bad
+            // signature over admitMessage with the current rosterSeq) makes
+            // the transaction invalid with state unchanged. A sponsorKeyHash
+            // of all zeros (no sponsor) can never match keyHash(attestKey),
+            // so ADMIT then always fails verification. TAG is peeked, and
+            // ROUND and TAG are popped only on the way to success.
+            if (dsDepth < 2) return fault()
+            if (treeOp !== 'none') return fault()
+            if (
+                !e.tree ||
+                su ||
+                !e.sig ||
+                e.attestKey === undefined ||
+                e.endorseKey === undefined ||
+                e.payout === undefined ||
+                e.instanceId === undefined
+            ) {
+                return unchanged('need_witness')
+            }
+            const { leafPre, proof, leafIndex } = e.tree
+            if (leafIndex < 0n || leafIndex >= 65536n) {
+                return unchanged('verify_failed')
+            }
+            if (leafPre !== '') return unchanged('verify_failed')
+            if (!SparseMerkleTree.verify(s.rosterRoot, '', proof, leafIndex)) {
+                return unchanged('verify_failed')
+            }
+            if (!/^[0-9a-f]{40}$/.test(e.payout)) {
+                return unchanged('verify_failed')
+            }
+            if (keyHash(e.attestKey) !== s.sponsorKeyHash) {
+                return unchanged('verify_failed')
+            }
+            const admitTag = cellAt(ds, dsDepth - 2)
+            if (
+                !verifyAdmission(
+                    e.instanceId,
+                    admitTag,
+                    s.rosterSeq,
+                    leafIndex,
+                    e.endorseKey,
+                    e.payout,
+                    e.sig,
+                    e.attestKey
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            const admitRound = pop()
+            pop()
+            rosterRoot = SparseMerkleTree.rootAfter(
+                encodeLeafPre(keyHash(e.endorseKey), e.payout, admitRound, 0n),
+                proof,
+                leafIndex
+            )
+            rosterSeq = s.rosterSeq + 1n
+            su = true
+            nextTreeOp = 'admit'
+            break
+        }
+        case Op.REMOVE: {
+            // TAG --   the sponsor removes the member at the leaf the
+            // cycle's proof names. Same fault / need_witness / verify_failed
+            // split as ADMIT, except the leaf must be occupied (120 lowercase
+            // hex; an empty leaf cannot be removed) and the signature covers
+            // removeMessage with the leaf's hash. A sponsorKeyHash of all
+            // zeros means no sponsor, so REMOVE then never verifies. TAG is
+            // peeked and popped only on success.
+            if (dsDepth < 1) return fault()
+            if (treeOp !== 'none') return fault()
+            if (
+                !e.tree ||
+                su ||
+                !e.sig ||
+                e.attestKey === undefined ||
+                e.instanceId === undefined
+            ) {
+                return unchanged('need_witness')
+            }
+            const { leafPre, proof, leafIndex } = e.tree
+            if (leafIndex < 0n || leafIndex >= 65536n) {
+                return unchanged('verify_failed')
+            }
+            if (!/^[0-9a-f]{120}$/.test(leafPre)) {
+                return unchanged('verify_failed')
+            }
+            if (
+                !SparseMerkleTree.verify(
+                    s.rosterRoot,
+                    leafPre,
+                    proof,
+                    leafIndex
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            if (keyHash(e.attestKey) !== s.sponsorKeyHash) {
+                return unchanged('verify_failed')
+            }
+            const removeTag = cellAt(ds, dsDepth - 1)
+            if (
+                !verifyRemoval(
+                    e.instanceId,
+                    removeTag,
+                    s.rosterSeq,
+                    leafIndex,
+                    leafHashOf(leafPre),
+                    e.sig,
+                    e.attestKey
+                )
+            ) {
+                return unchanged('verify_failed')
+            }
+            pop()
+            rosterRoot = SparseMerkleTree.rootAfter('', proof, leafIndex)
+            rosterSeq = s.rosterSeq + 1n
+            su = true
+            nextTreeOp = 'remove'
+            break
+        }
         case Op.OUTH: {
             // N1 --   logHash := sha256(logHash || cell(N1)). The output log
             // `out` is untouched, so OUT_MAX does not apply.
@@ -927,6 +1108,7 @@ export function step(
             halted,
             logHash,
             rosterRoot,
+            rosterSeq,
         },
         status: halted ? 'halted' : yielded ? 'yield' : 'ok',
         faulted: false,
