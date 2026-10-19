@@ -62,12 +62,19 @@
  * changes the leaf and so the root; OUTH folds a cell into the running
  * `logHash`. Handlers inside the unrolled loop only record what they need
  * (`treeOp`, the member's lastRound, whether ATTESTM ran and whether the
- * leaf changed). After the loop, next to the Rabin check, the proof is
- * checked once against the old root, the ATTESTM key is checked against the
- * leaf's key hash and, when the leaf changed, the new leaf hash is walked up
- * the same proof to give the new root. A missing or wrong proof, preimage
- * or index invalidates the transaction; a tree instruction the program
- * misuses is a fault.
+ * leaf changed). ADMIT (TAG ROUND --) lets the sponsor (the key whose
+ * hash is `sponsorKeyHash`) put a new member into an empty leaf with
+ * lastRound := ROUND; REMOVE (TAG --) lets the sponsor empty an occupied
+ * leaf. Both sign a message that includes `rosterSeq`, and both add one to
+ * `rosterSeq`, so a sponsor signature works once only. After the loop,
+ * before the Rabin check, the proof is checked once against the old root,
+ * the ATTESTM key is checked against the leaf's key hash, the ADMIT or
+ * REMOVE witnesses and message are checked and built, and, when the leaf
+ * changed, the new leaf hash is walked up the same proof to give the new
+ * root. A missing or wrong proof, preimage, index, key or signature
+ * invalidates the transaction; a tree instruction the program misuses (a
+ * short stack, a second tree instruction in the cycle, no bound member) is
+ * a fault. One tree instruction, one signature and one payment per cycle.
  *
  * Semantics are defined by `src/k17/isa.ts` and the reference VM in
  * `src/k17/vm.ts`; this file must agree with them exactly.
@@ -159,6 +166,18 @@ export class K17Machine extends SmartContract {
     /** Domain prefix of an ATTESTM message, ASCII "K17T" (attest MEMBER_DOMAIN). */
     @prop()
     static readonly MEMBER_DOMAIN: ByteString = toByteString('4b313754')
+    /** Domain prefix of an ADMIT message, ASCII "K17D" (attest ADMIT_DOMAIN). */
+    @prop()
+    static readonly ADMIT_DOMAIN: ByteString = toByteString('4b313744')
+    /** Domain prefix of a REMOVE message, ASCII "K17X" (attest REMOVE_DOMAIN). */
+    @prop()
+    static readonly REMOVE_DOMAIN: ByteString = toByteString('4b313758')
+    /** Bytes of a Rabin public key in pubKeyBytes form. */
+    @prop()
+    static readonly KEY_BYTES: bigint = 384n
+    /** Bytes of a payout address hash. */
+    @prop()
+    static readonly PAYOUT_BYTES: bigint = 20n
     /**
      * Root of an all-empty subtree at each height 0..TREE_DEPTH (smt
      * EMPTY_HASHES): entry 0 is the empty leaf hash (32 zero bytes), entry
@@ -254,8 +273,9 @@ export class K17Machine extends SmartContract {
     @prop()
     readonly instanceId: ByteString
     /**
-     * sha256 of the sponsor's Rabin key (32 bytes), the key that signs
-     * ADMIT and REMOVE (Task 7). All zero means the machine has no sponsor.
+     * sha256 of the sponsor's Rabin key (32 bytes, pubKeyBytes form), the
+     * key that signs ADMIT and REMOVE. All zero means the machine has no
+     * sponsor: no key hashes to it, so ADMIT and REMOVE can never verify.
      * Fixed at deployment.
      */
     @prop()
@@ -288,7 +308,11 @@ export class K17Machine extends SmartContract {
      */
     @prop(true)
     rosterRoot: ByteString
-    /** Count of roster mutations (ADMIT and REMOVE, Task 7) so far. */
+    /**
+     * Count of roster mutations (ADMIT and REMOVE) so far. ADMIT and REMOVE
+     * messages include it and each adds one, so a sponsor signature cannot
+     * be replayed.
+     */
     @prop(true)
     rosterSeq: bigint
     /**
@@ -419,14 +443,16 @@ export class K17Machine extends SmartContract {
      *        SIGVERIFY, ATTEST or ENDORSE (0 if none)
      * @param sigPad Rabin signature padding for sigS
      * @param keyA Rabin key (pubKeyBytes form, 384 bytes) that signs for
-     *        ATTEST or sponsors for ENDORSE; empty when unused
-     * @param keyB new member's Rabin key (pubKeyBytes form) for ENDORSE;
-     *        empty when unused
-     * @param payout new member's 20-byte payout address hash for ENDORSE;
-     *        empty when unused
-     * @param leafPre the cycle's one roster-tree leaf preimage (60 bytes for
-     *        MEMBER: keyHash || payout || cell(lastRound) || cell(flags));
-     *        empty when no tree instruction runs
+     *        ATTEST or ATTESTM, sponsors for ENDORSE, or is the sponsor key
+     *        for ADMIT and REMOVE; empty when unused
+     * @param keyB new member's Rabin key (pubKeyBytes form) for ENDORSE or
+     *        ADMIT; empty when unused
+     * @param payout new member's 20-byte payout address hash for ENDORSE or
+     *        ADMIT; empty when unused
+     * @param leafPre the cycle's one roster-tree leaf preimage: 60 bytes
+     *        (keyHash || payout || cell(lastRound) || cell(flags)) for
+     *        MEMBER and REMOVE, empty for ADMIT (the leaf must be empty) and
+     *        when no tree instruction runs
      * @param proof the 16 sibling hashes of that leaf, level 0 first
      *        (512 bytes); empty when no tree instruction runs
      * @param leafIndex the leaf's position in [0, 65536); 0 when unused.
@@ -450,15 +476,18 @@ export class K17Machine extends SmartContract {
         // the stack and the hot loop variables below stay shallow (cheaper
         // stack access in every unrolled iteration).
         // Roster-tree operation of this cycle: 0 none, 1 MEMBER, 2 ADMIT,
-        // 3 REMOVE (2 and 3 are Task 7). At most one per cycle; the proof
-        // is checked once after the loop when treeOp != 0.
+        // 3 REMOVE. At most one per cycle; the proof is checked once after
+        // the loop when treeOp != 0.
         let treeOp = 0n
-        // lastRound of the leaf MEMBER bound (only read when treeOp == 1);
-        // PAYLEAF advances it to ROUND. The other member fields are sliced
-        // from leafPre where needed, so the loop carries no copies of them.
+        // lastRound of the leaf MEMBER bound (treeOp 1), which PAYLEAF
+        // advances to ROUND, or the ROUND that ADMIT gives the new leaf
+        // (treeOp 2). The other member fields are sliced from leafPre where
+        // needed, so the loop carries no copies of them.
         let memberLastRound = 0n
-        // True once PAYLEAF replaced the leaf; the new leaf hash and root
-        // are computed after the loop only then.
+        // TAG of ADMIT or REMOVE; their message is built after the loop.
+        let treeTag = 0n
+        // True once PAYLEAF, ADMIT or REMOVE replaced the leaf; the new
+        // leaf hash and root are computed after the loop only then.
         let leafChanged = false
         // True once ATTESTM ran; its key-to-leaf check runs after the loop.
         let memberKeyCheck = false
@@ -1065,6 +1094,38 @@ export class K17Machine extends SmartContract {
                                 memberLastRound = top
                                 ds = ds2
                             }
+                        } else if (op == 40n) {
+                            // ADMIT : TAG ROUND --
+                            // Underflow or a second tree instruction this
+                            // cycle: fault. A second signature: tx invalid.
+                            // The leaf, proof, keys, payout and signature
+                            // are checked after the loop (tx invalid when
+                            // wrong).
+                            if (n < 8n || treeOp != 0n) {
+                                halted = true
+                            } else {
+                                assert(!sigUsed, 'one attestation per cycle')
+                                sigUsed = true
+                                treeOp = 2n
+                                treeTag = second
+                                memberLastRound = top
+                                ds = ds2
+                            }
+                        } else if (op == 41n) {
+                            // REMOVE : TAG --
+                            // Underflow or a second tree instruction this
+                            // cycle: fault. A second signature: tx invalid.
+                            // The leaf, proof, key and signature are checked
+                            // after the loop (tx invalid when wrong).
+                            if (n < 4n || treeOp != 0n) {
+                                halted = true
+                            } else {
+                                assert(!sigUsed, 'one attestation per cycle')
+                                sigUsed = true
+                                treeOp = 3n
+                                treeTag = top
+                                ds = ds1
+                            }
                         } else if (op == 42n) {
                             // OUTH : N1 --   logHash := sha256(logHash || cell(N1))
                             // Underflow: fault. No capacity limit.
@@ -1075,8 +1136,7 @@ export class K17Machine extends SmartContract {
                                 ds = ds1
                             }
                         } else {
-                            // unknown opcode (ADMIT 0x28 and REMOVE 0x29
-                            // are not on chain yet: Task 7)
+                            // unknown opcode
                             halted = true
                         }
 
@@ -1088,17 +1148,11 @@ export class K17Machine extends SmartContract {
             }
         }
 
-        // ---- the cycle's one signature --------------------------------
-        if (verifyNeeded) {
-            assert(
-                RabinVerifier.verifySig(verifyMsg, sig, verifyKey),
-                'signature check failed'
-            )
-        }
-
         // ---- the cycle's one roster-tree proof -----------------------
         // Checked whenever a tree instruction ran, halted or not: the VM
         // refuses a bad proof at the instruction, before any later fault.
+        // rosterSeq is written to the next state only on the alive path.
+        let rosterSeq = this.rosterSeq
         if (treeOp != 0n) {
             assert(
                 leafIndex >= 0n && leafIndex < K17Machine.TREE_LEAVES,
@@ -1124,24 +1178,93 @@ export class K17Machine extends SmartContract {
                     'key is not the member key'
                 )
             }
-            // Task 7 hook: ADMIT (treeOp 2) and REMOVE (treeOp 3) also
-            // change the leaf (their own new leaf hash) and bump rosterSeq
-            // here.
-            if (leafChanged) {
+            // New leaf hash when the leaf changes; REMOVE keeps the empty
+            // leaf hash.
+            let newLeafHash = K17Machine.EMPTY_HASHES[0]
+            if (treeOp == 1n) {
                 // PAYLEAF: the leaf keeps keyHash, payout and flags;
                 // lastRound becomes ROUND (memberLastRound after PAYLEAF).
-                const newLeafHash = sha256(
+                // Unused when leafChanged is false.
+                newLeafHash = sha256(
                     K17Machine.LEAF_DOMAIN +
                         slice(leafPre, 0n, 52n) +
                         K17Machine.cell(memberLastRound) +
                         slice(leafPre, 56n, 60n)
                 )
+            } else {
+                // ADMIT or REMOVE: the signer is the sponsor.
+                assert(
+                    len(keyA) == K17Machine.KEY_BYTES,
+                    'key must be 384 bytes'
+                )
+                assert(
+                    sha256(keyA) == this.sponsorKeyHash,
+                    'key is not the sponsor key'
+                )
+                // "K17D" or "K17X" || instanceId || cell(TAG) ||
+                // cell(rosterSeq) || cell(leafIndex) || (the rest below)
+                const msgHead =
+                    this.instanceId +
+                    K17Machine.cell(treeTag) +
+                    K17Machine.cell(this.rosterSeq) +
+                    K17Machine.cell(leafIndex)
+                if (treeOp == 2n) {
+                    // ADMIT: the leaf must be empty (the old-root check
+                    // above used the empty leaf hash for it).
+                    assert(len(leafPre) == 0n, 'leaf must be empty')
+                    assert(
+                        len(payout) == K17Machine.PAYOUT_BYTES,
+                        'payout must be 20 bytes'
+                    )
+                    assert(
+                        len(keyB) == K17Machine.KEY_BYTES,
+                        'new key must be 384 bytes'
+                    )
+                    const newKeyHash = sha256(keyB)
+                    // ... || sha256(keyB) || payout
+                    verifyMsg =
+                        K17Machine.ADMIT_DOMAIN + msgHead + newKeyHash + payout
+                    // New leaf: keyHash || payout || cell(ROUND) || cell(0)
+                    newLeafHash = sha256(
+                        K17Machine.LEAF_DOMAIN +
+                            newKeyHash +
+                            payout +
+                            K17Machine.cell(memberLastRound) +
+                            K17Machine.cell(0n)
+                    )
+                } else {
+                    // REMOVE: the leaf must be occupied.
+                    assert(
+                        len(leafPre) == K17Machine.LEAF_PRE_BYTES,
+                        'leaf preimage must be 60 bytes'
+                    )
+                    // ... || sha256("K17L" || leafPre)
+                    verifyMsg =
+                        K17Machine.REMOVE_DOMAIN +
+                        msgHead +
+                        sha256(K17Machine.LEAF_DOMAIN + leafPre)
+                }
+                verifyNeeded = true
+                verifyKey = Utils.fromLEUnsigned(keyA)
+                leafChanged = true
+                rosterSeq = this.rosterSeq + 1n
+            }
+            if (leafChanged) {
                 this.rosterRoot = K17Machine.treeRoot(
                     newLeafHash,
                     proof,
                     leafIndex
                 )
             }
+        }
+
+        // ---- the cycle's one signature --------------------------------
+        // After the tree block, which builds the ADMIT and REMOVE message.
+        if (verifyNeeded) {
+            assert(
+                RabinVerifier.verifySig(verifyMsg, sig, verifyKey),
+                'signature check failed'
+            )
         }
 
         // ---- anti output-sharing ------------------------------------
@@ -1213,6 +1336,7 @@ export class K17Machine extends SmartContract {
             this.outLog = outLog
             this.lastTime = now
             this.logHash = logHash
+            this.rosterSeq = rosterSeq
             outputs = this.buildStateOutput(remaining)
         }
         if (reward > 0n) {

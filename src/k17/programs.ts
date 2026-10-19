@@ -224,3 +224,40 @@ export function enrolAndAttestProgram(
         'LIT', bounty, 'LIT', 1, 'PAYSLOT', 'HALT',
     ])
 }
+
+/**
+ * Tree-consortium smoke program for the Merkle roster (v3 machine).
+ *
+ * The machine is deployed with the sponsor's key hash (`sponsorKeyHash`)
+ * and a roster tree root. Cycle 1 lets the sponsor admit a new member into
+ * the empty leaf that the cycle's proof names (the proof, not the program,
+ * selects the index). The new leaf gets lastRound := TIME of cycle 1.
+ * Cycle 2 binds that member with MEMBER, logs its lastRound with OUT, reads
+ * one witness cell (the reading), requires the member's ATTESTM signature
+ * over (tagT, reading), folds the reading into logHash with OUTH, pays
+ * `bounty` sats to the member with ROUND := TIME of cycle 2, and halts.
+ * PAYLEAF refuses a ROUND that is not above lastRound, so cycle 2 must have
+ * a later nLockTime than cycle 1. ROUND comes from TIME, never from IN.
+ * Cycle 1 runs 4 instructions and cycle 2 runs 15, both below K = 40.
+ *
+ * Forth-style listing:
+ *   cycle 1:  tagD TIME ADMIT YIELD
+ *   cycle 2:  MEMBER DROP LASTROUND OUT tagT IN DUP >R ATTESTM R> OUTH
+ *             bounty TIME PAYLEAF HALT
+ *
+ * Input: admission tag, attestation tag, bounty in sats.
+ * Output: program hex.
+ */
+export function treeConsortiumSmokeProgram(
+    tagD: number,
+    tagT: number,
+    bounty: number
+): string {
+    // prettier-ignore
+    return assemble([
+        'LIT', tagD, 'TIME', 'ADMIT', 'YIELD',
+        'MEMBER', 'DROP', 'LASTROUND', 'OUT',
+        'LIT', tagT, 'IN', 'DUP', '>R', 'ATTESTM', 'R>', 'OUTH',
+        'LIT', bounty, 'TIME', 'PAYLEAF', 'HALT',
+    ])
+}

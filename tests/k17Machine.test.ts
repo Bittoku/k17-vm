@@ -40,6 +40,7 @@ import {
     twoStageJobProgram,
     attestProgram,
     enrolAndAttestProgram,
+    treeConsortiumSmokeProgram,
 } from '../src/k17/programs'
 import {
     addrOf,
@@ -53,7 +54,12 @@ import {
     CycleOverrides,
     CycleTree,
 } from '../src/keeper'
-import { EMPTY_HASHES, SparseMerkleTree, encodeLeafPre } from '../src/k17/smt'
+import {
+    EMPTY_HASHES,
+    SparseMerkleTree,
+    encodeLeafPre,
+    leafHashOf,
+} from '../src/k17/smt'
 import {
     NO_SIG,
     newAttester,
@@ -64,6 +70,9 @@ import {
     pubKeyBytes,
     signEndorsement,
     signMemberReading,
+    signAdmission,
+    signRemoval,
+    Attester,
 } from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
 use(chaiAsPromised)
@@ -355,10 +364,24 @@ describe('K17Machine on-chain', function () {
         ).to.equal(beneficiaryAddress.toString())
     })
 
-    /** Every opcode value of the ISA. */
-    const ALL_OPS = Object.values(Op).filter(
-        (v) => typeof v === 'number'
-    ) as number[]
+    /**
+     * Every opcode value of the ISA except MEMBER, ATTESTM, PAYLEAF, ADMIT
+     * and REMOVE. Each of those needs witness data (a tree proof, a key or
+     * a signature), so a random program would always stall at it as
+     * need_witness or verify_failed, and no cycle could be built. OUTH and
+     * LASTROUND stay in: LASTROUND without a bound member is a fault, and
+     * the fuzz must show that this is a clean halt and refund on chain.
+     */
+    const ALL_OPS = (
+        Object.values(Op).filter((v) => typeof v === 'number') as number[]
+    ).filter(
+        (v) =>
+            v !== Op.MEMBER &&
+            v !== Op.ATTESTM &&
+            v !== Op.PAYLEAF &&
+            v !== Op.ADMIT &&
+            v !== Op.REMOVE
+    )
 
     /**
      * Differential fuzz: deploy 12 random 24-instruction programs over `ops`
@@ -2125,5 +2148,652 @@ describe('K17Machine on-chain', function () {
         // so the refusals above come from the round check.
         const honestTx = await buildStepTx(n1, plan6, t2, encodeCell(6n))
         expect(honestTx.verifyInputScript(0).success).to.equal(true)
+    })
+
+    // ------------------------------------------------------------------
+    // v3 machine: ADMIT and REMOVE
+    // ------------------------------------------------------------------
+
+    /** Empty leaf (in twoMemberTree too) that the tests admit members into. */
+    const ADMIT_INDEX = 3
+    /** Tags of the REMOVE message and of the smoke program's ATTESTM reading. */
+    const TAG_X = 55
+    const TAG_T = 66
+    /** Sats the smoke program pays the admitted member in cycle 2. */
+    const SMOKE_BOUNTY = 4000
+
+    /**
+     * True when two signatures can be swapped with tamperPush: both
+     * paddings are non-empty and the paddings and s values differ.
+     * Input: two signatures. Output: boolean.
+     */
+    const swappable = (a: RabinSig, b: RabinSig): boolean =>
+        a.padding !== '' &&
+        b.padding !== '' &&
+        a.padding !== b.padding &&
+        a.s !== b.s
+
+    /**
+     * Sponsor-style admission signature for member A's key (or `newKey`)
+     * with member A's payout, on the TEST_ID instance.
+     * Input: signer, rosterSeq to sign, leaf index, new member key, tag.
+     * Output: the Rabin signature over admitMessage.
+     */
+    const admissionSig = (
+        signer: Attester,
+        seq: bigint,
+        index: number,
+        newKey: bigint,
+        tag: number
+    ): RabinSig =>
+        signAdmission(
+            signer,
+            TEST_ID,
+            BigInt(tag),
+            seq,
+            BigInt(index),
+            newKey,
+            payoutOf(memberAAddress)
+        )
+
+    /**
+     * ADMIT tag for these tests: the first tag from 1000 up for which the
+     * signatures the tamper tests swap (sponsor at seq 0 against seq 1,
+     * seq 0 against seq 2, and sponsor against attesterB at seq 0) all
+     * have distinct, non-empty paddings, so each push is unique.
+     */
+    const TAG_D = (() => {
+        for (let tag = 1000; ; tag++) {
+            const sig = (signer: Attester, seq: bigint) =>
+                admissionSig(signer, seq, ADMIT_INDEX, attesterA.pub, tag)
+            const s0 = sig(sponsor, 0n)
+            if (
+                swappable(s0, sig(sponsor, 1n)) &&
+                swappable(s0, sig(sponsor, 2n)) &&
+                swappable(s0, sig(attesterB, 0n))
+            ) {
+                return tag
+            }
+        }
+    })()
+
+    /**
+     * Leaf preimage of a member admitted at ADMIT_INDEX: `key`'s hash,
+     * member A's payout, lastRound `round`, flags 0.
+     * Input: admission round, optional key (default attesterA's).
+     * Output: 120 hex chars.
+     */
+    const admittedLeaf = (round: bigint, key: bigint = attesterA.pub) =>
+        encodeLeafPre(keyHash(key), payoutOf(memberAAddress), round)
+
+    /**
+     * Keys of an admission cycle: `signer` signs (keyA), `newKey` joins
+     * (keyB) with member A's payout.
+     * Input: signer, new member key. Output: CycleKeys.
+     */
+    const admitKeys = (signer: Attester, newKey: bigint): CycleKeys => ({
+        attestKey: signer.pub,
+        endorseKey: newKey,
+        payoutHex: payoutOf(memberAAddress),
+    })
+
+    /**
+     * Run one cycle of a program whose next instructions admit member A
+     * (or `newKey`) at ADMIT_INDEX (or `index`) with its proof from `tree`.
+     * Input: machine, value, lock time, tree, options: index, new key,
+     * signer (default the sponsor), signature to present (default the
+     * signer's signature for the machine's rosterSeq), witness cells.
+     * Output: the cycle result.
+     */
+    function admitCycle(
+        m: K17Machine,
+        value: bigint,
+        lockTime: bigint,
+        tree: SparseMerkleTree,
+        opts: {
+            index?: number
+            newKey?: bigint
+            signer?: Attester
+            sig?: RabinSig
+            witness?: bigint[]
+        } = {}
+    ): Promise<CycleResult> {
+        const index = opts.index ?? ADMIT_INDEX
+        const signer = opts.signer ?? sponsor
+        const newKey = opts.newKey ?? attesterA.pub
+        return cycle(
+            m,
+            value,
+            lockTime,
+            keeperA,
+            {},
+            opts.witness ?? [],
+            opts.sig ?? admissionSig(signer, m.rosterSeq, index, newKey, TAG_D),
+            admitKeys(signer, newKey),
+            tree.proof(index)
+        )
+    }
+
+    /**
+     * Program for the replay test: witness 1 runs `TAG_D TIME ADMIT`,
+     * witness 0 runs `TAG_X REMOVE`; each ends the cycle and loops back.
+     */
+    const ADMIN_PROG = (): string =>
+        assemble([
+            'IN',
+            'IF',
+            'remove',
+            'LIT',
+            TAG_D,
+            'TIME',
+            'ADMIT',
+            'YIELD',
+            'LIT',
+            0,
+            'IF',
+            0,
+            'remove:',
+            'LIT',
+            TAG_X,
+            'REMOVE',
+            'YIELD',
+            'LIT',
+            0,
+            'IF',
+            0,
+        ])
+
+    /** Smoke program with the tags and bounty of these tests. */
+    const SMOKE_PROG = (): string =>
+        treeConsortiumSmokeProgram(TAG_D, TAG_T, SMOKE_BOUNTY)
+
+    it('tree smoke: the sponsor admits a member into an empty index; it attests and is paid next cycle', async () => {
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(SMOKE_PROG(), tree)
+        expect(m.rosterSeq).to.equal(0n)
+
+        // cycle 1: ADMIT at ADMIT_INDEX with lastRound := TIME
+        const t1 = T0 + 1n
+        const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree)
+        expect(r1.plan.halted).to.be.false
+        expect(r1.plan.treeOp).to.equal('admit')
+        expect(r1.plan.payslot).to.be.undefined
+        tree.set(ADMIT_INDEX, admittedLeaf(t1))
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(1n)
+
+        // cycle 2: the member attests a reading and is paid. The whole
+        // cycle-2 sequence must run inside one cycle of K instructions,
+        // which the halt in this one cycle shows.
+        const reading = 777n
+        const r2 = await cycle(
+            n1,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperA,
+            {},
+            [reading],
+            signMemberReading(attesterA, n1.instanceId, BigInt(TAG_T), reading),
+            { attestKey: attesterA.pub },
+            tree.proof(ADMIT_INDEX)
+        )
+        expect(r2.plan.halted).to.be.true
+        expect(outputLog(r2.plan.nextState)).to.deep.equal([t1])
+        expect(r2.plan.nextState.logHash).to.equal(
+            sha256Hex('00'.repeat(32) + encodeCell(reading))
+        )
+        expect(addressOf(r2.tx.outputs[0])).to.equal(
+            beneficiaryAddress.toString()
+        )
+        expect(addressOf(r2.tx.outputs[1])).to.equal(keeperA.toString())
+        expect(addressOf(r2.tx.outputs[2])).to.equal(memberAAddress.toString())
+        expect(r2.tx.outputs[2].satoshis).to.equal(SMOKE_BOUNTY)
+    })
+
+    it('a member admitted in round r cannot be paid in r, only in r + 1 (Review Focus 3)', async () => {
+        // The smoke program (ROUND from TIME): the planner refuses cycle 2
+        // at the admission's own nLockTime and accepts it one second later.
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(SMOKE_PROG(), tree)
+        const t1 = T0 + 1n
+        const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree)
+        tree.set(ADMIT_INDEX, admittedLeaf(t1))
+        const n1 = r1.next as K17Machine
+        const payAt = (lockTime: bigint) =>
+            cycle(
+                n1,
+                r1.plan.remaining,
+                lockTime,
+                keeperA,
+                {},
+                [9n],
+                signMemberReading(attesterA, n1.instanceId, BigInt(TAG_T), 9n),
+                { attestKey: attesterA.pub },
+                tree.proof(ADMIT_INDEX)
+            )
+        await expect(payAt(t1)).to.be.rejectedWith(/rejected/)
+        const paid = await payAt(t1 + 1n)
+        expect(addressOf(paid.tx.outputs[2])).to.equal(
+            memberAAddress.toString()
+        )
+
+        // The interpreter: ROUND from the witness only to build the
+        // attack. Admit with ROUND 5, then try to pay with ROUND 5.
+        const prog = assemble([
+            'LIT',
+            TAG_D,
+            'IN',
+            'ADMIT',
+            'YIELD',
+            'MEMBER',
+            'DROP',
+            'LIT',
+            PAY_M,
+            'IN',
+            'PAYLEAF',
+            'YIELD',
+            'HALT',
+        ])
+        const wtree = new SparseMerkleTree()
+        const w = await deployTree(prog, wtree)
+        const w1 = await admitCycle(w, BigInt(FUNDING), T0 + 1n, wtree, {
+            witness: [5n],
+        })
+        wtree.set(ADMIT_INDEX, admittedLeaf(5n))
+        const wn1 = w1.next as K17Machine
+        expect(wn1.rosterRoot).to.equal(wtree.root())
+        const t2 = T0 + 2n
+        const plan6 = planCycle(
+            wn1,
+            w1.plan.remaining,
+            t2,
+            keeperA,
+            [6n],
+            NO_SIG,
+            {},
+            wtree.proof(ADMIT_INDEX)
+        )
+        expect(plan6.halted).to.be.false
+        expect(() =>
+            planCycle(
+                wn1,
+                w1.plan.remaining,
+                t2,
+                keeperA,
+                [5n],
+                NO_SIG,
+                {},
+                wtree.proof(ADMIT_INDEX)
+            )
+        ).to.throw(/rejected/)
+        const round5 = encodeCell(5n)
+        // (a) output of an implementation without the check: member paid,
+        // leaf rewritten with lastRound 5, so rosterRoot unchanged.
+        const wrongNext = (plan6.next as K17Machine).next()
+        wrongNext.rosterRoot = toByteString(wtree.root())
+        expectScriptRefused(
+            await buildStepTx(wn1, plan6, t2, round5, wrongNext)
+        )
+        // (b) output of an implementation that faults instead: halted,
+        // payout dropped, beneficiary refunded.
+        const refundPlan: CyclePlan = {
+            ...plan6,
+            halted: true,
+            next: undefined,
+            payslot: undefined,
+            remaining: w1.plan.remaining - plan6.reward,
+        }
+        expectScriptRefused(await buildStepTx(wn1, refundPlan, t2, round5))
+        // Control: the honest round-6 transaction verifies.
+        const honestTx = await buildStepTx(wn1, plan6, t2, encodeCell(6n))
+        expect(honestTx.verifyInputScript(0).success).to.equal(true)
+    })
+
+    it('a sponsor admission replayed after REMOVE is refused: rosterSeq moved on (Review Focus 2)', async () => {
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(ADMIN_PROG(), tree)
+        const sig0 = admissionSig(
+            sponsor,
+            0n,
+            ADMIT_INDEX,
+            attesterA.pub,
+            TAG_D
+        )
+
+        // cycle 1: admit A (rosterSeq 0 -> 1)
+        const t1 = T0 + 1n
+        const r1 = await admitCycle(m, BigInt(FUNDING), t1, tree, {
+            witness: [1n],
+            sig: sig0,
+        })
+        tree.set(ADMIT_INDEX, admittedLeaf(t1))
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(1n)
+
+        // cycle 2: remove A (rosterSeq 1 -> 2); the tree is empty again
+        const r2 = await cycle(
+            n1,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperA,
+            {},
+            [0n],
+            signRemoval(
+                sponsor,
+                TEST_ID,
+                BigInt(TAG_X),
+                1n,
+                BigInt(ADMIT_INDEX),
+                leafHashOf(admittedLeaf(t1))
+            ),
+            { attestKey: sponsor.pub },
+            tree.proof(ADMIT_INDEX)
+        )
+        expect(r2.plan.treeOp).to.equal('remove')
+        tree.set(ADMIT_INDEX, '')
+        const n2 = r2.next as K17Machine
+        expect(n2.rosterRoot).to.equal(EMPTY_HASHES[16])
+        expect(n2.rosterSeq).to.equal(2n)
+
+        // cycle 3: the original admission is stale by rosterSeq
+        const t3 = T0 + 3n
+        await expect(
+            admitCycle(n2, r2.plan.remaining, t3, tree, {
+                witness: [1n],
+                sig: sig0,
+            })
+        ).to.be.rejectedWith(/rejected/)
+        // A fresh admission for seq 2 verifies; the same transaction with
+        // the seq-0 signature has the same outputs, so only the signature
+        // check can refuse it.
+        const honest = await admitCycle(n2, r2.plan.remaining, t3, tree, {
+            witness: [1n],
+        })
+        expect((honest.next as K17Machine).rosterSeq).to.equal(3n)
+        const sig2 = honest.plan.sig
+        tamperPush(honest.tx, 0, int2ByteString(sig2.s), int2ByteString(sig0.s))
+        tamperPush(honest.tx, 0, sig2.padding, sig0.padding)
+        expectScriptRefused(honest.tx)
+    })
+
+    it('an admission signed for the wrong rosterSeq is refused', async () => {
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(SMOKE_PROG(), tree)
+        const t1 = T0 + 1n
+        const sig1 = admissionSig(
+            sponsor,
+            1n,
+            ADMIT_INDEX,
+            attesterA.pub,
+            TAG_D
+        )
+        await expect(
+            admitCycle(m, BigInt(FUNDING), t1, tree, { sig: sig1 })
+        ).to.be.rejectedWith(/rejected/)
+        const honest = await admitCycle(m, BigInt(FUNDING), t1, tree)
+        const sig0 = honest.plan.sig
+        tamperPush(honest.tx, 0, int2ByteString(sig0.s), int2ByteString(sig1.s))
+        tamperPush(honest.tx, 0, sig0.padding, sig1.padding)
+        expectScriptRefused(honest.tx)
+    })
+
+    it("interpreter refuses an admission whose keyB is swapped for a stranger's key", async () => {
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(SMOKE_PROG(), tree)
+        const t1 = T0 + 1n
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            t1,
+            keeperA,
+            [],
+            admissionSig(sponsor, 0n, ADMIT_INDEX, attesterA.pub, TAG_D),
+            admitKeys(sponsor, attesterA.pub),
+            tree.proof(ADMIT_INDEX)
+        )
+        // Control: the honest transaction verifies.
+        expect(
+            (await buildStepTx(m, plan, t1, '')).verifyInputScript(0).success
+        ).to.equal(true)
+        // (a) keyB swapped in the unlocking script only.
+        const swapped = await buildStepTx(m, plan, t1, '')
+        tamperPush(
+            swapped,
+            0,
+            pubKeyBytes(attesterA.pub),
+            pubKeyBytes(attesterB.pub)
+        )
+        expectScriptRefused(swapped)
+        // (b) keyB swapped and the outputs that a contract without the
+        // signature check would accept: the stranger's leaf in the root.
+        // Only the signature (which covers sha256(keyB)) can refuse it.
+        const strangerTree = new SparseMerkleTree(
+            new Map([[ADMIT_INDEX, admittedLeaf(t1, attesterB.pub)]])
+        )
+        const strangerNext = (plan.next as K17Machine).next()
+        strangerNext.rosterRoot = toByteString(strangerTree.root())
+        strangerNext.rosterSeq = 1n
+        const strangerPlan: CyclePlan = {
+            ...plan,
+            keyBHex: pubKeyBytes(attesterB.pub),
+        }
+        expectScriptRefused(
+            await buildStepTx(m, strangerPlan, t1, '', strangerNext)
+        )
+    })
+
+    it('ADMIT on an occupied index with an empty leafPre and the real siblings is refused', async () => {
+        const tree = new SparseMerkleTree(
+            new Map([[ADMIT_INDEX, admittedLeaf(0n)]])
+        )
+        const m = await deployTree(SMOKE_PROG(), tree)
+        const t1 = T0 + 1n
+        const realPath = tree.proof(ADMIT_INDEX)
+        const sigB = admissionSig(
+            sponsor,
+            0n,
+            ADMIT_INDEX,
+            attesterB.pub,
+            TAG_D
+        )
+        const occupied: CycleTree = {
+            leafPre: '',
+            proof: realPath.proof,
+            leafIndex: BigInt(ADMIT_INDEX),
+        }
+        // the planner refuses it ...
+        await expect(
+            cycle(
+                m,
+                BigInt(FUNDING),
+                t1,
+                keeperA,
+                {},
+                [],
+                sigB,
+                admitKeys(sponsor, attesterB.pub),
+                occupied
+            )
+        ).to.be.rejectedWith(/rejected/)
+        // ... and so does the interpreter. Start from an honest admission
+        // of B at the empty index 5 (same time, same reward), then present
+        // index 3 with an empty leafPre, the real path and a valid sponsor
+        // signature for index 3, with the root a contract without the
+        // old-root check would compute. Only the old-root check can refuse.
+        const plan5 = planCycle(
+            m,
+            BigInt(FUNDING),
+            t1,
+            keeperA,
+            [],
+            admissionSig(sponsor, 0n, 5, attesterB.pub, TAG_D),
+            admitKeys(sponsor, attesterB.pub),
+            tree.proof(5)
+        )
+        expect(
+            (await buildStepTx(m, plan5, t1, '')).verifyInputScript(0).success
+        ).to.equal(true)
+        const overwriteNext = (plan5.next as K17Machine).next()
+        overwriteNext.rosterRoot = toByteString(
+            SparseMerkleTree.rootAfter(
+                admittedLeaf(t1, attesterB.pub),
+                realPath.proof,
+                BigInt(ADMIT_INDEX)
+            )
+        )
+        overwriteNext.rosterSeq = 1n
+        const overwritePlan: CyclePlan = {
+            ...plan5,
+            sig: sigB,
+            leafPre: '',
+            proof: realPath.proof,
+            leafIndex: BigInt(ADMIT_INDEX),
+        }
+        expectScriptRefused(
+            await buildStepTx(m, overwritePlan, t1, '', overwriteNext)
+        )
+    })
+
+    it("REMOVE empties the leaf; the removed member's old proof is then refused", async () => {
+        const prog = assemble([
+            'LIT',
+            TAG_X,
+            'REMOVE',
+            'YIELD',
+            'MEMBER',
+            'DROP',
+            'YIELD',
+            'HALT',
+        ])
+        const tree = twoMemberTree()
+        const m = await deployTree(prog, tree)
+        const staleA = tree.proof(INDEX_A)
+        const r1 = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 1n,
+            keeperA,
+            {},
+            [],
+            signRemoval(
+                sponsor,
+                TEST_ID,
+                BigInt(TAG_X),
+                0n,
+                BigInt(INDEX_A),
+                leafHashOf(leafOf('A', 0n))
+            ),
+            { attestKey: sponsor.pub },
+            staleA
+        )
+        tree.set(INDEX_A, '')
+        const n1 = r1.next as K17Machine
+        expect(n1.rosterRoot).to.equal(tree.root())
+        expect(n1.rosterSeq).to.equal(1n)
+
+        // the planner refuses A's old proof ...
+        await expect(
+            cycle(
+                n1,
+                r1.plan.remaining,
+                T0 + 2n,
+                keeperA,
+                {},
+                [],
+                NO_SIG,
+                {},
+                staleA
+            )
+        ).to.be.rejectedWith(/rejected/)
+        // ... and so does the interpreter: B's honest MEMBER cycle leaves
+        // the root unchanged, so swapping in A's leaf, old path and index
+        // keeps the outputs valid and only the old-root check can refuse.
+        const freshB = tree.proof(INDEX_B)
+        const honest = await cycle(
+            n1,
+            r1.plan.remaining,
+            T0 + 2n,
+            keeperA,
+            {},
+            [],
+            NO_SIG,
+            {},
+            freshB
+        )
+        expect(honest.tx.verifyInputScript(0).success).to.equal(true)
+        tamperPush(honest.tx, 0, freshB.leafPre, staleA.leafPre)
+        tamperPush(honest.tx, 0, freshB.proof, staleA.proof)
+        tamperPush(
+            honest.tx,
+            0,
+            int2ByteString(BigInt(INDEX_B)),
+            int2ByteString(BigInt(INDEX_A))
+        )
+        expectScriptRefused(honest.tx)
+    })
+
+    it('interpreter refuses an admission signed by a key that is not the sponsor', async () => {
+        const tree = new SparseMerkleTree()
+        const m = await deployTree(SMOKE_PROG(), tree)
+        const t1 = T0 + 1n
+        await expect(
+            admitCycle(m, BigInt(FUNDING), t1, tree, { signer: attesterB })
+        ).to.be.rejectedWith(/rejected/)
+        // attesterB's signature over the same message verifies under
+        // attesterB's key, so only sha256(keyA) == sponsorKeyHash refuses.
+        const honest = await admitCycle(m, BigInt(FUNDING), t1, tree)
+        const sigS = honest.plan.sig
+        const sigB = admissionSig(
+            attesterB,
+            0n,
+            ADMIT_INDEX,
+            attesterA.pub,
+            TAG_D
+        )
+        tamperPush(
+            honest.tx,
+            0,
+            pubKeyBytes(sponsor.pub),
+            pubKeyBytes(attesterB.pub)
+        )
+        tamperPush(honest.tx, 0, int2ByteString(sigS.s), int2ByteString(sigB.s))
+        tamperPush(honest.tx, 0, sigS.padding, sigB.padding)
+        expectScriptRefused(honest.tx)
+    })
+
+    it('ADMIT or REMOVE after MEMBER, and on a short stack, fault and refund', async () => {
+        /**
+         * Deploy `program` over twoMemberTree, run one cycle (with member
+         * A's proof when `withProof`), and expect a halt with the balance
+         * paid to the beneficiary. Input: program tokens, flag. Output: none.
+         */
+        const runOnce = async (
+            program: (string | number)[],
+            withProof = false
+        ) => {
+            const tree = twoMemberTree()
+            const m = await deployTree(assemble(program), tree)
+            const r = await cycle(
+                m,
+                BigInt(FUNDING),
+                T0 + 1n,
+                keeperA,
+                {},
+                [],
+                NO_SIG,
+                {},
+                withProof ? tree.proof(INDEX_A) : undefined
+            )
+            expect(r.plan.halted).to.be.true
+            expect(addressOf(r.tx.outputs[0])).to.equal(
+                beneficiaryAddress.toString()
+            )
+        }
+        await runOnce(['MEMBER', 'LIT', 1, 'ADMIT', 'YIELD'], true)
+        await runOnce(['MEMBER', 'REMOVE', 'YIELD'], true)
+        await runOnce(['LIT', 1, 'ADMIT', 'YIELD'])
+        await runOnce(['REMOVE', 'YIELD'])
     })
 })

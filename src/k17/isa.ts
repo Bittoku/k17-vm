@@ -94,6 +94,8 @@
  *       Sponsor-signed deletion of a member; message domain "K17X".
  *   OUTH      (0x2a)  N1 --
  *       logHash := sha256(logHash || cell(N1)). Never faults on capacity.
+ * Programs must derive ROUND (for PAYLEAF and ADMIT) from TIME, never from
+ * IN: a keeper controls IN, but nLockTime only grows.
  *
  * Any violation (stack underflow/overflow, bad address, unknown opcode, PC
  * past the end, output log full) is a FAULT. A fault is treated exactly as
