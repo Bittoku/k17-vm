@@ -194,3 +194,138 @@ export function signEndorsement(
 export function payoutOf(address: bsv.Address): string {
     return address.hashBuffer.toString('hex')
 }
+
+/**
+ * Domain prefix of a member attestation, ASCII "K17T" (tree roster). Kept
+ * apart from the other K17 domains so a signature cannot cross purposes.
+ */
+export const MEMBER_DOMAIN = '4b313754'
+
+/** Domain prefix of an admission message, ASCII "K17D". */
+export const ADMIT_DOMAIN = '4b313744'
+
+/** Domain prefix of a removal message, ASCII "K17X". */
+export const REMOVE_DOMAIN = '4b313758'
+
+/**
+ * Message a tree-roster member signs for a reading.
+ * Input: the machine's 32-byte instance id hex, tag (replay guard), value.
+ * Output: hex of MEMBER_DOMAIN + instanceId + cell(tag) + cell(value).
+ */
+export function memberMessage(
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint
+): string {
+    return MEMBER_DOMAIN + instanceIdHex + encodeCell(tag) + encodeCell(value)
+}
+
+/**
+ * Sign a tree-roster reading.
+ * Input: attester, instance id hex, tag, value.
+ * Output: Rabin signature over memberMessage.
+ */
+export function signMemberReading(
+    attester: Attester,
+    instanceIdHex: string,
+    tag: bigint,
+    value: bigint
+): RabinSig {
+    return toRabinSig(
+        rabin.sign(memberMessage(instanceIdHex, tag, value), attester.priv)
+    )
+}
+
+/**
+ * Message a sponsor signs to admit a new member at a leaf index.
+ * Input: instance id hex, tag (replay guard), seq (admission sequence
+ * number), leaf index, new member's public key, 20-byte payout hex.
+ * Output: hex of ADMIT_DOMAIN + instanceId + cell(tag) + cell(seq) +
+ * cell(leafIndex) + keyHash(newPub) + payout.
+ */
+export function admitMessage(
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string
+): string {
+    return (
+        ADMIT_DOMAIN +
+        instanceIdHex +
+        encodeCell(tag) +
+        encodeCell(seq) +
+        encodeCell(leafIndex) +
+        keyHash(newPub) +
+        payoutHex
+    )
+}
+
+/**
+ * Sign an admission.
+ * Input: sponsor, instance id hex, tag, seq, leaf index, new member's
+ * public key, payout hex.
+ * Output: Rabin signature over admitMessage.
+ */
+export function signAdmission(
+    sponsor: Attester,
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    newPub: RabinPubKey,
+    payoutHex: string
+): RabinSig {
+    return toRabinSig(
+        rabin.sign(
+            admitMessage(instanceIdHex, tag, seq, leafIndex, newPub, payoutHex),
+            sponsor.priv
+        )
+    )
+}
+
+/**
+ * Message a sponsor signs to remove the member at a leaf index.
+ * Input: instance id hex, tag, seq, leaf index, hash of the leaf being
+ * removed (64 hex chars).
+ * Output: hex of REMOVE_DOMAIN + instanceId + cell(tag) + cell(seq) +
+ * cell(leafIndex) + leafHash.
+ */
+export function removeMessage(
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    leafHashHex: string
+): string {
+    return (
+        REMOVE_DOMAIN +
+        instanceIdHex +
+        encodeCell(tag) +
+        encodeCell(seq) +
+        encodeCell(leafIndex) +
+        leafHashHex
+    )
+}
+
+/**
+ * Sign a removal.
+ * Input: sponsor, instance id hex, tag, seq, leaf index, leaf hash hex.
+ * Output: Rabin signature over removeMessage.
+ */
+export function signRemoval(
+    sponsor: Attester,
+    instanceIdHex: string,
+    tag: bigint,
+    seq: bigint,
+    leafIndex: bigint,
+    leafHashHex: string
+): RabinSig {
+    return toRabinSig(
+        rabin.sign(
+            removeMessage(instanceIdHex, tag, seq, leafIndex, leafHashHex),
+            sponsor.priv
+        )
+    )
+}
