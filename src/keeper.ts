@@ -65,8 +65,8 @@ import {
     stepK,
     whoOf,
 } from './k17/vm'
-import { MEM_CELLS, CELL, encodeCell } from './k17/isa'
-import { NO_SIG, pubKeyBytes } from './k17/attest'
+import { MEM_CELLS, CELL, Op, encodeCell } from './k17/isa'
+import { NO_SIG, canonicalSig, pubKeyBytes } from './k17/attest'
 
 /** Economic parameters fixed at deployment. */
 export interface Economics {
@@ -292,19 +292,23 @@ export interface CyclePlan {
     reward: bigint
     /** Bounty portion of `reward` released by BOUNTY instructions. */
     bounty: bigint
-    /** Witness cells for the unlocking script (hex). */
+    /** Witness cells for the unlocking script (hex): only the cells IN consumed. */
     witnessHex: string
-    /** Attestation signature for the unlocking script (NO_SIG when none). */
+    /**
+     * Signature for the unlocking script: NO_SIG when no signature
+     * instruction ran, else the given signature in canonical form
+     * (canonicalSig, 0 < s < n/2).
+     */
     sig: RabinSig
-    /** `keyA` argument of `step`: pubKeyBytes(attestKey) or '' (hex). */
+    /** `keyA` argument of `step`: pubKeyBytes(attestKey) when ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE ran, else '' (hex). */
     keyAHex: string
-    /** `keyB` argument of `step`: pubKeyBytes(endorseKey) or '' (hex). */
+    /** `keyB` argument of `step`: pubKeyBytes(endorseKey) when ENDORSE or ADMIT ran, else '' (hex). */
     keyBHex: string
-    /** `payout` argument of `step`: the ENDORSE payout or '' (hex). */
+    /** `payout` argument of `step`: the ENDORSE or ADMIT payout when one ran, else '' (hex). */
     payoutHex: string
-    /** `leafPre` argument of `step`: the tree leaf preimage or '' (hex). */
+    /** `leafPre` argument of `step`: the tree leaf preimage when a tree instruction ran, else '' (hex). */
     leafPre: string
-    /** `proof` argument of `step`: the 16-sibling tree proof or '' (hex). */
+    /** `proof` argument of `step`: the 16-sibling tree proof when a tree instruction ran, else '' (hex). */
     proof: string
     /** `leafIndex` argument of `step` (a bigint, not a cell); 0 when unused. */
     leafIndex: bigint
@@ -343,6 +347,12 @@ export interface CyclePlan {
  * N > value - 1 is a fault, as on chain: the plan is halted and carries no
  * payslot. The VM gets the instance's deadMan and lastTime, so a due
  * dead-man gives a halted plan with `deadManHalt` set (v3.1).
+ * Canonical arguments (v3.1): the plan carries only the unlocking
+ * arguments the cycle used (consumed witness cells; keys, payout, tree
+ * proof and signature only for the instructions that read them; '' and 0
+ * otherwise) and the signature in canonical form, because the contract
+ * refuses any other unlocking script. Extra inputs are dropped, not an
+ * error.
  * Errors, in the order they are checked: 'lockTime before lastTime'
  * (before the VM runs); then the VM's 'needs a witness' or 'witness
  * rejected'; then the MIN_STEP error for a cycle that stays alive with a
@@ -432,7 +442,20 @@ export function planCycle(
         payslot?.sats ?? 0n
     )
     const remaining = value - reward - (payslot?.sats ?? 0n)
-    const witnessHex = witness.map((w) => encodeCell(w)).join('')
+    // Canonical unlocking arguments (v3.1): the contract refuses any
+    // argument the cycle did not use, so send only what ran. The witness is
+    // the cells IN consumed; keyA only for a signature instruction other
+    // than SIGVERIFY; keyB and payout only for ENDORSE and ADMIT; the tree
+    // proof only when a tree instruction ran; the signature only when one
+    // was used, with s in its canonical form (0 < s < n/2).
+    const sigOp = outcome.sigOp
+    const keyAUsed = sigOp !== undefined && sigOp !== Op.SIGVERIFY
+    const keyBUsed = sigOp === Op.ENDORSE || sigOp === Op.ADMIT
+    const treeUsed = outcome.treeOp !== 'none'
+    const witnessHex = witness
+        .slice(0, outcome.witnessUsed)
+        .map((w) => encodeCell(w))
+        .join('')
     const common = {
         deadManHalt,
         reward,
@@ -440,15 +463,22 @@ export function planCycle(
         nextState,
         remaining,
         witnessHex,
-        sig,
+        sig:
+            sigOp === undefined || outcome.sigKey === undefined
+                ? NO_SIG
+                : canonicalSig(sig, outcome.sigKey),
         keyAHex:
-            keys.attestKey === undefined ? '' : pubKeyBytes(keys.attestKey),
+            keyAUsed && keys.attestKey !== undefined
+                ? pubKeyBytes(keys.attestKey)
+                : '',
         keyBHex:
-            keys.endorseKey === undefined ? '' : pubKeyBytes(keys.endorseKey),
-        payoutHex: keys.payoutHex ?? '',
-        leafPre: treeArg?.leafPre ?? '',
-        proof: treeArg?.proof ?? '',
-        leafIndex: treeArg?.leafIndex ?? 0n,
+            keyBUsed && keys.endorseKey !== undefined
+                ? pubKeyBytes(keys.endorseKey)
+                : '',
+        payoutHex: keyBUsed ? keys.payoutHex ?? '' : '',
+        leafPre: treeUsed ? treeArg?.leafPre ?? '' : '',
+        proof: treeUsed ? treeArg?.proof ?? '' : '',
+        leafIndex: treeUsed ? treeArg?.leafIndex ?? 0n : 0n,
         treeOp: outcome.treeOp,
         payslot,
     }

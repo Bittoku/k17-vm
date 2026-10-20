@@ -43,7 +43,18 @@ publication belong in this repo.
   sponsor key for `ADMIT` and `REMOVE`; `keyB` the new member's key, `payout` the new member's
   20-byte payout hash (`ENDORSE`, `ADMIT`). `leafPre`, `proof` and `leafIndex` are the cycle's
   one tree proof (60-byte leaf preimage, or empty for `ADMIT`; 512 bytes of siblings, level 0
-  first; index in `[0, 65536)`). Pass empty byte strings and 0 when unused.
+  first; index in `[0, 65536)`). Pass empty byte strings and 0 when unused: this is required
+  (v3.1 canonical unlocking script). After the loop the contract asserts that unused arguments
+  are empty or 0 (tree arguments when `treeOp == 0`; `sigS`, `sigPad`, `keyA`, `keyB`,
+  `payout` when no signature was recorded; `keyA` for a `SIGVERIFY` signature; `keyB`/`payout`
+  unless the message domain is `K17E` or `K17D`), that `wi == len(witness)` (alive and halted
+  paths), and that a verified signature has `0 < sigS < n/2`. Reason: nobody signs the
+  unlocking script, so a free argument lets a relayer change the txid and orphan chained
+  unconfirmed cycles. `planCycle` emits only used arguments (it reads `CycleOutcome.sigOp`,
+  `sigKey`, `treeOp`, `witnessUsed` from `stepK`) and normalises the signature;
+  `canonicalSig` in `src/k17/attest.ts` wraps every `sign*` helper. The VM reports
+  `treeOp: 'member'` for a `MEMBER` that faults on a full data stack, because the contract
+  still checks that proof.
 - Tree roster (v3 machine): state `sponsorKeyHash` (immutable), `rosterRoot`, `rosterSeq`,
   `logHash`. Handlers in the unrolled loop only record (`treeOp`, the ADMIT/REMOVE operand cells, flags); the proof,
   the `ADMIT`/`REMOVE` keys and message, and the new root are checked and built once after the
@@ -96,7 +107,7 @@ DEAD_MAN_FLOOR` (6 h, exported from `src/keeper.ts`) unless `econ.allowShortDead
 - `planCycle` error order: `lockTime before lastTime` (before the VM), then the VM's
   `needs a witness` / `witness rejected`, then the MIN_STEP error.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (469 918 bytes at K=40). A cycle that
+  12 KB per instruction with the current 43 handlers (470 098 bytes at K=40). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile

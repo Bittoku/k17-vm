@@ -27,6 +27,26 @@ export const RABIN_SECURITY_LEVEL = 6
 
 const rabin = new Rabin(RABIN_SECURITY_LEVEL)
 
+/**
+ * Put a Rabin signature in its canonical form (v3.1).
+ * Purpose: the verifier checks s^2 mod n, so s, n - s, -s and s + k*n all
+ * verify the same message. Nobody signs the unlocking script, so a relayer
+ * could swap one form for another and change the txid; the contract
+ * therefore accepts only 0 < s < n/2. Every sign* helper here returns that
+ * form, and planCycle normalises any signature it is given.
+ * Input: a signature (any representative of s) and the public modulus n it
+ * verifies under. Output: the same signature with s replaced by
+ * min(s mod n, n - s mod n); the padding is unchanged. NO_SIG (s = 0) is
+ * returned unchanged. Throws when n is not positive.
+ */
+export function canonicalSig(sig: RabinSig, pub: RabinPubKey): RabinSig {
+    if (pub <= 0n) throw new Error('Rabin public key must be positive')
+    if (sig.s === 0n) return sig
+    const reduced = ((sig.s % pub) + pub) % pub
+    const s = 2n * reduced < pub ? reduced : pub - reduced
+    return { s, padding: sig.padding }
+}
+
 /** Private key plus its public modulus. */
 export interface Attester {
     priv: RabinPrivateKey
@@ -54,7 +74,10 @@ export function signReading(
     tag: bigint,
     value: bigint
 ): RabinSig {
-    return toRabinSig(rabin.sign(attestMessage(tag, value), attester.priv))
+    return canonicalSig(
+        toRabinSig(rabin.sign(attestMessage(tag, value), attester.priv)),
+        attester.pub
+    )
 }
 
 /**
@@ -90,8 +113,14 @@ export function signReadingFor(
     tag: bigint,
     value: bigint
 ): RabinSig {
-    return toRabinSig(
-        rabin.sign(attestMessageFor(instanceIdHex, tag, value), attester.priv)
+    return canonicalSig(
+        toRabinSig(
+            rabin.sign(
+                attestMessageFor(instanceIdHex, tag, value),
+                attester.priv
+            )
+        ),
+        attester.pub
     )
 }
 
@@ -179,11 +208,14 @@ export function signEndorsement(
     payoutHex: string,
     newSlot: bigint
 ): RabinSig {
-    return toRabinSig(
-        rabin.sign(
-            endorseMessage(instanceIdHex, tag, newPub, payoutHex, newSlot),
-            endorser.priv
-        )
+    return canonicalSig(
+        toRabinSig(
+            rabin.sign(
+                endorseMessage(instanceIdHex, tag, newPub, payoutHex, newSlot),
+                endorser.priv
+            )
+        ),
+        endorser.pub
     )
 }
 
@@ -231,8 +263,11 @@ export function signMemberReading(
     tag: bigint,
     value: bigint
 ): RabinSig {
-    return toRabinSig(
-        rabin.sign(memberMessage(instanceIdHex, tag, value), attester.priv)
+    return canonicalSig(
+        toRabinSig(
+            rabin.sign(memberMessage(instanceIdHex, tag, value), attester.priv)
+        ),
+        attester.pub
     )
 }
 
@@ -277,11 +312,21 @@ export function signAdmission(
     newPub: RabinPubKey,
     payoutHex: string
 ): RabinSig {
-    return toRabinSig(
-        rabin.sign(
-            admitMessage(instanceIdHex, tag, seq, leafIndex, newPub, payoutHex),
-            sponsor.priv
-        )
+    return canonicalSig(
+        toRabinSig(
+            rabin.sign(
+                admitMessage(
+                    instanceIdHex,
+                    tag,
+                    seq,
+                    leafIndex,
+                    newPub,
+                    payoutHex
+                ),
+                sponsor.priv
+            )
+        ),
+        sponsor.pub
     )
 }
 
@@ -340,17 +385,20 @@ export function signRemoval(
     keyHashHex: string,
     payoutHex: string
 ): RabinSig {
-    return toRabinSig(
-        rabin.sign(
-            removeMessage(
-                instanceIdHex,
-                tag,
-                seq,
-                leafIndex,
-                keyHashHex,
-                payoutHex
-            ),
-            sponsor.priv
-        )
+    return canonicalSig(
+        toRabinSig(
+            rabin.sign(
+                removeMessage(
+                    instanceIdHex,
+                    tag,
+                    seq,
+                    leafIndex,
+                    keyHashHex,
+                    payoutHex
+                ),
+                sponsor.priv
+            )
+        ),
+        sponsor.pub
     )
 }

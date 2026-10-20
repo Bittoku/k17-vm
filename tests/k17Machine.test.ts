@@ -73,6 +73,7 @@ import {
     signMemberReading,
     signAdmission,
     signRemoval,
+    canonicalSig,
     Attester,
 } from '../src/k17/attest'
 import { getDefaultSigner, randomPrivateKey } from './utils/txHelper'
@@ -3930,5 +3931,272 @@ describe('K17Machine on-chain', function () {
         )
         expect(r2.plan.halted).to.be.true
         expectFaultRefund(r2, r1.plan.remaining)
+    })
+    // ------------------------------------------------------------------
+    // v3.1: canonical unlocking script
+    // ------------------------------------------------------------------
+
+    /**
+     * Every way a relayer could rewrite an unused argument of `step`: each
+     * entry is a plan change that puts a non-empty value into one argument.
+     * Input: none. Output: [name, change] pairs; a change maps a plan to the
+     * tampered plan. The witness entry is handled by the caller (it is a
+     * buildStepTx argument, not a plan field).
+     */
+    const UNUSED_TAMPERS: [string, (p: CyclePlan) => CyclePlan][] = [
+        ['leafPre', (p) => ({ ...p, leafPre: '00'.repeat(60) })],
+        ['proof', (p) => ({ ...p, proof: '00'.repeat(512) })],
+        ['leafIndex', (p) => ({ ...p, leafIndex: 1n })],
+        ['keyA', (p) => ({ ...p, keyAHex: pubKeyBytes(sponsor.pub) })],
+        ['sigS', (p) => ({ ...p, sig: { s: 1n, padding: p.sig.padding } })],
+        ['sigPad', (p) => ({ ...p, sig: { s: p.sig.s, padding: '00' } })],
+        ['keyB', (p) => ({ ...p, keyBHex: pubKeyBytes(landowner.pub) })],
+        ['payout', (p) => ({ ...p, payoutHex: '11'.repeat(20) })],
+    ]
+
+    /**
+     * Check that the honest plan verifies and that each named tamper (and,
+     * when `extraWitness` is set, one extra witness cell) is refused.
+     * Input: machine, honest plan, lock time, honest witness hex, names of
+     * the UNUSED_TAMPERS entries to try, whether to try an extra cell.
+     * Output: none (assertions).
+     */
+    async function expectCanonical(
+        m: K17Machine,
+        plan: CyclePlan,
+        lockTime: bigint,
+        witnessHex: string,
+        names: string[],
+        extraWitness = true
+    ): Promise<void> {
+        const honest = await buildStepTx(m, plan, lockTime, witnessHex)
+        expect(honest.verifyInputScript(0).success, 'honest').to.equal(true)
+        for (const [name, change] of UNUSED_TAMPERS) {
+            if (!names.includes(name)) continue
+            const tx = await buildStepTx(m, change(plan), lockTime, witnessHex)
+            expect(tx.verifyInputScript(0).success, name).to.equal(false)
+        }
+        if (extraWitness) {
+            const tx = await buildStepTx(
+                m,
+                plan,
+                lockTime,
+                witnessHex + encodeCell(7n)
+            )
+            expect(tx.verifyInputScript(0).success, 'witness').to.equal(false)
+        }
+    }
+
+    const ALL_UNUSED = UNUSED_TAMPERS.map(([name]) => name)
+
+    it('v3.1 canonical: a plain live cycle refuses every non-empty unused argument and an extra witness cell', async () => {
+        const m = await deploy(assemble(['LIT', 1, 'DROP', 'YIELD', 'HALT']))
+        const plan = planCycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        expect(plan.halted).to.be.false
+        await expectCanonical(m, plan, T0 + 60n, '', ALL_UNUSED)
+    })
+
+    it('v3.1 canonical: planCycle drops unused witness cells, keys, payout, tree proof and signature', async () => {
+        const m = await deploy(assemble(['IN', 'DROP', 'YIELD', 'HALT']))
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            [4n, 5n, 6n],
+            ATTEST0_SIG(m.instanceId),
+            ENDORSE_KEYS,
+            twoMemberTree().proof(INDEX_A)
+        )
+        expect(plan.witnessHex).to.equal(encodeCell(4n))
+        expect(plan.sig).to.deep.equal(NO_SIG)
+        expect(plan.keyAHex).to.equal('')
+        expect(plan.keyBHex).to.equal('')
+        expect(plan.payoutHex).to.equal('')
+        expect(plan.leafPre).to.equal('')
+        expect(plan.proof).to.equal('')
+        expect(plan.leafIndex).to.equal(0n)
+        await expectCanonical(m, plan, T0 + 60n, plan.witnessHex, ALL_UNUSED)
+    })
+
+    it('v3.1 canonical: a faulting refund (fault after IN) needs exactly the consumed witness and empty unused arguments', async () => {
+        // IN consumes one cell, the two DROPs underflow on the second: fault.
+        const m = await deploy(assemble(['IN', 'DROP', 'DROP', 'HALT']))
+        const plan = planCycle(m, BigInt(FUNDING), T0 + 60n, keeperA, [8n, 9n])
+        expect(plan.halted).to.be.true
+        expect(plan.witnessHex).to.equal(encodeCell(8n))
+        await expectCanonical(m, plan, T0 + 60n, plan.witnessHex, ALL_UNUSED)
+    })
+
+    it('v3.1 canonical: a dead-man refund refuses any non-empty argument', async () => {
+        const m = await deployDeadMan(WAIT_IN, DEAD_MAN)
+        const plan = deadManPlanFor(m)
+        expect(plan.deadManHalt).to.be.true
+        await expectCanonical(m, plan, T0 + DEAD_MAN, '', ALL_UNUSED)
+    })
+
+    it('v3.1 canonical: a SIGVERIFY cycle refuses keyA, keyB, payout and the tree arguments, and s replaced by n - s or s + n', async () => {
+        const m = await deployAttest(1)
+        const r = await cycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        const next = r.next as K17Machine
+        const value = r.plan.remaining
+        const sig = signReading(attesterB, 5n, 2231n)
+        const plan = planCycle(
+            next,
+            value,
+            T0 + 120n,
+            keeperA,
+            [5n, 2231n],
+            sig,
+            // keys the cycle does not read: planCycle drops them
+            { attestKey: attesterB.pub }
+        )
+        expect(plan.keyAHex).to.equal('')
+        expect(plan.sig).to.deep.equal(sig)
+        const witnessHex = encodeCell(5n) + encodeCell(2231n)
+        await expectCanonical(next, plan, T0 + 120n, witnessHex, [
+            'leafPre',
+            'proof',
+            'leafIndex',
+            'keyA',
+            'keyB',
+            'payout',
+        ])
+        const n = attesterB.pub
+        for (const s of [n - sig.s, sig.s + n]) {
+            const tx = await buildStepTx(
+                next,
+                { ...plan, sig: { s, padding: sig.padding } },
+                T0 + 120n,
+                witnessHex
+            )
+            expect(tx.verifyInputScript(0).success).to.equal(false)
+        }
+        // planCycle puts a non-canonical signature back in canonical form.
+        const fromOther = planCycle(
+            next,
+            value,
+            T0 + 120n,
+            keeperA,
+            [5n, 2231n],
+            { s: n - sig.s, padding: sig.padding }
+        )
+        expect(fromOther.sig).to.deep.equal(sig)
+    })
+
+    it('v3.1 canonical: an ATTEST cycle refuses keyB, payout and s replaced by n - s', async () => {
+        const m = await deploy(ATTEST0, FUNDING, SPONSOR_MEM)
+        const sig = ATTEST0_SIG(m.instanceId)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            [],
+            sig,
+            ENDORSE_KEYS
+        )
+        expect(plan.keyAHex).to.equal(pubKeyBytes(sponsor.pub))
+        expect(plan.keyBHex).to.equal('')
+        expect(plan.payoutHex).to.equal('')
+        await expectCanonical(m, plan, T0 + 60n, '', [
+            'leafPre',
+            'proof',
+            'leafIndex',
+            'keyB',
+            'payout',
+        ])
+        const flipped = await buildStepTx(
+            m,
+            { ...plan, sig: { s: sponsor.pub - sig.s, padding: sig.padding } },
+            T0 + 60n,
+            ''
+        )
+        expect(flipped.verifyInputScript(0).success).to.equal(false)
+    })
+
+    it('v3.1 canonical: MEMBER on a full data stack faults and the refund still carries (and needs) the proof', async () => {
+        const fill: (string | number)[] = []
+        for (let i = 0; i < 32; i++) fill.push('LIT', i)
+        const tree = twoMemberTree()
+        const m = await deployTree(assemble([...fill, 'MEMBER', 'HALT']), tree)
+        const r = await cycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        expect(r.plan.halted).to.be.true
+        expect(r.plan.treeOp).to.equal('member')
+        expect(r.plan.proof).to.equal(tree.proof(INDEX_A).proof)
+        const stripped = await buildStepTx(
+            m,
+            { ...r.plan, leafPre: '', proof: '', leafIndex: 0n },
+            T0 + 60n,
+            ''
+        )
+        expect(stripped.verifyInputScript(0).success).to.equal(false)
+    })
+
+    it('v3.1 canonical: every sign* helper returns 0 < s < n/2, and canonicalSig maps n - s back to s', () => {
+        const id = TEST_ID
+        const sigs: [RabinSig, bigint][] = [
+            [signReading(sponsor, 5n, 7n), sponsor.pub],
+            [signReadingFor(sponsor, id, 5n, 7n), sponsor.pub],
+            [
+                signEndorsement(
+                    sponsor,
+                    id,
+                    1n,
+                    landowner.pub,
+                    '11'.repeat(20),
+                    2n
+                ),
+                sponsor.pub,
+            ],
+            [signMemberReading(landowner, id, 5n, 7n), landowner.pub],
+            [
+                signAdmission(
+                    sponsor,
+                    id,
+                    1n,
+                    0n,
+                    3n,
+                    landowner.pub,
+                    '11'.repeat(20)
+                ),
+                sponsor.pub,
+            ],
+            [
+                signRemoval(
+                    sponsor,
+                    id,
+                    1n,
+                    0n,
+                    3n,
+                    'ab'.repeat(32),
+                    '11'.repeat(20)
+                ),
+                sponsor.pub,
+            ],
+        ]
+        for (let tag = 0n; tag < 16n; tag++) {
+            sigs.push([signReading(landowner, tag, tag), landowner.pub])
+        }
+        for (const [sig, n] of sigs) {
+            expect(sig.s > 0n).to.equal(true)
+            expect(2n * sig.s < n).to.equal(true)
+            expect(canonicalSig({ ...sig, s: n - sig.s }, n)).to.deep.equal(sig)
+            expect(
+                canonicalSig({ ...sig, s: sig.s + 3n * n }, n)
+            ).to.deep.equal(sig)
+            expect(canonicalSig({ ...sig, s: -sig.s }, n)).to.deep.equal(sig)
+        }
+        expect(canonicalSig(NO_SIG, sponsor.pub)).to.deep.equal(NO_SIG)
     })
 })

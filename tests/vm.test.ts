@@ -2205,3 +2205,61 @@ describe('K17 v3.1 dead-man halt', function () {
         expect(outputLog(due.state)).to.deep.equal([])
     })
 })
+
+describe('K17 v3.1 canonical unlocking arguments (VM reporting)', () => {
+    const KEY_5 = '11'.repeat(32)
+    const PAYOUT = '33'.repeat(20)
+    const tree = new SparseMerkleTree()
+    tree.set(5, encodeLeafPre(KEY_5, PAYOUT, 7n, 1n))
+
+    it('MEMBER on a full data stack faults but reports treeOp member (the contract still checks the proof)', () => {
+        const fill: (string | number)[] = []
+        for (let i = 0; i < DS_MAX; i++) fill.push('LIT', i)
+        const s = initialState(
+            assemble([...fill, 'MEMBER', 'HALT']),
+            undefined,
+            {
+                rosterRoot: tree.root(),
+            }
+        )
+        const r = stepK(s, { ...envOf(0n), tree: tree.proof(5) }, DS_MAX + 2)
+        expect(r.status).to.equal('halted')
+        expect(r.state.halted).to.equal(true)
+        expect(r.treeOp).to.equal('member')
+    })
+
+    it('stepK reports the signature instruction and its key (sigOp, sigKey)', () => {
+        const attester = newAttester(Buffer.alloc(32, 9))
+        const roster = [0n, attester.pub]
+        // no signature instruction: both undefined
+        const none = stepK(initialState(assemble(['LIT', 1, 'HALT'])), 0n, 4)
+        expect(none.sigOp).to.equal(undefined)
+        expect(none.sigKey).to.equal(undefined)
+        // SIGVERIFY 1: the roster key, not attestKey
+        const r = stepK(
+            initialState(
+                assemble(['LIT', 5, 'LIT', 7, 'SIGVERIFY', 1, 'HALT'])
+            ),
+            {
+                ...envOf(0n),
+                roster,
+                sig: signReading(attester, 5n, 7n),
+                attestKey: 123n,
+            },
+            8
+        )
+        expect(r.status).to.equal('halted')
+        expect(r.sigOp).to.equal(Op.SIGVERIFY)
+        expect(r.sigKey).to.equal(attester.pub)
+        // a SIGVERIFY that faults (empty roster slot) uses no signature
+        const f = stepK(
+            initialState(
+                assemble(['LIT', 5, 'LIT', 7, 'SIGVERIFY', 0, 'HALT'])
+            ),
+            { ...envOf(0n), roster, sig: signReading(attester, 5n, 7n) },
+            8
+        )
+        expect(f.state.halted).to.equal(true)
+        expect(f.sigOp).to.equal(undefined)
+    })
+})

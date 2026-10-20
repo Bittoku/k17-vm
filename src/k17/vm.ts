@@ -915,7 +915,11 @@ export function step(
             ) {
                 return unchanged('verify_failed')
             }
-            if (dsDepth >= DS_MAX) return fault()
+            // A full data stack faults after the proof was checked. The
+            // contract has then already recorded the tree operation (and
+            // checks the proof after its loop), so report 'member': the
+            // keeper must still send the proof (v3.1 canonical arguments).
+            if (dsDepth >= DS_MAX) return { ...fault(), treeOp: 'member' }
             const fields = decodeLeafPre(leafPre)
             nextTreeOp = 'member'
             mb = {
@@ -1187,6 +1191,20 @@ export interface CycleOutcome {
     treeOp: TreeOp
     /** The member MEMBER bound this cycle; undefined when none. */
     member?: BoundMember
+    /**
+     * The opcode of the instruction that used the cycle's one signature
+     * (SIGVERIFY, ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE); undefined when
+     * no signature was used. planCycle reads it to send only the unlocking
+     * arguments that instruction reads (v3.1 canonical arguments).
+     */
+    sigOp?: Op
+    /**
+     * The Rabin public key the signature was verified under: the roster
+     * key named by SIGVERIFY's operand, else env.attestKey. Undefined when
+     * sigOp is undefined. planCycle uses it to put the signature in its
+     * canonical form.
+     */
+    sigKey?: RabinPubKey
 }
 
 /**
@@ -1220,6 +1238,8 @@ export function stepK(
     let ps: PaySlot | undefined
     let treeOp: TreeOp = 'none'
     let member: BoundMember | undefined
+    let sigOp: Op | undefined
+    let sigKey: RabinPubKey | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
         const r = step(cur, e, wi, bounty, su, ps, treeOp, member)
@@ -1232,7 +1252,20 @@ export function stepK(
                 payslot: ps,
                 treeOp,
                 member,
+                sigOp,
+                sigKey,
             }
+        }
+        if (r.sigUsed && !su) {
+            // This instruction used the signature: record which one, and
+            // the key it was verified under.
+            const prog = Buffer.from(cur.prog, 'hex')
+            const pc = Number(cur.pc)
+            sigOp = prog[pc] as Op
+            sigKey =
+                sigOp === Op.SIGVERIFY
+                    ? e.roster?.[prog.readUInt32LE(pc + 1)]
+                    : e.attestKey
         }
         cur = r.state
         wi = r.witnessIndex
@@ -1253,6 +1286,8 @@ export function stepK(
         payslot: ps,
         treeOp,
         member,
+        sigOp,
+        sigKey,
     }
 }
 

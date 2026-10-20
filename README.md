@@ -260,6 +260,19 @@ the transaction invalid.
 - Dead-man. When the machine has `deadMan` > 0 and nLockTime is at least
   `lastTime + deadMan`, the cycle halts before its first instruction (v3.1).
   See "Freeze escape" below.
+- Canonical unlocking script (v3.1). Every argument of `step` has one
+  valid value. An argument the cycle did not use must be empty, or 0 for
+  `sigS` and `leafIndex`. The witness must hold exactly the cells that `IN`
+  consumed, also when the cycle halts. `keyA` is used only by `ATTEST`,
+  `ENDORSE`, `ATTESTM`, `ADMIT` and `REMOVE` (not by `SIGVERIFY`); `keyB`
+  and `payout` only by `ENDORSE` and `ADMIT`; the tree arguments only when a
+  tree instruction ran. A used Rabin signature must have `0 < s < n/2`,
+  because `s`, `n - s` and `s + k·n` all verify. The reason: nobody signs
+  the unlocking script, so a relayer could rewrite a free argument. That
+  gives the transaction a new txid and orphans the unconfirmed cycles that
+  a keeper chained after it. `planCycle` sends only the used arguments, and
+  the `sign*` helpers in `src/k17/attest.ts` return canonical signatures
+  (`canonicalSig`).
 - Get `ROUND` from `TIME`, never from `IN`. The keeper controls `IN`. The
   contract does not let nLockTime go backwards. A member admitted in round
   r can be paid in round r + 1 at the earliest, because `PAYLEAF` requires
@@ -364,6 +377,7 @@ cycle per block at nLockTime = MTP - 1, or up to about 10 per block with
 | 40  | 43                                      | 469 386 bytes  | about 470 KB      |
 | 40  | 43 (v3.1, second signature faults)      | 469 666 bytes  | about 470 KB      |
 | 40  | 43 (v3.1, plus dead-man and `MIN_STEP`) | 469 918 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, plus canonical unlocking)     | 470 098 bytes  | about 470 KB      |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
@@ -373,7 +387,7 @@ script per unrolled instruction, plus a fixed part
 construction). The cycle transaction column is the final (halting) cycle.
 A cycle that continues also carries the next state output, so it is about
 twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
-939 311 bytes at K=40 (43 handlers). Set `K17_SIZES=1` to print these sizes during
+940 740 bytes at K=40 (43 handlers). Set `K17_SIZES=1` to print these sizes during
 `npm test`. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.

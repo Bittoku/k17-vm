@@ -92,6 +92,16 @@
  * machine alive must advance the clock by at least MIN_STEP (60 s), so a
  * keeper cannot pin lastTime; halting cycles are exempt.
  *
+ * v3.1 canonical unlocking script: nobody signs the arguments of `step`, so
+ * any argument the contract did not pin could be rewritten by a relayer,
+ * which gives a new txid and orphans the unconfirmed cycles chained after
+ * it. After the loop the contract requires every unused argument to be
+ * empty or 0 (the tree arguments when no tree instruction ran; sigS, sigPad,
+ * keyA, keyB and payout when no signature instruction ran; keyA for a
+ * SIGVERIFY signature; keyB and payout unless ENDORSE or ADMIT ran), the
+ * witness to hold exactly the cells IN consumed, and a verified Rabin
+ * signature to satisfy 0 < s < n/2. The rules hold on the halted path too.
+ *
  * Faults (underflow, overflow, bad address, bad opcode, PC overrun, full
  * output log, a second signature instruction) never fail the transaction. They halt the machine so the funds
  * can always be released.
@@ -183,6 +193,12 @@ export class K17Machine extends SmartContract {
     /** Domain prefix of an ATTESTM message, ASCII "K17T" (attest MEMBER_DOMAIN). */
     @prop()
     static readonly MEMBER_DOMAIN: ByteString = toByteString('4b313754')
+    /** Domain prefix of a SIGVERIFY message, ASCII "K17A" (isa ATTEST_DOMAIN). */
+    @prop()
+    static readonly SIGVERIFY_DOMAIN: ByteString = toByteString('4b313741')
+    /** Domain prefix of an ENDORSE message, ASCII "K17E" (isa ENDORSE_DOMAIN). */
+    @prop()
+    static readonly ENDORSE_DOMAIN: ByteString = toByteString('4b313745')
     /** Domain prefix of an ADMIT message, ASCII "K17D" (attest ADMIT_DOMAIN). */
     @prop()
     static readonly ADMIT_DOMAIN: ByteString = toByteString('4b313744')
@@ -442,6 +458,13 @@ export class K17Machine extends SmartContract {
      * @param leafIndex the leaf's position in [0, 65536); 0 when unused.
      *        The three tree arguments are only checked when the cycle ran a
      *        tree instruction (treeOp != 0).
+     *
+     * Canonical arguments (v3.1): an argument the cycle did not use must be
+     * empty (0 for sigS and leafIndex), the witness must hold exactly the
+     * cells IN consumed, and a used signature must have 0 < sigS < n/2.
+     * Otherwise the transaction is invalid, so a relayer cannot change the
+     * txid of a cycle (and orphan its unconfirmed descendants) by
+     * rewriting the unlocking script.
      */
     @method()
     public step(
@@ -1231,12 +1254,64 @@ export class K17Machine extends SmartContract {
 
         // ---- the cycle's one signature --------------------------------
         // After the tree block, which builds the ADMIT and REMOVE message.
+        //
+        // Canonical unlocking script (v3.1). Nobody signs the unlocking
+        // script, so a relayer could rewrite any argument the contract does
+        // not pin and give the transaction a new txid, which orphans the
+        // unconfirmed cycles chained after it. So every argument the cycle
+        // did not use must be empty (or 0), and a used Rabin signature must
+        // be in its one canonical form. The rules are checked here, after
+        // the loop, on the alive and the halted path alike.
         if (verifyNeeded) {
+            // RabinVerifier checks s^2 mod n, so s, n - s, -s and s + k*n
+            // all verify. Accept only 0 < s < n/2 (n = verifyKey).
+            assert(
+                sigS > 0n && 2n * sigS < verifyKey,
+                'signature must be canonical (0 < s < n/2)'
+            )
             assert(
                 RabinVerifier.verifySig(verifyMsg, sig, verifyKey),
                 'signature check failed'
             )
+            // The message domain names the instruction that recorded the
+            // signature. SIGVERIFY verifies under a deployment roster key,
+            // so keyA is unused; only ENDORSE ("K17E") and ADMIT ("K17D")
+            // read keyB and payout.
+            const sigDomain = slice(verifyMsg, 0n, 4n)
+            if (sigDomain == K17Machine.SIGVERIFY_DOMAIN) {
+                assert(len(keyA) == 0n, 'unused keyA must be empty')
+            }
+            if (
+                sigDomain != K17Machine.ENDORSE_DOMAIN &&
+                sigDomain != K17Machine.ADMIT_DOMAIN
+            ) {
+                assert(
+                    len(keyB) == 0n && len(payout) == 0n,
+                    'unused keyB and payout must be empty'
+                )
+            }
+        } else {
+            // No signature instruction recorded a signature this cycle
+            // (also the dead-man and every halt before one).
+            assert(
+                sigS == 0n &&
+                    len(sigPad) == 0n &&
+                    len(keyA) == 0n &&
+                    len(keyB) == 0n &&
+                    len(payout) == 0n,
+                'unused signature arguments must be empty'
+            )
         }
+        if (treeOp == 0n) {
+            assert(
+                len(leafPre) == 0n && len(proof) == 0n && leafIndex == 0n,
+                'unused tree arguments must be empty'
+            )
+        }
+        // Every witness byte was consumed by an IN that ran. A fault stops
+        // the loop, so on the halted path the honest witness is exactly the
+        // cells consumed before the halt.
+        assert(wi == witnessLen, 'witness has unconsumed cells')
 
         // ---- anti output-sharing ------------------------------------
         // Two machines with identical scripts and values could otherwise be

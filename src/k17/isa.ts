@@ -108,6 +108,15 @@
  * beneficiary. Faults never make the spending transaction invalid, because
  * an unspendable program would freeze its funds forever.
  *
+ * Canonical unlocking script (v3.1, a transaction rule, not a VM rule).
+ * The transaction is also invalid when an unlocking argument the cycle did
+ * not use is not empty (or 0): the witness must hold exactly the cells IN
+ * consumed; leafPre, proof and leafIndex must be empty and 0 unless a tree
+ * instruction ran; sigS, sigPad and keyA must be 0 and empty unless a
+ * signature instruction ran, and keyA also for SIGVERIFY; keyB and payout
+ * must be empty unless ENDORSE or ADMIT ran. A used Rabin signature must
+ * have 0 < s < n/2. This stops a relayer from changing a cycle's txid.
+ *
  * Dead-man halt (v3.1, not an instruction). A machine deployed with
  * deadMan > 0 halts before its first instruction in any cycle whose
  * nLockTime is at least lastTime + deadMan, exactly like a fault: refund to
