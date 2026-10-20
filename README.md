@@ -187,6 +187,10 @@ leaf preimage the cycle wrote: the new 120-hex leaf after `PAYLEAF` or
 `ADMIT`, `''` after `REMOVE`, and undefined when no leaf was written. A tree
 mirror applies it at `leafIndex`.
 
+`CyclePlan.outhCells` (and `CycleOutcome.outhCells` from `stepK`) lists the
+cells `OUTH` folded into `logHash` during the cycle, in order; folding them
+from the previous `logHash` with `sha256(prev || cell)` gives the new one.
+
 ### Instructions
 
 | Instruction | Stack effect   | Function                                                                                                               |

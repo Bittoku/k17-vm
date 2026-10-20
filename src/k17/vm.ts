@@ -365,6 +365,15 @@ export interface StepResult {
      * state at a fault keeps the new root.
      */
     leafAfter?: string
+    /**
+     * The cells OUTH folded into `state.logHash` during this cycle, in fold
+     * order (the integer each OUTH popped); empty when none. Folding them in
+     * order from the cycle's starting logHash, sha256(prev || cell) per cell,
+     * yields `state.logHash`. A cycle refused as need_witness or
+     * verify_failed keeps the earlier state, so it reports []. A fault after
+     * an OUTH keeps the cell, as the state at a fault keeps the new logHash.
+     */
+    outhCells: bigint[]
 }
 
 /**
@@ -503,7 +512,8 @@ export function step(
     payslot?: PaySlot,
     treeOp: TreeOp = 'none',
     member?: BoundMember,
-    leafAfter?: string
+    leafAfter?: string,
+    outhCells: bigint[] = []
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -517,6 +527,7 @@ export function step(
         treeOp,
         member,
         leafAfter,
+        outhCells,
     })
     if (s.halted) return unchanged('halted')
 
@@ -533,6 +544,7 @@ export function step(
         treeOp,
         member,
         leafAfter,
+        outhCells,
     })
 
     if (pc >= prog.length) return fault()
@@ -558,6 +570,7 @@ export function step(
     let nextTreeOp = treeOp
     let mb = member
     let nextLeafAfter = leafAfter
+    let nextOuthCells = outhCells
     let logHash = s.logHash
     let rosterRoot = s.rosterRoot
     let rosterSeq = s.rosterSeq
@@ -1174,6 +1187,7 @@ export function step(
             logHash = createHash('sha256')
                 .update(Buffer.from(s.logHash + encodeCell(n1), 'hex'))
                 .digest('hex')
+            nextOuthCells = [...outhCells, n1]
             break
         }
         default:
@@ -1202,6 +1216,7 @@ export function step(
         treeOp: nextTreeOp,
         member: mb,
         leafAfter: nextLeafAfter,
+        outhCells: nextOuthCells,
     }
 }
 
@@ -1227,6 +1242,15 @@ export interface CycleOutcome {
      * state at a fault keeps the new root.
      */
     leafAfter?: string
+    /**
+     * The cells OUTH folded into `state.logHash` during this cycle, in fold
+     * order (the integer each OUTH popped); empty when none. Folding them in
+     * order from the cycle's starting logHash, sha256(prev || cell) per cell,
+     * yields `state.logHash`. A cycle refused as need_witness or
+     * verify_failed keeps the earlier state, so it reports []. A fault after
+     * an OUTH keeps the cell, as the state at a fault keeps the new logHash.
+     */
+    outhCells: bigint[]
     /**
      * The opcode of the instruction that used the cycle's one signature
      * (SIGVERIFY, ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE); undefined when
@@ -1265,6 +1289,7 @@ export function stepK(
             witnessUsed: 0,
             bountyDue: 0n,
             treeOp: 'none',
+            outhCells: [],
         }
     }
     let cur = s
@@ -1275,11 +1300,23 @@ export function stepK(
     let treeOp: TreeOp = 'none'
     let member: BoundMember | undefined
     let leafAfter: string | undefined
+    let outhCells: bigint[] = []
     let sigOp: Op | undefined
     let sigKey: RabinPubKey | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty, su, ps, treeOp, member, leafAfter)
+        const r = step(
+            cur,
+            e,
+            wi,
+            bounty,
+            su,
+            ps,
+            treeOp,
+            member,
+            leafAfter,
+            outhCells
+        )
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -1290,6 +1327,7 @@ export function stepK(
                 treeOp,
                 member,
                 leafAfter,
+                outhCells,
                 sigOp,
                 sigKey,
             }
@@ -1313,6 +1351,7 @@ export function stepK(
         treeOp = r.treeOp
         member = r.member
         leafAfter = r.leafAfter
+        outhCells = r.outhCells
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
@@ -1326,6 +1365,7 @@ export function stepK(
         treeOp,
         member,
         leafAfter,
+        outhCells,
         sigOp,
         sigKey,
     }
@@ -1350,6 +1390,8 @@ export function run(
     member?: BoundMember
     /** The leaf preimage hex the run wrote to the roster (see StepResult.leafAfter). */
     leafAfter?: string
+    /** The cells OUTH folded into logHash during the run, in order (see StepResult.outhCells). */
+    outhCells: bigint[]
 } {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     // Dead-man halt (v3.1): nothing executes. `run` uses one environment
@@ -1361,6 +1403,7 @@ export function run(
             status: 'halted',
             bountyDue: 0n,
             treeOp: 'none',
+            outhCells: [],
         }
     }
     let cur = s
@@ -1372,9 +1415,21 @@ export function run(
     let treeOp: TreeOp = 'none'
     let member: BoundMember | undefined
     let leafAfter: string | undefined
+    let outhCells: bigint[] = []
     let status: Status = cur.halted ? 'halted' : 'ok'
     while (status === 'ok' && steps < maxSteps) {
-        const r = step(cur, e, wi, bounty, su, ps, treeOp, member, leafAfter)
+        const r = step(
+            cur,
+            e,
+            wi,
+            bounty,
+            su,
+            ps,
+            treeOp,
+            member,
+            leafAfter,
+            outhCells
+        )
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -1385,6 +1440,7 @@ export function run(
                 treeOp,
                 member,
                 leafAfter,
+                outhCells,
             }
         }
         cur = r.state
@@ -1395,6 +1451,7 @@ export function run(
         treeOp = r.treeOp
         member = r.member
         leafAfter = r.leafAfter
+        outhCells = r.outhCells
         status =
             r.status === 'fault'
                 ? 'halted'
@@ -1412,6 +1469,7 @@ export function run(
         treeOp,
         member,
         leafAfter,
+        outhCells,
     }
 }
 

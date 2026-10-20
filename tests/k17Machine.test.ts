@@ -2051,6 +2051,7 @@ describe('K17Machine on-chain', function () {
         const n1 = r1.next as K17Machine
         expect(n1.logHash).to.equal(sha256Hex('00'.repeat(32) + encodeCell(7n)))
         expect(n1.rosterRoot).to.equal(tree.root())
+        expect(r1.plan.outhCells).to.deep.equal([7n])
         const r2 = await cycle(n1, r1.plan.remaining, T0 + 120n, keeperA)
         expect(r2.plan.halted).to.be.true
         expect(addressOf(r2.tx.outputs[0])).to.equal(
@@ -2169,6 +2170,7 @@ describe('K17Machine on-chain', function () {
                 BigInt(INDEX_A)
             )
         ).to.equal(plan.nextState.rosterRoot)
+        expect(plan.outhCells).to.deep.equal([])
         expect(plan.remaining).to.equal(BigInt(FUNDING) - 160n)
         // The same cycle on chain: the refund layout, no output 2.
         const r = await payleafCycle(prog, tree)

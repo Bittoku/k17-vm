@@ -1312,6 +1312,72 @@ describe('K17 v3 ATTESTM and PAYLEAF', function () {
         expect(only.leafAfter).to.equal(undefined)
     })
 
+    /** sha256(prev || cell) folded over `cells`, as OUTH does. */
+    const foldCells = (prev: string, cells: bigint[]): string =>
+        cells.reduce(
+            (acc, cell) =>
+                createHash('sha256')
+                    .update(Buffer.from(acc + encodeCell(cell), 'hex'))
+                    .digest('hex'),
+            prev
+        )
+
+    it('two OUTHs in one cycle report both cells in order, matching logHash', () => {
+        const start = machine(['LIT', 5, 'OUTH', 'LIT', 9, 'OUTH', 'HALT'])
+        const cycle = stepK(start, envFor(MEMBER_INDEX), 40)
+        expect(cycle.outhCells).to.deep.equal([5n, 9n])
+        expect(foldCells(start.logHash, cycle.outhCells)).to.equal(
+            cycle.state.logHash
+        )
+        const whole = run(start, envFor(MEMBER_INDEX))
+        expect(whole.outhCells).to.deep.equal([5n, 9n])
+        expect(foldCells(start.logHash, whole.outhCells)).to.equal(
+            whole.state.logHash
+        )
+        const none = stepK(machine(['LIT', 1, 'DROP', 'HALT']), envFor(9), 40)
+        expect(none.outhCells).to.deep.equal([])
+    })
+
+    it('a verify_failed cycle reports no cells it did not keep', () => {
+        // PAYLEAF at ROUND == lastRound is refused; nothing was folded.
+        const refused = stepK(
+            machine(['MEMBER', 'DROP', 'LIT', 1, 'LIT', 7, 'PAYLEAF', 'HALT']),
+            envFor(MEMBER_INDEX),
+            40
+        )
+        expect(refused.status).to.equal('verify_failed')
+        expect(refused.outhCells).to.deep.equal([])
+        // An OUTH that ran before the refusal is part of the kept state, so
+        // its cell is reported and still agrees with the state's logHash.
+        const start = machine([
+            'LIT',
+            5,
+            'OUTH',
+            'MEMBER',
+            'DROP',
+            'LIT',
+            1,
+            'LIT',
+            7,
+            'PAYLEAF',
+            'HALT',
+        ])
+        const after = stepK(start, envFor(MEMBER_INDEX), 40)
+        expect(after.status).to.equal('verify_failed')
+        expect(foldCells(start.logHash, after.outhCells)).to.equal(
+            after.state.logHash
+        )
+    })
+
+    it('a fault after an OUTH keeps the cell, consistent with logHash', () => {
+        // The second OUTH underflows: the state keeps the first fold only.
+        const start = machine(['LIT', 5, 'OUTH', 'OUTH', 'HALT'])
+        const r = stepK(start, envFor(MEMBER_INDEX), 40)
+        expect(r.state.halted).to.equal(true)
+        expect(r.outhCells).to.deep.equal([5n])
+        expect(foldCells(start.logHash, r.outhCells)).to.equal(r.state.logHash)
+    })
+
     it('a fault after PAYLEAF in the same cycle keeps leafAfter', () => {
         // prettier-ignore
         const prog = [

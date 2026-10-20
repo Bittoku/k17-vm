@@ -333,6 +333,12 @@ export interface CyclePlan {
      */
     leafAfter?: string
     /**
+     * The cells OUTH folded into `nextState.logHash` this cycle, in fold
+     * order; empty when none. Folding them in order from the previous
+     * logHash, sha256(prev || cell) per cell, gives the new logHash.
+     */
+    outhCells: bigint[]
+    /**
      * The PAYSLOT or PAYLEAF payout this cycle; undefined when none
      * (`slot` is -1 for a PAYLEAF payout and is not used for the output).
      * Its output follows the keeper reward output when one exists (output
@@ -426,6 +432,7 @@ export function planCycle(
               bountyDue: 0n,
               payslot: undefined,
               treeOp: 'none' as TreeOp,
+              outhCells: [] as bigint[],
           }
     if (outcome.status === 'need_witness') {
         throw new Error('cycle needs a witness cell the solver did not supply')
@@ -499,6 +506,7 @@ export function planCycle(
         leafIndex: treeUsed ? treeArg?.leafIndex ?? 0n : 0n,
         treeOp: outcome.treeOp,
         leafAfter: outcome.leafAfter,
+        outhCells: outcome.outhCells,
         payslot,
     }
     if (nextState.halted) {
