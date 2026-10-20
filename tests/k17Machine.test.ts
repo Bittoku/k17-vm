@@ -2159,6 +2159,16 @@ describe('K17Machine on-chain', function () {
         expect(plan.halted).to.be.true
         expect(plan.payslot).to.be.undefined
         expect(plan.reward).to.equal(160n)
+        // The write happened before the payout was dropped: the plan still
+        // reports the leaf, and it matches the root the plan keeps.
+        expect(plan.leafAfter).to.have.length(120)
+        expect(
+            SparseMerkleTree.rootAfter(
+                plan.leafAfter as string,
+                tree.proof(INDEX_A).proof,
+                BigInt(INDEX_A)
+            )
+        ).to.equal(plan.nextState.rosterRoot)
         expect(plan.remaining).to.equal(BigInt(FUNDING) - 160n)
         // The same cycle on chain: the refund layout, no output 2.
         const r = await payleafCycle(prog, tree)

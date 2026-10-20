@@ -1289,6 +1289,50 @@ describe('K17 v3 ATTESTM and PAYLEAF', function () {
         expect(r.status).to.equal('need_witness')
     })
 
+    it('PAYLEAF reports the written leaf; MEMBER alone reports none', () => {
+        const prog = ['MEMBER', 'DROP', 'LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT']
+        const r = stepK(machine(prog), envFor(MEMBER_INDEX), 40)
+        expect(r.leafAfter).to.equal(
+            encodeLeafPre(keyHash(attester.pub), PAYOUT, 8n, 1n)
+        )
+        expect(r.leafAfter).to.have.length(120)
+        expect(
+            SparseMerkleTree.rootAfter(
+                r.leafAfter as string,
+                tree.proof(MEMBER_INDEX).proof,
+                BigInt(MEMBER_INDEX)
+            )
+        ).to.equal(r.state.rosterRoot)
+        const only = stepK(
+            machine(['MEMBER', 'DROP', 'HALT']),
+            envFor(MEMBER_INDEX),
+            40
+        )
+        expect(only.treeOp).to.equal('member')
+        expect(only.leafAfter).to.equal(undefined)
+    })
+
+    it('a fault after PAYLEAF in the same cycle keeps leafAfter', () => {
+        // prettier-ignore
+        const prog = [
+            'MEMBER', 'DROP',
+            'LIT', 1, 'LIT', 8, 'PAYLEAF',
+            'LIT', 1, 'LIT', 9, 'PAYLEAF', 'HALT',
+        ]
+        const r = stepK(machine(prog), envFor(MEMBER_INDEX), 40)
+        expect(r.state.halted).to.equal(true)
+        expect(r.leafAfter).to.equal(
+            encodeLeafPre(keyHash(attester.pub), PAYOUT, 8n, 1n)
+        )
+        expect(
+            SparseMerkleTree.rootAfter(
+                r.leafAfter as string,
+                tree.proof(MEMBER_INDEX).proof,
+                BigInt(MEMBER_INDEX)
+            )
+        ).to.equal(r.state.rosterRoot)
+    })
+
     it('PAYLEAF without MEMBER faults', () => {
         const r = run(machine(['LIT', 1, 'LIT', 8, 'PAYLEAF', 'HALT']), 0n)
         expect(r.status).to.equal('halted')
@@ -1591,6 +1635,39 @@ describe('K17 v3 ADMIT and REMOVE', function () {
         const next = stepK(withProg(7), payEnv(), 40)
         expect(next.status).to.equal('halted')
         expect(next.payslot?.sats).to.equal(1n)
+    })
+
+    it('ADMIT reports the new leaf and REMOVE reports an empty one', () => {
+        const tree = buildTree()
+        const admitted = stepK(
+            machine(ADMIT_PROG, tree.root()),
+            admitEnv(tree),
+            40
+        )
+        expect(admitted.leafAfter).to.equal(newcomerLeaf(ADMIT_ROUND))
+        expect(admitted.leafAfter).to.have.length(120)
+        expect(
+            SparseMerkleTree.rootAfter(
+                admitted.leafAfter as string,
+                tree.proof(NEW_INDEX).proof,
+                BigInt(NEW_INDEX)
+            )
+        ).to.equal(admitted.state.rosterRoot)
+
+        const removed = stepK(
+            machine(REMOVE_PROG, tree.root()),
+            removeEnv(tree),
+            40
+        )
+        expect(removed.treeOp).to.equal('remove')
+        expect(removed.leafAfter).to.equal('')
+        expect(
+            SparseMerkleTree.rootAfter(
+                removed.leafAfter as string,
+                tree.proof(OLD_INDEX).proof,
+                BigInt(OLD_INDEX)
+            )
+        ).to.equal(removed.state.rosterRoot)
     })
 
     it('ADMIT with a stale rosterSeq in the signed message is verify_failed', () => {

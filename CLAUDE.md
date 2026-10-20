@@ -55,6 +55,7 @@ publication belong in this repo.
   `canonicalSig` in `src/k17/attest.ts` wraps every `sign*` helper. The VM reports
   `treeOp: 'member'` for a `MEMBER` that faults on a full data stack, because the contract
   still checks that proof.
+- `CyclePlan.leafAfter` (from `CycleOutcome.leafAfter`) reports the leaf the cycle wrote to the roster: the new 120-hex preimage after PAYLEAF or ADMIT, `''` after REMOVE, undefined otherwise. It is kept at a fault after the write, so it always matches the kept `rosterRoot`.
 - Keeper and change arguments (v3.1): `newMachine` refuses `rewardMin < 1n`, so a keeper
   output always pins `keeper`. A cycle tx must carry a positive change output (it pins
   scrypt-ts's hidden changeAmount/changeAddress arguments). scrypt-ts `autoPayfee` adds fee

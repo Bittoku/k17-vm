@@ -327,6 +327,12 @@ export interface CyclePlan {
     /** The tree operation the cycle ran ('none' when no tree instruction). */
     treeOp: TreeOp
     /**
+     * The leaf preimage hex the cycle wrote to the roster: the new 120-hex
+     * leaf after PAYLEAF or ADMIT, '' after REMOVE, undefined when no leaf
+     * was written. A tree mirror applies it at `leafIndex`.
+     */
+    leafAfter?: string
+    /**
      * The PAYSLOT or PAYLEAF payout this cycle; undefined when none
      * (`slot` is -1 for a PAYLEAF payout and is not used for the output).
      * Its output follows the keeper reward output when one exists (output
@@ -492,6 +498,7 @@ export function planCycle(
         proof: treeUsed ? treeArg?.proof ?? '' : '',
         leafIndex: treeUsed ? treeArg?.leafIndex ?? 0n : 0n,
         treeOp: outcome.treeOp,
+        leafAfter: outcome.leafAfter,
         payslot,
     }
     if (nextState.halted) {

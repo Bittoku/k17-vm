@@ -356,6 +356,15 @@ export interface StepResult {
     treeOp: TreeOp
     /** The member bound by MEMBER this cycle, if any. */
     member?: BoundMember
+    /**
+     * The leaf preimage hex this cycle wrote to the roster: the new 120-hex
+     * leaf after PAYLEAF or ADMIT, '' (an empty leaf) after REMOVE, and
+     * undefined when no leaf was written (including MEMBER alone). It
+     * matches `state.rosterRoot`, so a mirror of the tree can apply it at
+     * the cycle's leaf index. A fault after the write keeps it, as the
+     * state at a fault keeps the new root.
+     */
+    leafAfter?: string
 }
 
 /**
@@ -493,7 +502,8 @@ export function step(
     sigUsed = false,
     payslot?: PaySlot,
     treeOp: TreeOp = 'none',
-    member?: BoundMember
+    member?: BoundMember,
+    leafAfter?: string
 ): StepResult {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     const unchanged = (status: Status): StepResult => ({
@@ -506,6 +516,7 @@ export function step(
         payslot,
         treeOp,
         member,
+        leafAfter,
     })
     if (s.halted) return unchanged('halted')
 
@@ -521,6 +532,7 @@ export function step(
         payslot,
         treeOp,
         member,
+        leafAfter,
     })
 
     if (pc >= prog.length) return fault()
@@ -545,6 +557,7 @@ export function step(
     let ps = payslot
     let nextTreeOp = treeOp
     let mb = member
+    let nextLeafAfter = leafAfter
     let logHash = s.logHash
     let rosterRoot = s.rosterRoot
     let rosterSeq = s.rosterSeq
@@ -997,8 +1010,14 @@ export function step(
             if (sats === 0n) return fault()
             if (round <= mb.lastRound) return unchanged('verify_failed')
             ps = { slot: -1, payoutHex: mb.payoutHex, sats }
+            nextLeafAfter = encodeLeafPre(
+                mb.keyHash,
+                mb.payoutHex,
+                round,
+                mb.flags
+            )
             rosterRoot = SparseMerkleTree.rootAfter(
-                encodeLeafPre(mb.keyHash, mb.payoutHex, round, mb.flags),
+                nextLeafAfter,
                 mb.proof,
                 mb.leafIndex
             )
@@ -1062,8 +1081,14 @@ export function step(
             }
             const admitRound = pop()
             pop()
+            nextLeafAfter = encodeLeafPre(
+                keyHash(e.endorseKey),
+                e.payout,
+                admitRound,
+                0n
+            )
             rosterRoot = SparseMerkleTree.rootAfter(
-                encodeLeafPre(keyHash(e.endorseKey), e.payout, admitRound, 0n),
+                nextLeafAfter,
                 proof,
                 leafIndex
             )
@@ -1134,6 +1159,7 @@ export function step(
                 return unchanged('verify_failed')
             }
             pop()
+            nextLeafAfter = ''
             rosterRoot = SparseMerkleTree.rootAfter('', proof, leafIndex)
             rosterSeq = s.rosterSeq + 1n
             su = true
@@ -1175,6 +1201,7 @@ export function step(
         payslot: ps,
         treeOp: nextTreeOp,
         member: mb,
+        leafAfter: nextLeafAfter,
     }
 }
 
@@ -1191,6 +1218,15 @@ export interface CycleOutcome {
     treeOp: TreeOp
     /** The member MEMBER bound this cycle; undefined when none. */
     member?: BoundMember
+    /**
+     * The leaf preimage hex this cycle wrote to the roster: the new 120-hex
+     * leaf after PAYLEAF or ADMIT, '' (an empty leaf) after REMOVE, and
+     * undefined when no leaf was written (including MEMBER alone). It
+     * matches `state.rosterRoot`, so a mirror of the tree can apply it at
+     * the cycle's leaf index. A fault after the write keeps it, as the
+     * state at a fault keeps the new root.
+     */
+    leafAfter?: string
     /**
      * The opcode of the instruction that used the cycle's one signature
      * (SIGVERIFY, ATTEST, ENDORSE, ATTESTM, ADMIT or REMOVE); undefined when
@@ -1238,11 +1274,12 @@ export function stepK(
     let ps: PaySlot | undefined
     let treeOp: TreeOp = 'none'
     let member: BoundMember | undefined
+    let leafAfter: string | undefined
     let sigOp: Op | undefined
     let sigKey: RabinPubKey | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     for (let i = 0; i < k && status === 'ok'; i++) {
-        const r = step(cur, e, wi, bounty, su, ps, treeOp, member)
+        const r = step(cur, e, wi, bounty, su, ps, treeOp, member, leafAfter)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -1252,6 +1289,7 @@ export function stepK(
                 payslot: ps,
                 treeOp,
                 member,
+                leafAfter,
                 sigOp,
                 sigKey,
             }
@@ -1274,6 +1312,7 @@ export function stepK(
         ps = r.payslot
         treeOp = r.treeOp
         member = r.member
+        leafAfter = r.leafAfter
         status = r.status === 'fault' ? 'halted' : r.status
     }
     // A yield is a normal end of cycle from the transaction's point of view.
@@ -1286,6 +1325,7 @@ export function stepK(
         payslot: ps,
         treeOp,
         member,
+        leafAfter,
         sigOp,
         sigKey,
     }
@@ -1308,6 +1348,8 @@ export function run(
     payslot?: PaySlot
     treeOp: TreeOp
     member?: BoundMember
+    /** The leaf preimage hex the run wrote to the roster (see StepResult.leafAfter). */
+    leafAfter?: string
 } {
     const e: StepEnv = typeof env === 'bigint' ? envOf(env) : env
     // Dead-man halt (v3.1): nothing executes. `run` uses one environment
@@ -1329,9 +1371,10 @@ export function run(
     let ps: PaySlot | undefined
     let treeOp: TreeOp = 'none'
     let member: BoundMember | undefined
+    let leafAfter: string | undefined
     let status: Status = cur.halted ? 'halted' : 'ok'
     while (status === 'ok' && steps < maxSteps) {
-        const r = step(cur, e, wi, bounty, su, ps, treeOp, member)
+        const r = step(cur, e, wi, bounty, su, ps, treeOp, member, leafAfter)
         if (r.status === 'need_witness' || r.status === 'verify_failed') {
             return {
                 state: cur,
@@ -1341,6 +1384,7 @@ export function run(
                 payslot: ps,
                 treeOp,
                 member,
+                leafAfter,
             }
         }
         cur = r.state
@@ -1350,6 +1394,7 @@ export function run(
         ps = r.payslot
         treeOp = r.treeOp
         member = r.member
+        leafAfter = r.leafAfter
         status =
             r.status === 'fault'
                 ? 'halted'
@@ -1366,6 +1411,7 @@ export function run(
         payslot: ps,
         treeOp,
         member,
+        leafAfter,
     }
 }
 

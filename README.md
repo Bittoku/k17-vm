@@ -182,6 +182,11 @@ state. Each cycle can carry one Merkle proof in the unlocking script.
 
 `src/k17/smt.ts` builds the tree, the proofs and the roots off chain.
 
+`CyclePlan.leafAfter` (and `CycleOutcome.leafAfter` from `stepK`) reports the
+leaf preimage the cycle wrote: the new 120-hex leaf after `PAYLEAF` or
+`ADMIT`, `''` after `REMOVE`, and undefined when no leaf was written. A tree
+mirror applies it at `leafIndex`.
+
 ### Instructions
 
 | Instruction | Stack effect   | Function                                                                                                               |
