@@ -273,6 +273,35 @@ the transaction invalid.
   a keeper chained after it. `planCycle` sends only the used arguments, and
   the `sign*` helpers in `src/k17/attest.ts` return canonical signatures
   (`canonicalSig`).
+- Keeper and change outputs (v3.1). `newMachine` refuses `rewardMin` below
+  1 sat, so a cycle always pays a keeper output, and that output pins the
+  `keeper` argument. A cycle transaction must also carry a positive change
+  output. scrypt-ts passes the change amount and address as hidden `step`
+  arguments, and it builds no change output for an amount of 0 or less;
+  only a change output pins them. scrypt-ts adds the fee inputs and the
+  change after `bindCycleBuilder` returns, with at least 1 sat of change.
+  `bindCycleBuilder` throws when it built fee inputs itself and there is no
+  change output. A keeper that adds inputs in another way must call
+  `assertChangeOutput` on the final transaction before it broadcasts.
+- Residual malleability (known, not closed by the contract):
+
+  - A witness cell that `IN` consumed but that reaches neither the next
+    state nor a signed message can be changed without a change to the
+    outputs. On the halted path this is always true, because no state
+    output exists. Programs must check such cells (for example with
+    `VERIFY`) or carry them into the state when their value matters.
+  - Non-minimal push encodings (for example `OP_PUSHDATA1 0x00` in place
+    of `OP_0`) break relay policy (`MINIMALDATA`), not consensus. Standard
+    nodes do not relay them, but a miner can still re-encode a cycle.
+    Script cannot see the push opcode, so the contract cannot refuse this.
+  - A `PAYSLOT` or `PAYLEAF` payout can clamp the keeper reward to
+    `value - 1 - N` = 0. Then there is no keeper output and `keeper` is not
+    pinned.
+
+  Impact: with nLockTime = MTP - 1 and `MIN_STEP`, keepers run one live
+  cycle per block, so cycles are not chained unconfirmed, and a rewrite
+  costs the keeper only a new plan.
+
 - Get `ROUND` from `TIME`, never from `IN`. The keeper controls `IN`. The
   contract does not let nLockTime go backwards. A member admitted in round
   r can be paid in round r + 1 at the earliest, because `PAYLEAF` requires

@@ -37,12 +37,17 @@ const rabin = new Rabin(RABIN_SECURITY_LEVEL)
  * Input: a signature (any representative of s) and the public modulus n it
  * verifies under. Output: the same signature with s replaced by
  * min(s mod n, n - s mod n); the padding is unchanged. NO_SIG (s = 0) is
- * returned unchanged. Throws when n is not positive.
+ * returned unchanged. Throws when n is not positive, or when s is a
+ * non-zero multiple of n (s mod n = 0 signs no message, and returning 0
+ * would silently turn it into NO_SIG).
  */
 export function canonicalSig(sig: RabinSig, pub: RabinPubKey): RabinSig {
     if (pub <= 0n) throw new Error('Rabin public key must be positive')
     if (sig.s === 0n) return sig
     const reduced = ((sig.s % pub) + pub) % pub
+    if (reduced === 0n) {
+        throw new Error('Rabin signature s is a multiple of the public key')
+    }
     const s = 2n * reduced < pub ? reduced : pub - reduced
     return { s, padding: sig.padding }
 }

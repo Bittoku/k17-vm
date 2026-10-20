@@ -139,6 +139,11 @@ export function randomInstanceId(): string {
  * dead-man interval, counted on the chain's MTP clock. It must be 0 or at
  * least DEAD_MAN_FLOOR (6 h); with `econ.allowShortDeadMan` (tests only)
  * any value above MIN_STEP is accepted. Anything else throws.
+ * `econ.rewardMin` must be at least 1 sat (v3.1 canonical unlocking
+ * script): then every cycle pays a keeper output, which pins the `keeper`
+ * argument of `step` through hashOutputs. One edge stays: a PAYSLOT or
+ * PAYLEAF payout (or a 1-sat balance) can clamp the reward to
+ * value - 1 - N = 0, and then `keeper` is free (see README).
  */
 export function newMachine(
     progHex: string,
@@ -154,6 +159,13 @@ export function newMachine(
         initialMemHex === undefined ? undefined : initialMemHex.toLowerCase(),
         tree
     )
+    // With a zero reward no keeper output is built, so the keeper address
+    // in the unlocking script would be free for a relayer to rewrite.
+    if (econ.rewardMin < 1n) {
+        throw new Error(
+            'rewardMin must be at least 1 sat (a zero reward leaves the keeper argument unpinned)'
+        )
+    }
     const deadMan = econ.deadMan ?? 0n
     if (deadMan < 0n) throw new Error('deadMan must not be negative')
     // The contract accepts any value; the keeper refuses values that let
@@ -520,6 +532,19 @@ export interface CycleOverrides {
  *   then:     change
  * Input: instance, plan, keeper address, overrides. Output: MethodCallOptions
  * to pass to `m.methods.step`.
+ *
+ * Change-output rule (v3.1 canonical unlocking script): a cycle
+ * transaction must carry a positive change output. scrypt-ts passes the
+ * change amount and address as hidden `step` arguments and builds no
+ * change output when the amount is 0 or less, so without a change output a
+ * relayer could rewrite both without changing the txid's outputs. With a
+ * change output, hashOutputs pins them. In the normal path scrypt-ts adds
+ * the fee inputs and sizes the change output after this builder returns
+ * (`autoPayfee`, which reserves at least 1 sat of change), so the builder
+ * can only check the inputs it adds itself: it throws (assertChangeOutput)
+ * when it built more than one input and there is no change output. Callers
+ * that add inputs in another way should call assertChangeOutput on the
+ * final transaction before they broadcast it.
  */
 export function bindCycleBuilder(
     m: K17Machine,
@@ -607,6 +632,7 @@ export function bindCycleBuilder(
             )
             tx.setInputSequence(atInputIndex, overrides.sequence ?? 0xfffffffe)
             tx.setLockTime(Number(lockTime))
+            assertChangeOutput(tx)
             return { tx, atInputIndex, nexts, next: nexts[0] }
         }
     )
@@ -622,6 +648,23 @@ export function bindCycleBuilder(
                       atOutputIndex: 0,
                   }
                 : undefined,
+    }
+}
+
+/**
+ * Check the change-output rule of a cycle transaction (v3.1 canonical
+ * unlocking script; see bindCycleBuilder).
+ * Input: the transaction. Output: none. Throws when the transaction has
+ * fee inputs (more than one input) but no change output, because the
+ * hidden changeAmount and changeAddress arguments of `step` are then not
+ * pinned by the outputs. A transaction with the machine input only (the
+ * state before scrypt-ts adds fee inputs) passes.
+ */
+export function assertChangeOutput(tx: bsv.Transaction): void {
+    if (tx.inputs.length > 1 && tx.getChangeOutput() === null) {
+        throw new Error(
+            'cycle transaction has fee inputs but no change output (the change arguments of step would be unpinned)'
+        )
     }
 }
 

@@ -55,6 +55,17 @@ publication belong in this repo.
   `canonicalSig` in `src/k17/attest.ts` wraps every `sign*` helper. The VM reports
   `treeOp: 'member'` for a `MEMBER` that faults on a full data stack, because the contract
   still checks that proof.
+- Keeper and change arguments (v3.1): `newMachine` refuses `rewardMin < 1n`, so a keeper
+  output always pins `keeper`. A cycle tx must carry a positive change output (it pins
+  scrypt-ts's hidden changeAmount/changeAddress arguments). scrypt-ts `autoPayfee` adds fee
+  inputs and change after `bindCycleBuilder` returns; the builder calls `assertChangeOutput`
+  for inputs it builds itself (more than one input), and tests' `cycle()` calls it on the final
+  tx. Residuals (documented in README "Rules for each cycle"): a consumed witness cell that
+  reaches neither state nor a signature can be rewritten (always on the halted path; programs
+  must check such cells); non-minimal pushes are relay policy (MINIMALDATA), not consensus; a
+  PAYSLOT/PAYLEAF payout can clamp the reward to 0, leaving `keeper` unpinned. Impact is small:
+  with lockTime = MTP - 1 and MIN_STEP, keepers run one live cycle per block, so cycles are not
+  chained unconfirmed and a rewrite costs only a re-plan.
 - Tree roster (v3 machine): state `sponsorKeyHash` (immutable), `rosterRoot`, `rosterSeq`,
   `logHash`. Handlers in the unrolled loop only record (`treeOp`, the ADMIT/REMOVE operand cells, flags); the proof,
   the `ADMIT`/`REMOVE` keys and message, and the new root are checked and built once after the

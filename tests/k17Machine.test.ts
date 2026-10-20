@@ -54,6 +54,7 @@ import {
     CycleOverrides,
     CycleTree,
     DEAD_MAN_FLOOR,
+    assertChangeOutput,
 } from '../src/keeper'
 import {
     EMPTY_HASHES,
@@ -210,6 +211,9 @@ async function cycle(
     )
     const verdict = tx.verifyInputScript(atInputIndex)
     if (!verdict.success) throw new Error(`script failed: ${verdict.error}`)
+    // v3.1: the final transaction (after scrypt-ts added the fee input)
+    // carries a change output, which pins the hidden change arguments.
+    assertChangeOutput(tx)
     return {
         plan,
         tx,
@@ -4198,5 +4202,157 @@ describe('K17Machine on-chain', function () {
             expect(canonicalSig({ ...sig, s: -sig.s }, n)).to.deep.equal(sig)
         }
         expect(canonicalSig(NO_SIG, sponsor.pub)).to.deep.equal(NO_SIG)
+    })
+    it('v3.1 canonical: an ATTESTM cycle refuses non-empty keyB and payout', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(MEMBER_PROG, tree)
+        const reading = 4242n
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            [reading],
+            signMemberReading(attesterA, m.instanceId, BigInt(TAG_M), reading),
+            {
+                attestKey: attesterA.pub,
+                endorseKey: landowner.pub,
+                payoutHex: LANDOWNER_PAYOUT,
+            },
+            tree.proof(INDEX_A)
+        )
+        expect(plan.halted).to.be.false
+        expect(plan.keyAHex).to.equal(pubKeyBytes(attesterA.pub))
+        expect(plan.keyBHex).to.equal('')
+        expect(plan.payoutHex).to.equal('')
+        await expectCanonical(m, plan, T0 + 60n, plan.witnessHex, [
+            'keyB',
+            'payout',
+        ])
+    })
+
+    it('v3.1 canonical: a REMOVE cycle refuses non-empty keyB and payout', async () => {
+        const tree = twoMemberTree()
+        const m = await deployTree(REMOVE_PROG(TAG_X), tree)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            [],
+            removalSig(sponsor, TAG_X, INDEX_A, MEMBER_A),
+            {
+                attestKey: sponsor.pub,
+                endorseKey: landowner.pub,
+                payoutHex: LANDOWNER_PAYOUT,
+            },
+            tree.proof(INDEX_A)
+        )
+        expect(plan.treeOp).to.equal('remove')
+        expect(plan.keyBHex).to.equal('')
+        expect(plan.payoutHex).to.equal('')
+        await expectCanonical(m, plan, T0 + 60n, '', ['keyB', 'payout'])
+    })
+
+    it('v3.1 canonical: a cycle that halts after ADMIT refuses tampered tree arguments', async () => {
+        const tree = twoMemberTree()
+        // ADMIT, then DROP on the empty stack faults: a refund that still
+        // carries the ADMIT proof, keys and signature.
+        const prog = assemble(['LIT', TAG_D, 'TIME', 'ADMIT', 'DROP', 'HALT'])
+        const m = await deployTree(prog, tree)
+        const plan = planCycle(
+            m,
+            BigInt(FUNDING),
+            T0 + 60n,
+            keeperA,
+            [],
+            admissionSig(sponsor, 0n, ADMIT_INDEX, attesterA.pub, TAG_D),
+            admitKeys(sponsor, attesterA.pub),
+            tree.proof(ADMIT_INDEX)
+        )
+        expect(plan.halted).to.be.true
+        expect(plan.treeOp).to.equal('admit')
+        const flip = (hex: string) =>
+            (hex[0] === '0' ? '1' : '0') + hex.slice(1)
+        const tampers: [string, CyclePlan][] = [
+            ['leafPre', { ...plan, leafPre: '00'.repeat(60) }],
+            ['proof', { ...plan, proof: flip(plan.proof) }],
+            ['leafIndex', { ...plan, leafIndex: plan.leafIndex + 1n }],
+        ]
+        const honest = await buildStepTx(m, plan, T0 + 60n, '')
+        expect(honest.verifyInputScript(0).success).to.equal(true)
+        // the refund pays the beneficiary and the keeper as planned
+        expect(honest.outputs.length).to.be.greaterThan(1)
+        for (const [name, bad] of tampers) {
+            const tx = await buildStepTx(m, bad, T0 + 60n, '')
+            // outputs unchanged: only the unlocking script differs
+            expect(
+                tx.outputs.map((o) =>
+                    o.toBufferWriter().toBuffer().toString('hex')
+                )
+            ).to.deep.equal(
+                honest.outputs.map((o) =>
+                    o.toBufferWriter().toBuffer().toString('hex')
+                )
+            )
+            expect(tx.verifyInputScript(0).success, name).to.equal(false)
+        }
+    })
+
+    it('v3.1 canonical: canonicalSig throws for a non-zero multiple of n', () => {
+        const n = sponsor.pub
+        expect(() => canonicalSig({ s: n, padding: '' }, n)).to.throw(
+            /multiple of the public key/
+        )
+        expect(() => canonicalSig({ s: -2n * n, padding: '' }, n)).to.throw(
+            /multiple of the public key/
+        )
+    })
+
+    it('v3.1: newMachine refuses rewardMin below 1 sat', () => {
+        expect(() =>
+            newMachine(assemble(['HALT']), { ...ECON, rewardMin: 0n }, T0)
+        ).to.throw(/rewardMin must be at least 1 sat/)
+        expect(
+            newMachine(assemble(['HALT']), { ...ECON, rewardMin: 1n }, T0)
+                .rewardMin
+        ).to.equal(1n)
+    })
+
+    it('v3.1: assertChangeOutput refuses fee inputs without a change output', () => {
+        const feeAddress = keeperB
+        const fund = (tx: bsv.Transaction) =>
+            tx
+                .from({
+                    txId: 'aa'.repeat(32),
+                    outputIndex: 0,
+                    script: bsv.Script.fromAddress(feeAddress).toHex(),
+                    satoshis: 1000,
+                })
+                .from({
+                    txId: 'bb'.repeat(32),
+                    outputIndex: 0,
+                    script: bsv.Script.fromAddress(feeAddress).toHex(),
+                    satoshis: 1000,
+                })
+        // everything spent to one output: no change output
+        const noChange = fund(new bsv.Transaction())
+            .to(keeperA, 2000)
+            .change(feeAddress)
+        expect(noChange.getChangeOutput()).to.equal(null)
+        expect(() => assertChangeOutput(noChange)).to.throw(/no change output/)
+        const withChange = fund(new bsv.Transaction())
+            .to(keeperA, 1000)
+            .change(feeAddress)
+        expect(withChange.getChangeOutput()).to.not.equal(null)
+        expect(() => assertChangeOutput(withChange)).to.not.throw()
+        // the machine input alone (before scrypt-ts adds fees) passes
+        const single = new bsv.Transaction().from({
+            txId: 'cc'.repeat(32),
+            outputIndex: 0,
+            script: bsv.Script.fromAddress(feeAddress).toHex(),
+            satoshis: 1000,
+        })
+        expect(() => assertChangeOutput(single)).to.not.throw()
     })
 })
