@@ -490,15 +490,6 @@ export class K17Machine extends SmartContract {
         // PAYLEAF advances it to ROUND. The other member fields are sliced
         // from leafPre where needed, so the loop carries no copies of them.
         let memberLastRound = 0n
-        // The operand cells of ADMIT (cell(TAG) || cell(ROUND)) or REMOVE
-        // (cell(TAG)), as they were on the stack; the message and new leaf
-        // are built from them after the loop.
-        let treeArgs = toByteString('')
-        // True once PAYLEAF, ADMIT or REMOVE replaced the leaf; the new
-        // leaf hash and root are computed after the loop only then.
-        let leafChanged = false
-        // True once ATTESTM ran; its key-to-leaf check runs after the loop.
-        let memberKeyCheck = false
         let logHash = this.logHash
         const progLen = len(this.prog)
         const value = this.ctx.utxo.value
@@ -510,27 +501,28 @@ export class K17Machine extends SmartContract {
         let rs = this.rs
         let mem = this.mem
         let outLog = this.outLog
+        // Machine status in the loop: 0 running, 1 halted (HALT or fault),
+        // 2 yielded. One local instead of two booleans keeps the frame
+        // smaller, which makes every deep assignment in the loop cheaper.
         // A malformed deployment (instanceId not 32 bytes) faults before the
         // first instruction, so its balance is refunded, never frozen.
-        let halted = len(this.instanceId) != 32n
+        let status: bigint = len(this.instanceId) != 32n ? 1n : 0n
         // Dead-man halt (v3.1): when deadMan seconds have passed since the
-        // last cycle, this cycle halts before its first instruction. treeOp,
-        // verifyNeeded and memberKeyCheck then stay unset, so no witness,
+        // last cycle, this cycle halts before its first instruction. treeOp
+        // and sigUsed then stay unset, so no witness,
         // signature or tree check runs and the refund is always spendable.
         if (
             this.deadMan > 0n &&
             this.ctx.locktime >= this.lastTime + this.deadMan
         ) {
-            halted = true
+            status = 1n
         }
-        let yielded = false
         let wi = 0n
         let bountyDue = 0n
-        let sigUsed = false
-        let payslotUsed = false
-        let payslotSats = 0n
-        // Placeholder until PAYSLOT runs; only read when payslotUsed.
-        let payslotAddr: Addr = this.beneficiary
+        // The cycle's one payment record (PAYSLOT or PAYLEAF): empty, or
+        // cell(N) || the 20-byte payout address. One local instead of three
+        // (used flag, amount, address); decoded after the loop.
+        let payRec = toByteString('')
         // SIGVERIFY, ATTEST, ENDORSE and ATTESTM record the message and key
         // here in the loop; ADMIT and REMOVE record them after the loop, in
         // the tree block. None of them calls RabinVerifier itself. sigUsed
@@ -538,14 +530,20 @@ export class K17Machine extends SmartContract {
         // the verifier appears once in the script. That verification runs
         // after the tree block, because the tree block builds the ADMIT and
         // REMOVE message.
-        let verifyNeeded = false
-        let verifyMsg = toByteString('')
-        let verifyKey: RabinPubKey = 0n
+        // The cycle's one signature record: empty until a signature
+        // instruction runs, so `len(sigRec) > 0` is the one-signature flag.
+        // SIGVERIFY records its message (12 bytes) and the roster index
+        // (1 byte); ATTEST, ENDORSE and ATTESTM their message; ADMIT and
+        // REMOVE their operand cells (8 or 4 bytes). The key and the final
+        // message are decoded after the loop. One local instead of four
+        // (sigUsed, verifyMsg, verifyKey, treeArgs): every deep assignment
+        // in the unrolled loop gets cheaper.
+        let sigRec = toByteString('')
 
         for (let i = 0; i < K17Machine.K; i++) {
-            if (!halted && !yielded) {
+            if (status == 0n) {
                 if (pc >= progLen) {
-                    halted = true
+                    status = 1n
                 } else {
                     const op = byteString2Int(slice(this.prog, pc, pc + 1n))
                     let nextPc = pc + 1n
@@ -568,7 +566,7 @@ export class K17Machine extends SmartContract {
                         }
                     }
                     if (!decodeOk) {
-                        halted = true
+                        status = 1n
                     } else {
                         const n = len(ds)
                         const r = len(rs)
@@ -584,26 +582,34 @@ export class K17Machine extends SmartContract {
                         const ds1 = n >= 4n ? slice(ds, 0n, n - 4n) : ds
                         const ds2 = n >= 8n ? slice(ds, 0n, n - 8n) : ds
 
+                        // Handlers write these shallow per-iteration copies, not the
+                        // deep loop-carried status and ds: sCrypt sinks an assigned
+                        // local back to its stack slot with one OP_ROLL per slot above
+                        // it, so a deep assignment in each of 43 branches costs about
+                        // 2 bytes per slot, 40 times. st: 0 run on, 1 fault/halt,
+                        // 2 yield. status is 0 here, so the write-back is exact.
+                        let st = 0n
+                        let nds = ds
                         if (op == 0n) {
                             // HALT
-                            halted = true
+                            st = 1n
                         } else if (op == 1n) {
                             // !  : N1 ADDR --   the roster region is write-protected
                             if (n < 8n || top >= K17Machine.ROSTER_BASE) {
-                                halted = true
+                                st = 1n
                             } else {
                                 mem =
                                     slice(mem, 0n, top * 4n) +
                                     K17Machine.cell(second) +
                                     slice(mem, top * 4n + 4n)
-                                ds = ds2
+                                nds = ds2
                             }
                         } else if (op == 2n) {
                             // +
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(
                                         K17Machine.wrap(second + top)
@@ -612,9 +618,9 @@ export class K17Machine extends SmartContract {
                         } else if (op == 3n) {
                             // -
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(
                                         K17Machine.wrap(second - top)
@@ -623,67 +629,67 @@ export class K17Machine extends SmartContract {
                         } else if (op == 4n) {
                             // >R
                             if (n < 4n || r >= K17Machine.RS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
                                 rs = rs + K17Machine.cell(top)
-                                ds = ds1
+                                nds = ds1
                             }
                         } else if (op == 5n) {
                             // @ : ADDR -- N1
                             if (n < 4n || top >= K17Machine.MEM_CELLS) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds1 + slice(mem, top * 4n, top * 4n + 4n)
+                                nds = ds1 + slice(mem, top * 4n, top * 4n + 4n)
                             }
                         } else if (op == 6n) {
                             // AND
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds2 + K17Machine.cell(and(second, top))
+                                nds = ds2 + K17Machine.cell(and(second, top))
                             }
                         } else if (op == 7n) {
                             // DROP
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds1
+                                nds = ds1
                             }
                         } else if (op == 8n) {
                             // DUP
                             if (n < 4n || n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + K17Machine.cell(top)
+                                nds = ds + K17Machine.cell(top)
                             }
                         } else if (op == 9n) {
                             // OR
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds2 + K17Machine.cell(or(second, top))
+                                nds = ds2 + K17Machine.cell(or(second, top))
                             }
                         } else if (op == 10n) {
                             // OVER : N1 N2 -- N1 N2 N1
                             if (n < 8n || n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + K17Machine.cell(second)
+                                nds = ds + K17Machine.cell(second)
                             }
                         } else if (op == 11n) {
                             // R>
                             if (r < 4n || n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + slice(rs, r - 4n, r)
+                                nds = ds + slice(rs, r - 4n, r)
                                 rs = slice(rs, 0n, r - 4n)
                             }
                         } else if (op == 12n) {
                             // SWAP
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(top) +
                                     K17Machine.cell(second)
@@ -691,16 +697,16 @@ export class K17Machine extends SmartContract {
                         } else if (op == 13n) {
                             // XOR
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds2 + K17Machine.cell(xor(second, top))
+                                nds = ds2 + K17Machine.cell(xor(second, top))
                             }
                         } else if (op == 14n) {
                             // [IF] : N1 --  branch when N1 == 0
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds1
+                                nds = ds1
                                 if (top == 0n) {
                                     nextPc = operand
                                 }
@@ -708,7 +714,7 @@ export class K17Machine extends SmartContract {
                         } else if (op == 15n) {
                             // [CALL]
                             if (r >= K17Machine.RS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
                                 rs = rs + K17Machine.cell(nextPc)
                                 nextPc = operand
@@ -716,7 +722,7 @@ export class K17Machine extends SmartContract {
                         } else if (op == 16n) {
                             // [EXIT]
                             if (r < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
                                 nextPc = K17Machine.uncell(slice(rs, r - 4n, r))
                                 rs = slice(rs, 0n, r - 4n)
@@ -724,16 +730,16 @@ export class K17Machine extends SmartContract {
                         } else if (op == 17n) {
                             // [LIT]
                             if (n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + K17Machine.cell(operand)
+                                nds = ds + K17Machine.cell(operand)
                             }
                         } else if (op == 18n) {
                             // 0=
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds1 + K17Machine.cell(top == 0n ? 1n : 0n)
+                                nds = ds1 + K17Machine.cell(top == 0n ? 1n : 0n)
                             }
                         } else if (op == 19n) {
                             // OUT
@@ -741,17 +747,17 @@ export class K17Machine extends SmartContract {
                                 n < 4n ||
                                 len(outLog) >= K17Machine.OUT_MAX_BYTES
                             ) {
-                                halted = true
+                                st = 1n
                             } else {
                                 outLog = outLog + K17Machine.cell(top)
-                                ds = ds1
+                                nds = ds1
                             }
                         } else if (op == 20n) {
                             // TIME
                             if (n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds +
                                     K17Machine.cell(
                                         K17Machine.wrap(this.ctx.locktime)
@@ -760,22 +766,22 @@ export class K17Machine extends SmartContract {
                         } else if (op == 21n) {
                             // IN : -- W   (no witness left => tx invalid, not a fault)
                             if (n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
                                 assert(
                                     wi + 4n <= witnessLen,
                                     'witness required'
                                 )
-                                ds = ds + slice(witness, wi, wi + 4n)
+                                nds = ds + slice(witness, wi, wi + 4n)
                                 wi += 4n
                             }
                         } else if (op == 22n) {
                             // VERIFY : N1 --   (zero => tx invalid, not a fault)
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
                                 assert(top != 0n, 'verify failed')
-                                ds = ds1
+                                nds = ds1
                             }
                         } else if (op == 23n) {
                             // BOUNTY n
@@ -783,9 +789,9 @@ export class K17Machine extends SmartContract {
                         } else if (op == 24n) {
                             // *
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(
                                         K17Machine.wrap(second * top)
@@ -794,67 +800,66 @@ export class K17Machine extends SmartContract {
                         } else if (op == 25n) {
                             // HASH : N1 -- first 4 bytes of sha256(cell(N1))
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds1 +
                                     slice(sha256(K17Machine.cell(top)), 0n, 4n)
                             }
                         } else if (op == 26n) {
                             // WHO
                             if (n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + K17Machine.cell(who)
+                                nds = ds + K17Machine.cell(who)
                             }
                         } else if (op == 27n) {
                             // YIELD : end the cycle after this instruction
-                            yielded = true
+                            st = 2n
                         } else if (op == 28n) {
                             // MIN
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(second < top ? second : top)
                             }
                         } else if (op == 29n) {
                             // MAX
                             if (n < 8n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds2 +
                                     K17Machine.cell(second > top ? second : top)
                             }
                         } else if (op == 31n) {
                             // /  : unsigned division, zero divisor is a fault
                             if (n < 8n || top == 0n) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds2 + K17Machine.cell(second / top)
+                                nds = ds2 + K17Machine.cell(second / top)
                             }
                         } else if (op == 30n) {
                             // SIGVERIFY k : TAG VAL --
                             // Underflow, bad roster index, a second signature
                             // this cycle or an empty slot: fault. Missing or
                             // wrong signature: tx invalid.
-                            if (n < 8n || operand >= 4n || sigUsed) {
-                                halted = true
+                            if (n < 8n || operand >= 4n || len(sigRec) > 0n) {
+                                st = 1n
                             } else {
                                 const pub = this.roster[Number(operand)]
                                 if (pub == 0n) {
-                                    halted = true
+                                    st = 1n
                                 } else {
-                                    sigUsed = true
-                                    // ATTEST_DOMAIN ("K17A") || cell(TAG) || cell(VAL)
-                                    verifyNeeded = true
-                                    verifyMsg =
+                                    // ATTEST_DOMAIN ("K17A") || cell(TAG) ||
+                                    // cell(VAL), then the roster index.
+                                    sigRec =
                                         toByteString('4b313741') +
-                                        slice(ds, n - 8n, n)
-                                    verifyKey = pub
-                                    ds = ds2
+                                        slice(ds, n - 8n, n) +
+                                        int2ByteString(operand, 1n)
+                                    nds = ds2
                                 }
                             }
                         } else if (op == 32n) {
@@ -866,9 +871,9 @@ export class K17Machine extends SmartContract {
                             if (
                                 n < 12n ||
                                 top >= K17Machine.ROSTER_SLOTS_MEM ||
-                                sigUsed
+                                len(sigRec) > 0n
                             ) {
-                                halted = true
+                                st = 1n
                             } else {
                                 const slotByte =
                                     (K17Machine.ROSTER_BASE +
@@ -880,7 +885,7 @@ export class K17Machine extends SmartContract {
                                     slotByte + 32n
                                 )
                                 if (slotHash == K17Machine.EMPTY_HASH) {
-                                    halted = true
+                                    st = 1n
                                 } else {
                                     assert(
                                         len(keyA) == 384n,
@@ -890,15 +895,12 @@ export class K17Machine extends SmartContract {
                                         sha256(keyA) == slotHash,
                                         'key not in roster slot'
                                     )
-                                    sigUsed = true
                                     // "K17M" || instanceId || cell(TAG) || cell(VAL)
-                                    verifyNeeded = true
-                                    verifyMsg =
+                                    sigRec =
                                         toByteString('4b31374d') +
                                         this.instanceId +
                                         slice(ds, n - 12n, n - 4n)
-                                    verifyKey = Utils.fromLEUnsigned(keyA)
-                                    ds = slice(ds, 0n, n - 12n)
+                                    nds = slice(ds, 0n, n - 12n)
                                 }
                             }
                         } else if (op == 33n) {
@@ -911,9 +913,9 @@ export class K17Machine extends SmartContract {
                             if (
                                 n < 12n ||
                                 second >= K17Machine.ROSTER_SLOTS_MEM ||
-                                sigUsed
+                                len(sigRec) > 0n
                             ) {
-                                halted = true
+                                st = 1n
                             } else {
                                 const sponsorByte =
                                     (K17Machine.ROSTER_BASE +
@@ -929,14 +931,14 @@ export class K17Machine extends SmartContract {
                                         top * K17Machine.SLOT_CELLS) *
                                     4n
                                 if (sponsorHash == K17Machine.EMPTY_HASH) {
-                                    halted = true
+                                    st = 1n
                                 } else if (top >= K17Machine.ROSTER_SLOTS_MEM) {
-                                    halted = true
+                                    st = 1n
                                 } else if (
                                     slice(mem, newByte, newByte + 32n) !=
                                     K17Machine.EMPTY_HASH
                                 ) {
-                                    halted = true
+                                    st = 1n
                                 } else {
                                     assert(
                                         len(keyA) == 384n,
@@ -954,25 +956,22 @@ export class K17Machine extends SmartContract {
                                         sha256(keyA) == sponsorHash,
                                         'key not in roster slot'
                                     )
-                                    sigUsed = true
                                     const newHash = sha256(keyB)
                                     // "K17E" || instanceId || cell(TAG) ||
                                     // cell(NEWSLOT) || sha256(keyB) || payout
-                                    verifyNeeded = true
-                                    verifyMsg =
+                                    sigRec =
                                         toByteString('4b313745') +
                                         this.instanceId +
                                         slice(ds, n - 12n, n - 8n) +
                                         slice(ds, n - 4n, n) +
                                         newHash +
                                         payout
-                                    verifyKey = Utils.fromLEUnsigned(keyA)
                                     mem =
                                         slice(mem, 0n, newByte) +
                                         newHash +
                                         payout +
                                         slice(mem, newByte + 52n)
-                                    ds = slice(ds, 0n, n - 12n)
+                                    nds = slice(ds, 0n, n - 12n)
                                 }
                             }
                         } else if (op == 34n) {
@@ -981,15 +980,14 @@ export class K17Machine extends SmartContract {
                             // however malformed): fault that drops the
                             // payout. Underflow, bad slot, empty slot or
                             // N == 0: fault. Never tx-invalid.
-                            if (payslotUsed) {
-                                halted = true
-                                payslotUsed = false
-                                payslotSats = 0n
+                            if (len(payRec) > 0n) {
+                                st = 1n
+                                payRec = toByteString('')
                             } else if (
                                 n < 8n ||
                                 top >= K17Machine.ROSTER_SLOTS_MEM
                             ) {
-                                halted = true
+                                st = 1n
                             } else {
                                 const slotByte =
                                     (K17Machine.ROSTER_BASE +
@@ -999,28 +997,26 @@ export class K17Machine extends SmartContract {
                                     slice(mem, slotByte, slotByte + 32n) ==
                                     K17Machine.EMPTY_HASH
                                 ) {
-                                    halted = true
+                                    st = 1n
                                 } else if (second == 0n) {
-                                    halted = true
+                                    st = 1n
                                 } else {
-                                    payslotUsed = true
-                                    payslotSats = second
-                                    payslotAddr = Addr(
+                                    payRec =
+                                        K17Machine.cell(second) +
                                         slice(
                                             mem,
                                             slotByte + 32n,
                                             slotByte + 52n
                                         )
-                                    )
-                                    ds = ds2
+                                    nds = ds2
                                 }
                             }
                         } else if (op == 35n) {
                             // VALUE : -- V
                             if (n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds =
+                                nds =
                                     ds + K17Machine.cell(K17Machine.wrap(value))
                             }
                         } else if (op == 36n) {
@@ -1031,7 +1027,7 @@ export class K17Machine extends SmartContract {
                             // loop (tx invalid when wrong), even when a
                             // full data stack faults here, as in the VM.
                             if (treeOp != 0n) {
-                                halted = true
+                                st = 1n
                             } else {
                                 assert(
                                     len(leafPre) == K17Machine.LEAF_PRE_BYTES,
@@ -1042,39 +1038,35 @@ export class K17Machine extends SmartContract {
                                     slice(leafPre, 52n, 56n)
                                 )
                                 if (n >= K17Machine.DS_MAX_BYTES) {
-                                    halted = true
+                                    st = 1n
                                 } else {
-                                    ds = ds + K17Machine.cell(leafIndex)
+                                    nds = ds + K17Machine.cell(leafIndex)
                                 }
                             }
                         } else if (op == 37n) {
                             // LASTROUND : -- R   no bound member: fault
                             if (treeOp != 1n || n >= K17Machine.DS_MAX_BYTES) {
-                                halted = true
+                                st = 1n
                             } else {
-                                ds = ds + K17Machine.cell(memberLastRound)
+                                nds = ds + K17Machine.cell(memberLastRound)
                             }
                         } else if (op == 38n) {
                             // ATTESTM : TAG VAL --
                             // Underflow, no bound member or a second
                             // signature this cycle: fault. A key that is not
                             // the member's, or a bad signature: tx invalid.
-                            if (n < 8n || treeOp != 1n || sigUsed) {
-                                halted = true
+                            if (n < 8n || treeOp != 1n || len(sigRec) > 0n) {
+                                st = 1n
                             } else {
                                 // sha256(keyA) must equal the leaf's key
                                 // hash: checked after the loop. That check
                                 // pins keyA, so no length check is needed.
-                                memberKeyCheck = true
-                                sigUsed = true
                                 // "K17T" || instanceId || cell(TAG) || cell(VAL)
-                                verifyNeeded = true
-                                verifyMsg =
+                                sigRec =
                                     K17Machine.MEMBER_DOMAIN +
                                     this.instanceId +
                                     slice(ds, n - 8n, n)
-                                verifyKey = Utils.fromLEUnsigned(keyA)
-                                ds = ds2
+                                nds = ds2
                             }
                         } else if (op == 39n) {
                             // PAYLEAF : N ROUND --
@@ -1082,27 +1074,25 @@ export class K17Machine extends SmartContract {
                             // fault that drops the payout. Underflow, no
                             // bound member or N == 0: fault. ROUND not above
                             // the member's lastRound: tx invalid.
-                            if (payslotUsed) {
-                                halted = true
-                                payslotUsed = false
-                                payslotSats = 0n
+                            if (len(payRec) > 0n) {
+                                st = 1n
+                                payRec = toByteString('')
                             } else if (n < 8n || treeOp != 1n) {
-                                halted = true
+                                st = 1n
                             } else if (second == 0n) {
-                                halted = true
+                                st = 1n
                             } else {
                                 assert(
                                     top > memberLastRound,
                                     'round must be above lastRound'
                                 )
-                                payslotUsed = true
-                                payslotSats = second
-                                payslotAddr = Addr(slice(leafPre, 32n, 52n))
+                                payRec =
+                                    K17Machine.cell(second) +
+                                    slice(leafPre, 32n, 52n)
                                 // The new leaf hash (lastRound := ROUND) is
                                 // computed after the loop.
-                                leafChanged = true
                                 memberLastRound = top
-                                ds = ds2
+                                nds = ds2
                             }
                         } else if (op == 40n || op == 41n) {
                             // ADMIT (0x28) : TAG ROUND --
@@ -1113,35 +1103,73 @@ export class K17Machine extends SmartContract {
                             // are checked after the loop (tx invalid when
                             // wrong). treeOp becomes 2 (ADMIT) or 3 (REMOVE).
                             const need: bigint = op == 40n ? 8n : 4n
-                            if (n < need || treeOp != 0n || sigUsed) {
-                                halted = true
+                            if (n < need || treeOp != 0n || len(sigRec) > 0n) {
+                                st = 1n
                             } else {
-                                sigUsed = true
                                 treeOp = op - 38n
-                                treeArgs = slice(ds, n - need, n)
-                                ds = slice(ds, 0n, n - need)
+                                sigRec = slice(ds, n - need, n)
+                                nds = slice(ds, 0n, n - need)
                             }
                         } else if (op == 42n) {
                             // OUTH : N1 --   logHash := sha256(logHash || cell(N1))
                             // Underflow: fault. No capacity limit.
                             if (n < 4n) {
-                                halted = true
+                                st = 1n
                             } else {
                                 logHash = sha256(logHash + K17Machine.cell(top))
-                                ds = ds1
+                                nds = ds1
                             }
                         } else {
                             // unknown opcode
-                            halted = true
+                            st = 1n
                         }
 
-                        if (!halted) {
+                        // One write-back per iteration (see the comment at st).
+                        status = st
+                        ds = nds
+                        if (st != 1n) {
                             pc = nextPc
                         }
                     }
                 }
             }
         }
+
+        let halted = status == 1n
+        // Decode the signature record (see sigRec). Only SIGVERIFY's record
+        // is 13 bytes (ATTEST 44, ENDORSE 96, ATTESTM 44, ADMIT 8, REMOVE
+        // 4); it verifies under a deployment roster key, the others under
+        // keyA (an empty keyA gives 0, unused).
+        // The length discrimination relies on instanceId being exactly 32
+        // bytes (guaranteed: a wrong length halts at entry, before any
+        // signature handler runs), which keeps every other record length
+        // distinct from 13. Any future change to the ATTEST/ATTESTM/ENDORSE
+        // message layout must switch to an explicit domain or opcode tag in
+        // the record instead of relying on length.
+        const sigUsed = len(sigRec) > 0n
+        const treeArgs = sigRec
+        let verifyMsg = sigRec
+        let verifyKey: RabinPubKey = Utils.fromLEUnsigned(keyA)
+        if (len(sigRec) == 13n) {
+            verifyMsg = slice(sigRec, 0n, 12n)
+            verifyKey =
+                this.roster[Number(byteString2Int(slice(sigRec, 12n, 13n)))]
+        }
+        // Decode the payment record (see payRec).
+        let payslotUsed = len(payRec) > 0n
+        let payslotSats = 0n
+        let payslotAddr: Addr = this.beneficiary
+        if (payslotUsed) {
+            payslotSats = K17Machine.uncell(slice(payRec, 0n, 4n))
+            payslotAddr = Addr(slice(payRec, 4n, 24n))
+        }
+        // PAYLEAF is the only instruction in the loop that changes the leaf,
+        // and it requires ROUND > lastRound, so the leaf changed exactly
+        // when the bound member's lastRound moved.
+        let leafChanged: boolean =
+            treeOp == 1n
+                ? memberLastRound != K17Machine.uncell(slice(leafPre, 52n, 56n))
+                : false
 
         // ---- the cycle's one roster-tree proof -----------------------
         // Checked whenever a tree instruction ran, halted or not: the VM
@@ -1166,7 +1194,16 @@ export class K17Machine extends SmartContract {
                     this.rosterRoot,
                 'proof does not match rosterRoot'
             )
-            if (memberKeyCheck) {
+            // ATTESTM ran iff a member is bound and the recorded signature
+            // has its domain (no other signature instruction can follow it
+            // in the cycle). With treeOp == 1 a recorded signature came from
+            // SIGVERIFY, ATTEST, ENDORSE or ATTESTM, so verifyMsg is not
+            // empty; ADMIT and REMOVE (treeOp 2, 3) build theirs below.
+            if (
+                treeOp == 1n &&
+                sigUsed &&
+                slice(verifyMsg, 0n, 4n) == K17Machine.MEMBER_DOMAIN
+            ) {
                 // ATTESTM: the signing key is the bound member's key.
                 assert(
                     sha256(keyA) == slice(leafPre, 0n, 32n),
@@ -1238,8 +1275,6 @@ export class K17Machine extends SmartContract {
                         msgHead +
                         slice(leafPre, 0n, 52n)
                 }
-                verifyNeeded = true
-                verifyKey = Utils.fromLEUnsigned(keyA)
                 leafChanged = true
                 rosterSeq = this.rosterSeq + 1n
             }
@@ -1262,7 +1297,7 @@ export class K17Machine extends SmartContract {
         // did not use must be empty (or 0), and a used Rabin signature must
         // be in its one canonical form. The rules are checked here, after
         // the loop, on the alive and the halted path alike.
-        if (verifyNeeded) {
+        if (sigUsed) {
             // RabinVerifier checks s^2 mod n, so s, n - s, -s and s + k*n
             // all verify. Accept only 0 < s < n/2 (n = verifyKey).
             assert(

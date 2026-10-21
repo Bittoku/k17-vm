@@ -22,10 +22,21 @@ publication belong in this repo.
 - `SIGVERIFY` verifies a Rabin signature (scrypt-ts-lib `RabinVerifier`, security level 6);
   `src/k17/attest.ts` signs with the same parameters. One signature per cycle, shared by
   `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and `REMOVE`: a second one in a cycle
-  is a fault (v3.1). The contract folds `sigUsed` into each handler's existing fault condition
-  (`if (<underflow> || ... || sigUsed) halted = true`); do not wrap handler bodies in a new
-  `if`/`else`, which costs about 14 KB at K=40. The VM returns `fault` for `sigUsed` before any
-  `need_witness` check.
+  is a fault (v3.1). In the contract, handlers do not write the loop-carried `status` or
+  data stack `ds`. Each iteration declares per-iteration temporaries (`let st = 0n`, `let nds = ds`);
+  a handler sets `st = 1n` for a fault (2 for a yield) and assigns `nds`, and both are written
+  back once at the end of the iteration. The one-signature flag is `len(sigRec) > 0n`
+  (`sigRec` holds the cycle's one signature record, empty until a signature instruction runs;
+  a second one faults), and payments go through the single `payRec` record (`PAYSLOT` or
+  `PAYLEAF`), decoded after the loop. WHY: every loop-carried variable lies under all 40
+  unrolled copies of the loop body, and sCrypt sinks each assignment to it with one `OP_ROLL`
+  per stack slot above it, so each extra loop-carried variable makes every access in every
+  handler deeper (about 2 bytes per slot, 40 times, in each of 43 branches). Keep new
+  per-cycle state per-iteration, or pack it into an existing compact record; do not add
+  loop-carried booleans or counters, and do not wrap handler bodies in new `if`/`else`. This
+  took the K=40 script from 470 098 to 182 986 bytes with no behaviour change; undoing it
+  brings the size back. The VM returns `fault` for a second signature before any `need_witness`
+  check.
 - Roster in memory (v2 machine): 8 slots of 13 cells at cells 152..255 (slot k at
   `152 + 13k`): 8 cells of SHA-256 key hash, then 5 cells of payout address hash. All-zero
   hash cells mean an empty slot. `!` into cell 152 or higher faults; only `ENDORSE` writes
@@ -120,7 +131,8 @@ DEAD_MAN_FLOOR` (6 h, exported from `src/keeper.ts`) unless `econ.allowShortDead
 - `planCycle` error order: `lockTime before lastTime` (before the VM), then the VM's
   `needs a witness` / `witness rejected`, then the MIN_STEP error.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  12 KB per instruction with the current 43 handlers (470 098 bytes at K=40). A cycle that
+  4.6 KB per instruction with the current 43 handlers (182 986 bytes at K=40; it was
+  470 098 bytes, about 12 KB per instruction, before the shallow-temporaries change). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and
   imports the compiled artifact from `artifacts/`; after an ISA change, rebuild and recompile
