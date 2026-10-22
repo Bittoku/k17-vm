@@ -163,7 +163,7 @@ Open design questions:
 - **What does it cost in script size?** Every cycle carries the full interpreter. Extra code makes every transaction larger.
 - **How does it affect existing machines?** Both designs change the contract template, which makes a new artifact. Existing machines cannot be upgraded. The published disclosure describes the current behavior.
 
-Proposed direction (under evaluation, not implemented): anyone may top up, so a machine can be crowd-funded. A top-up resets the dead-man clock only when it is at least the original escrow.
+Proposed direction (under evaluation, not implemented): anyone may top up, so a machine can be crowd-funded. A top-up only adds value. It does not change `lastTime`, so the reward auction and the dead-man clock do not change. Only a real cycle moves them. An idle machine therefore still refunds at `lastTime + deadMan`, even after a top-up.
 
 ## 6. K17 compared with Ethereum keeper contracts
 
