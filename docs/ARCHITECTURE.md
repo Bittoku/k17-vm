@@ -8,9 +8,9 @@ One UTXO holds one suspended stack-machine process. The locking script of that U
 
 A spend runs up to K = 40 instructions. The spend is valid only if its first output recreates the UTXO with the state advanced by exactly those instructions. Anyone may spend the UTXO.
 
-The contract pays the spender a reward. The contract computes the reward from the time since the last cycle. It adds any `BOUNTY`. The total is capped at the balance less 1 sat. It shrinks to make room for a payout.
+The contract pays the spender exactly the reward that it computes. It computes the reward from the time since the last cycle. It adds any `BOUNTY`. The total is capped at the balance less 1 sat. It shrinks to make room for a payout.
 
-Miners check every cycle. No off-chain party must compute the result, so no off-chain party must be trusted for it. A program that reads signed inputs still trusts the signer for those values.
+Miners check every cycle. So no off-chain party needs to be trusted for the result. A program that reads signed inputs still trusts the signer for those values.
 
 ## 2. System components
 
@@ -85,28 +85,28 @@ A program that waits for a witness nobody has would never fault. For that case, 
 
 A K17 machine is not a one-spend contract. It is one UTXO that the keepers spend many times. Each cycle recreates the output with the advanced state. A program can loop as long as the escrow and the program allow.
 
-Three programs in this repository show the pattern. `heartbeatProgram` loops with no end. The output log limit stops it (section 7). `fibonacciProgram(n)` and `countdownProgram(n)` in `src/k17/programs.ts` loop `n` times and then `HALT`. The companion repository, [`k17-dc4cd`](https://github.com/Bittoku/k17-dc4cd), has multi-round consortium programs. They run one round after another. The README describes the per-round rules.
+Three programs in this repository show the pattern. `heartbeatProgram` loops with no end. The output log limit stops it (section 7). `fibonacciProgram(n)` and `countdownProgram(n)` in `src/k17/programs.ts` loop `n` times and then `HALT`. The companion repository, [`k17-dc4cd`](https://github.com/Bittoku/k17-dc4cd), has multi-round consortium programs. They run one round after another. Its README ("Operational rules") describes the per-round rules.
 
 Three limits end a long-running machine.
 
-1. **The escrow.** Each cycle pays the keeper reward and any bounty, so the balance falls. A program can read the balance with `VALUE` and stop when it is too low. A `PAYSLOT` payout that the balance cannot cover (balance less 1 sat) is a fault. The machine then halts and refunds the beneficiary. A `BOUNTY` that is too large is not a fault. The contract caps the reward plus bounty at the balance less 1 sat. A program that must pay in full needs to check `VALUE` first.
+1. **The escrow.** Each cycle pays the keeper reward and any bounty, so the balance falls. A program can read the balance with `VALUE` and stop when it is too low. A `PAYSLOT` or `PAYLEAF` payout that the balance cannot cover (balance less 1 sat) is a fault. The machine then halts and refunds the beneficiary. A `BOUNTY` that is too large is not a fault. The contract caps the reward plus bounty at the balance less 1 sat. A program that must pay in full needs to check `VALUE` first.
 2. **The program deadline.** The program reads `TIME` and halts after its own limit.
 3. **The dead-man interval.** A non-zero `deadMan` ends a machine that nobody advances (section 3).
 
 ### 4.1 Iterative improvement with a bounty
 
-A program can run a search that never needs to finish. It keeps the best result so far in memory. A solver supplies a witness. The program accepts the witness only if a covenant-checked quality beats the stored best. For each accepted witness the program does these things:
+A program can run a search that never needs to finish. It keeps the best result so far in memory. A solver supplies a witness. The program accepts the witness only if a quality that the program computes and miners check beats the stored best. For each accepted witness the program does these things:
 
 - It pays a bounty with `BOUNTY`.
 - It stores the new best.
 - It loops to wait for the next witness.
 
-Each accepted output is strictly better than the one before it. A witness that is not better makes the transaction invalid (`VERIFY` of zero). The UTXO stays as it was.
+Each accepted answer is strictly better than the one before it. A witness that is not better makes the transaction invalid (`VERIFY` of zero). The UTXO stays as it was.
 
 Two constraints apply.
 
 - The program must compute the quality inside one cycle of K = 40 instructions. The ISA has 32-bit unsigned cells. It has no signed or floating arithmetic.
-- A cycle pays one bounty. `BOUNTY` adds to the keeper reward, which is one output. The reward is capped at the balance less 1 sat.
+- A cycle can pay only its spender. Every `BOUNTY` in the cycle adds to the keeper reward, which is one output. The reward is capped at the balance less 1 sat.
 
 **Sketch — not a program in this repository.** The quality is a closer integer approximation of the square root of `N`. The witness `x` is accepted when `|x*x - N|` is smaller than the stored best error. `best` starts at `N`, the error of `x = 0`.
 
@@ -134,7 +134,7 @@ flowchart TD
 6. Run `BOUNTY b`, store `x` and `err` in memory, and log `x` with `OUT`.
 7. If `err` is zero, `HALT` and refund the beneficiary. Otherwise `YIELD` and loop.
 
-The step list is a plan. Nobody has written, sized or run this program. The count of instructions per stage is not measured. Two open points remain. A fixed bounty pays for a tiny improvement as much as for a large one. Also, each cycle costs at least `rewardMin + 60 * slope`, so many small improvements use the escrow quickly.
+The step list is a plan. Nobody has written, sized or run this program. The count of instructions per stage is not measured. Three open points remain. A bystander can copy a pending witness and front-run it, as in section 8. A fixed bounty pays for a tiny improvement as much as for a large one, so a solver who knows a good answer can send a chain of small improvements and collect a bounty for each. Also, each cycle costs at least `rewardMin + 60 * slope`, so many small improvements use the escrow quickly.
 
 ## 5. Topping up the escrow
 
@@ -147,7 +147,7 @@ A transaction can send coins to the same locking script. This creates a second, 
 Today there are two options.
 
 - Deploy with enough escrow for the intended life of the machine.
-- When the balance runs low, let the machine halt (or let the dead-man halt refund it). The beneficiary then deploys a new machine. The new deployment carries over the state it needs in its initial memory.
+- When the balance runs low, let the machine halt (or let the dead-man halt refund it). The beneficiary then deploys a new machine. The new deployment can carry over memory (the initial memory image) and a roster root. It cannot carry over the stacks, the output log or `logHash`.
 
 ### 5.1 Possible future support
 
@@ -162,6 +162,8 @@ Open design questions:
 - **Does a refill reset the dead-man clock?** Probably not, because a refill is not progress. A refill that the beneficiary signs could reset it.
 - **What does it cost in script size?** Every cycle carries the full interpreter. Extra code makes every transaction larger.
 - **How does it affect existing machines?** Both designs change the contract template, which makes a new artifact. Existing machines cannot be upgraded. The published disclosure describes the current behavior.
+
+Proposed direction (under evaluation, not implemented): anyone may top up, so a machine can be crowd-funded. A top-up resets the dead-man clock only when it is at least the original escrow.
 
 ## 6. K17 compared with Ethereum keeper contracts
 
@@ -260,7 +262,7 @@ OUT OUT
 HALT
 ```
 
-`IN IN` reads the two witness cells. The `VERIFY` lines check the range of each factor, rule out the factor 1, and check that the product equals `n`. A failed `VERIFY` makes the transaction invalid, so the network refuses a wrong answer. `BOUNTY` authorizes `bounty` extra satoshis for the spender. `OUT OUT` logs `q` and `p`. `HALT` returns the rest of the escrow to the beneficiary.
+`IN IN` reads the two witness cells. The `VERIFY` lines check the range of each factor, rule out the factor 1, and check that the product equals `n`. A failed `VERIFY` makes the transaction invalid, so the network refuses a wrong answer. `BOUNTY` authorises `bounty` extra satoshis for the spender. `OUT OUT` logs `q` and `p`. `HALT` returns the rest of the escrow to the beneficiary.
 
 ```mermaid
 sequenceDiagram
@@ -287,7 +289,7 @@ Stage 1 is the factoring bounty above. It stores `p` in memory. Stage 2 asks for
 1. A solver commits `c = HASH(x XOR WHO)`. `WHO` pushes the first four bytes of the address of the spender, so the commitment names the payee.
 2. In the reveal, the machine checks `HASH(x XOR WHO) == c` with the current spender. Only the address of the committer passes.
 
-A commit can be overwritten after `commitTtl` seconds. This stops a bogus commit from blocking the job. A `deadline` is checked at the start of every stage-2 cycle. If stage 2 is not finished in time, it halts the machine and refunds the escrow.
+A commit can be overwritten after `commitTtl` seconds. This stops a bogus commit from blocking the job. A `deadline` is checked at the start of every stage-2 cycle. If stage 2 is not finished in time, this check halts the machine and refunds the escrow.
 
 Stage 1 has no deadline. Deploy with a non-zero `deadMan`, so that an unsolved stage 1 can still be refunded. The header comment of the function in `src/k17/programs.ts` gives the sizing rules for the TTL.
 
