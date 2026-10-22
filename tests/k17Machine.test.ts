@@ -58,6 +58,7 @@ import {
     PlanOptions,
     assertChangeOutput,
     sendCycle,
+    buildFundedCycleTx,
     stepArgs,
 } from '../src/keeper'
 import {
@@ -4746,6 +4747,50 @@ describe('K17Machine on-chain', function () {
         const p2 = planCycle(n, plan.remaining + topUp, t + 60n, keeperA)
         const s2 = await sendCycle(n, p2, keeperA, t + 60n)
         expect(s2.tx.verifyInputScript(0).success).to.equal(true)
+    })
+
+    it('top-up (external funder): buildFundedCycleTx leaves the funder input empty, signs the rest, and a later funder signature completes it', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const topUp = 6_000n
+        const plan = planCycle(m, v, t, keeperA, [], NO_SIG, {}, undefined, {
+            topUp,
+        })
+        const coin = funderCoin(topUp)
+        const keeperSigner = m.signer
+        const built = await buildFundedCycleTx(m, plan, keeperA, t, [coin])
+        expect(m.signer).to.equal(keeperSigner)
+        expect(built.atInputIndex).to.equal(0)
+        expect(built.funderInputIndices).to.deep.equal([1])
+        expect(built.next).to.equal(plan.next)
+        const tx = built.tx
+        // The funder input is empty; the machine and fee inputs are signed.
+        expect(tx.inputs[1].script.toHex()).to.equal('')
+        expect(tx.inputs.length).to.be.greaterThan(2)
+        tx.inputs.forEach((inp, i) => {
+            if (i !== 1) expect(inp.script.toHex()).to.not.equal('')
+        })
+        expect(BigInt(tx.outputs[0].satoshis)).to.equal(plan.remaining + topUp)
+        expect(tx.getChangeOutput()).to.not.equal(null)
+        expect(tx.verifyInputScript(0).success).to.equal(true)
+        // Later (another process): the parsed tx gets the funder signature;
+        // the keeper's signatures stay valid.
+        const later = new bsv.Transaction(tx.uncheckedSerialize())
+        later.inputs[0].output = tx.inputs[0].output
+        later.inputs[1].output = new bsv.Transaction.Output({
+            script: bsv.Script.fromHex(coin.script),
+            satoshis: Number(coin.satoshis),
+        })
+        later.inputs[1].setScript(
+            bsv.Script.fromHex(p2pkhUnlock(funderKey, later, 1))
+        )
+        expect(later.verifyInputScript(0).success).to.equal(true)
+        expect(later.verifyInputScript(1).success).to.equal(true)
+        // Wrong coin totals are refused before anything is signed.
+        await expect(
+            buildFundedCycleTx(m, plan, keeperA, t, [funderCoin(topUp + 1n)])
+        ).to.be.rejectedWith(/exactly plan.topUp/)
     })
 
     it('top-up (external funder): wrong coin totals and a wrong funder signature are refused before broadcast', async () => {

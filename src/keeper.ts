@@ -630,14 +630,22 @@ export interface FunderInput {
  * Output: the unlocking script hex for that input (for P2PKH:
  * `<sig> <pubkey>`). The funder signs with SIGHASH_ALL | FORKID, so its
  * signature commits to the machine output value and to every other output
- * and input; any change after signing makes the signature invalid. The
- * funder must check, before it signs, these four things. It computes
- * `remaining` itself: it replays planCycle on the real machine UTXO and
- * does not trust the builder's value. Then it checks that output 0 equals
- * `remaining` plus the sum of the funder's own coins, and that the
- * `topUp` argument of the machine input equals that sum. If it signs
- * without these checks, a dishonest builder can move the excess of the
- * funder's coin over `topUp` into the keeper's change.
+ * and input; any change after signing makes the signature invalid. Before
+ * it signs, the funder must check the transaction against data it reads
+ * from the chain itself, never against the builder's claims:
+ *   - input 0 spends the unspent tip of the machine the funder chose (found
+ *     by following spends from an outpoint of that machine; an equal
+ *     instance id alone is not enough, because anyone can deploy a machine
+ *     with a copied instance id);
+ *   - the `topUp` argument of the machine input equals the sum of the
+ *     funder's coins, and no other input spends a coin of the funder's key
+ *     (else two separately signed requests over one transaction move the
+ *     second coin into the keeper's change);
+ *   - output 0 carries `remaining + topUp`: either replay planCycle on the
+ *     real machine UTXO, or run the script interpreter on the machine input
+ *     against the real prevout (the covenant then enforces the value).
+ * If it signs without these checks, a dishonest builder can move funder
+ * value into the keeper's change or into a machine it controls.
  */
 export type FunderSigner = (
     tx: bsv.Transaction,
@@ -966,6 +974,82 @@ function assertCycleTx(
     }
 }
 
+/** Result of buildFundedCycleTx: a final cycle that waits for its funder. */
+export interface FundedCycleTx {
+    /**
+     * The final transaction. The machine input and every keeper fee input
+     * are signed; each funder input has an empty unlocking script. Outputs,
+     * inputs and nLockTime are final, so a funder can sign later (in another
+     * process) and its SIGHASH_ALL | FORKID signature stays valid.
+     */
+    tx: bsv.Transaction
+    /** Input index of the machine (0 unless test overrides moved it). */
+    atInputIndex: number
+    /** Input indices of the funder coins, in the order of `inputs`. */
+    funderInputIndices: number[]
+    /** The next machine instance (undefined when the cycle halted). */
+    next?: K17Machine
+}
+
+/**
+ * Build the final transaction of a funded cycle without the funder
+ * signatures, for a funder that signs later or in another process.
+ * It builds the cycle as sendCycle does with `funding` (funder coins as
+ * inputs 1..n, keeper fee inputs and change from autoPayfee, the keeper's
+ * signer signs its own inputs and skips the funder inputs), runs the
+ * pre-sign checks of sendCycle (assertCycleTx: output 0 carries
+ * `remaining + topUp`, a change output, the machine input passes the
+ * script interpreter), and returns. Nothing is broadcast.
+ * Input: instance (connected to the keeper's signer), plan, keeper address,
+ * nLockTime, the funder coins (their sum must equal plan.topUp) and
+ * test-only overrides. Output: FundedCycleTx. Throws on any failed check;
+ * the machine UTXO is then unspent. Not safe for concurrent calls on the
+ * same instance: it swaps `m.signer` for the duration of the call.
+ */
+export async function buildFundedCycleTx(
+    m: K17Machine,
+    plan: CyclePlan,
+    keeper: bsv.Address,
+    lockTime: bigint,
+    inputs: FunderInput[],
+    overrides: CycleOverrides = {}
+): Promise<FundedCycleTx> {
+    // The sign callback is never called here; bindCycleBuilder needs only
+    // the coins.
+    const funding: CycleFunding = {
+        inputs,
+        sign: () => {
+            throw new Error('buildFundedCycleTx does not sign funder inputs')
+        },
+    }
+    const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides, funding)
+    const leading = overrides.leadingFeeInputs ?? 0
+    const funderInputIndices = inputs.map((_, i) => leading + 1 + i)
+    const keeperSigner = m.signer
+    await m.connect(skipInputsSigner(keeperSigner, new Set(funderInputIndices)))
+    let tx: bsv.Transaction
+    let atInputIndex: number
+    try {
+        const r = await m.methods.step(...stepArgs(plan, keeper), {
+            ...opts,
+            partiallySigned: true,
+        })
+        tx = r.tx
+        atInputIndex = r.atInputIndex
+    } finally {
+        await m.connect(keeperSigner)
+    }
+    // The machine input sighash does not depend on the funder's unlocking
+    // scripts, so these checks hold after the funder signs.
+    assertCycleTx(tx, plan, overrides, [atInputIndex])
+    return {
+        tx,
+        atInputIndex,
+        funderInputIndices,
+        next: plan.halted ? undefined : overrides.next ?? plan.next,
+    }
+}
+
 /**
  * Build, sign and (by default) broadcast one cycle of `m` from its plan,
  * with the plan's canonical `step` arguments. This is the keeper entry
@@ -983,8 +1067,10 @@ function assertCycleTx(
  * sendCycle checks: output 0 carries `remaining + topUp` (live), the
  * transaction has a change output (assertChangeOutput) and the machine
  * input passes the script interpreter. It runs these checks before it
- * calls `funding.sign`, and again before it broadcasts (the callback can
- * change the transaction), together with every funder input.
+ * calls `funding.sign` (through buildFundedCycleTx), and again before it
+ * broadcasts (the callback can change the transaction), together with every
+ * funder input. A funder in another process uses buildFundedCycleTx
+ * directly and adds its signatures later.
  * Not safe for concurrent calls on the same machine instance: with
  * `funding` it swaps `m.signer` for the duration of the call.
  * Input: instance (connected to the keeper's signer), plan, keeper
@@ -999,38 +1085,36 @@ export async function sendCycle(
     options: SendCycleOptions = {}
 ): Promise<SentCycle> {
     const { funding, overrides = {}, broadcast = true } = options
-    const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides, funding)
-    const leading = overrides.leadingFeeInputs ?? 0
-    const funderInputIndices = (funding?.inputs ?? []).map(
-        (_, i) => leading + 1 + i
-    )
-    const keeperSigner = m.signer
-    if (funding) {
-        await m.connect(
-            skipInputsSigner(keeperSigner, new Set(funderInputIndices))
-        )
-    }
     let tx: bsv.Transaction
     let atInputIndex: number
-    try {
+    let funderInputIndices: number[] = []
+    if (funding) {
+        // Build and check without the funder signatures, then ask the
+        // funder for each one.
+        const built = await buildFundedCycleTx(
+            m,
+            plan,
+            keeper,
+            lockTime,
+            funding.inputs,
+            overrides
+        )
+        tx = built.tx
+        atInputIndex = built.atInputIndex
+        funderInputIndices = built.funderInputIndices
+        for (const [i, idx] of funderInputIndices.entries()) {
+            const coin = funding.inputs[i]
+            const unlocking = await funding.sign(tx, idx, coin)
+            tx.inputs[idx].setScript(bsv.Script.fromHex(unlocking))
+        }
+    } else {
+        const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
         const r = await m.methods.step(...stepArgs(plan, keeper), {
             ...opts,
             partiallySigned: true,
         })
         tx = r.tx
         atInputIndex = r.atInputIndex
-    } finally {
-        if (funding) await m.connect(keeperSigner)
-    }
-    if (funding) {
-        // Same checks before the funder signs. The machine input sighash
-        // does not depend on the funder's unlocking scripts.
-        assertCycleTx(tx, plan, overrides, [atInputIndex])
-        for (const [i, idx] of funderInputIndices.entries()) {
-            const coin = funding.inputs[i]
-            const unlocking = await funding.sign(tx, idx, coin)
-            tx.inputs[idx].setScript(bsv.Script.fromHex(unlocking))
-        }
     }
     // Again after the callback, because the callback can change tx.
     assertCycleTx(tx, plan, overrides, [atInputIndex, ...funderInputIndices])
