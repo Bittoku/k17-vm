@@ -320,6 +320,12 @@ cycle takes no top-up` before a transaction is built.
   the fee estimate does not count other unlocking-script sizes. A keeper can refuse to include a funder's coins; that
   delays the top-up but does not lose the funder's money.
 
+  For a funder that signs later or in another process, use
+  `buildFundedCycleTx(machine, plan, keeper, lockTime, inputs)`. It returns
+  the final transaction with the keeper inputs signed and the funder inputs
+  empty, runs the same pre-sign checks as `sendCycle`, and broadcasts
+  nothing.
+
 - Canonical unlocking script (v3.1). Every argument of `step` has one
   valid value. An argument the cycle did not use must be empty, or 0 for
   `sigS`, `leafIndex` and `topUp`. The witness must hold exactly the cells that `IN`
