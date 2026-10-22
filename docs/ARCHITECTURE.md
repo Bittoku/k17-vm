@@ -154,14 +154,21 @@ Rules:
 Who supplies the extra inputs:
 
 - **The keeper (self-funded).** The keeper's wallet adds its own coins for the top-up and the fee. The change goes back to the keeper.
-- **A separate funder.** The keeper adds the funder's coins as inputs. Their sum must be exactly `topUp`. The funder waits until the transaction is final. The funder computes `remaining` itself: it replays `planCycle` on the real machine UTXO. It checks that output 0 equals `remaining` plus the sum of its own coins. It also checks that the `topUp` argument of the machine input equals that sum. Without these checks, a dishonest builder can move the excess of the funder's coin over `topUp` into the keeper's change. The funder coins must be P2PKH, because the fee estimate does not count other unlocking-script sizes. Then it signs its own inputs with `SIGHASH_ALL`. The signature covers all outputs, so nobody can move the funder's coins to another output after it signs. The keeper can refuse to include a funder's coins. That delays the top-up, but the funder keeps its coins.
+- **A separate funder.** The keeper adds the funder's coins as inputs. Their sum must be exactly `topUp`. The funder waits until the transaction is final. A funder in another process gets it from `buildFundedCycleTx`, which returns the final transaction with the keeper inputs signed and the funder inputs empty. Before it signs, the funder makes these checks on data it reads from the chain itself:
+
+  1. Input 0 spends the unspent tip that the funder finds when it follows spends from a machine outpoint taken from a trusted record. An equal instance id is not enough: anyone can deploy a copy of the machine with the same id.
+  2. No other input spends a coin of the funder's key.
+  3. The values of the funder coins add up to `topUp`, and the `topUp` argument of the machine input equals that sum.
+  4. Output 0 holds `remaining + topUp`. The funder gets `remaining` from a `planCycle` replay on the real machine UTXO, or runs the script interpreter on the machine input against the real prevout.
+
+  Without these checks, a dishonest builder can move funder sats into the keeper's change, or put the top-up into a machine that the builder controls. The funder coins must be P2PKH, because the fee estimate does not count other unlocking-script sizes. Then it signs its own inputs with `SIGHASH_ALL`. The signature covers all outputs, so nobody can move the funder's coins to another output after it signs. The keeper can refuse to include a funder's coins. That delays the top-up, but the funder keeps its coins.
 
 A blocked machine cannot get a top-up: no cycle runs until a witness arrives. A transaction that only sends coins to the same locking script creates a second, independent UTXO with the same state. The contract never merges the two.
 
 ### 5.1 Compatibility
 
 - The top-up changes the locking script. It is a new contract template and a new artifact (`artifacts/k17Machine.json`). The script is 26 bytes larger (183 012 bytes at K = 40).
-- Machines deployed before this version cannot be topped up. Their code is fixed in their UTXO. They keep the earlier rule: the next machine output holds exactly `value - reward - payout`. For such a machine, deploy with enough escrow for its intended life. Or let it halt and deploy a new machine. A new deployment can carry over memory (the initial memory image) and a roster root. It cannot carry over the stacks, the output log or `logHash`.
+- Machines deployed before this version cannot be topped up. Their code is fixed in their UTXO. They keep the earlier rule: the next machine output holds exactly `value - reward - payout`. This release cannot load them: `fromLockingScript` with the new artifact gives a template mismatch. Keep the earlier release to run or halt such a machine. For such a machine, deploy with enough escrow for its intended life. Or let it halt and deploy a new machine. A new deployment can carry over memory (the initial memory image) and a roster root. It cannot carry over the stacks, the output log or `logHash`.
 - Every caller of `step` must pass 11 arguments. A call with the earlier 10 arguments fails.
 - The published disclosures, including the [defensive publication](K17-DEFENSIVE-PUBLICATION.md), describe the earlier behaviour: one `step` method and exact value conservation. They do not describe the top-up.
 
@@ -201,9 +208,9 @@ A cheap keeper moves early and takes a small reward. A costly keeper wins only w
 
 A live cycle must also advance the clock by at least `MIN_STEP` = 60 seconds. Without this rule, a keeper could hold `nLockTime` at `lastTime` while it drives the machine. Then `lastTime` would lag the chain clock. The dead-man halt would come early.
 
-**What Ethereum keepers do well.** They can check complex conditions, and they run for little gas. K17 pays for its generality in size. The README measures the K = 40, 43-handler locking script at 182 986 bytes. It measures the final (halting) cycle transaction at 183 626 bytes.
+**What Ethereum keepers do well.** They can check complex conditions, and they run for little gas. K17 pays for its generality in size. The README measures the K = 40, 43-handler locking script at 183 012 bytes. It measures the final (halting) cycle transaction at 183 652 bytes.
 
-A cycle that keeps the machine alive also carries the next state output. It is about twice the size of the locking script. The one measured live cycle is the enrolment cycle of `enrolAndAttestProgram`, at 366 514 bytes.
+A cycle that keeps the machine alive also carries the next state output. It is about twice the size of the locking script. The one measured live cycle is the enrolment cycle of `enrolAndAttestProgram`, at 366 568 bytes.
 
 The clock rule also limits speed. At `nLockTime` = MTP - 1, a keeper gets about one live cycle per block. K17 suits slow, valuable, trust-minimised work. It does not suit work that needs fast, cheap and frequent calls.
 

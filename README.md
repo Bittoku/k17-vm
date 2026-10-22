@@ -311,14 +311,29 @@ cycle takes no top-up` before a transaction is built.
   the signer. For a third-party funder, pass `funding` to `sendCycle`: the
   funder's coins (their sum must be exactly `topUp`) become inputs 1..n,
   and a callback signs each of them with SIGHASH_ALL after the transaction
-  is final. Before it signs, the funder must compute `remaining` itself: it
-  replays `planCycle` on the real machine UTXO. It must check that output 0
-  equals `remaining` plus the sum of its own coins. It must also check that
-  the `topUp` argument of the machine input equals that sum. Without these
-  checks, a dishonest builder can move the excess of the funder's coin over
-  `topUp` into the keeper's change. The funder coins must be P2PKH, because
+  is final. Before it signs, the funder must make these checks on data it
+  reads from the chain itself:
+
+  1. Input 0 spends the unspent tip that the funder finds when it follows
+     spends from a machine outpoint taken from a trusted record (the deploy
+     output or the sponsor's config). An equal instance id is not enough:
+     anyone can deploy a copy of the machine with the same id.
+  2. No other input spends a coin of the funder's key.
+  3. The values of the funder coins add up to `topUp`, and the `topUp`
+     argument of the machine input equals that sum.
+  4. Output 0 holds `remaining + topUp`. Get `remaining` from a `planCycle`
+     replay on the real machine UTXO, or run the script interpreter on the
+     machine input against the real prevout (the covenant then enforces
+     the value).
+
+  Without these checks, a dishonest builder can move funder sats into the
+  keeper's change, or put the top-up into a machine that the builder
+  controls. The `FunderSigner` doc comment in `src/keeper.ts` has the same
+  list. The funder coins must be P2PKH, because
   the fee estimate does not count other unlocking-script sizes. A keeper can refuse to include a funder's coins; that
-  delays the top-up but does not lose the funder's money.
+  delays the top-up but does not lose the funder's money. The published
+  disclosures (the K17 defensive publication) describe the earlier
+  behaviour, with exact value conservation and no top-up.
 
   For a funder that signs later or in another process, use
   `buildFundedCycleTx(machine, plan, keeper, lockTime, inputs)`. It returns

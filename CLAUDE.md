@@ -83,7 +83,12 @@ publication belong in this repo.
   signer). A third-party funder goes through
   `sendCycle(m, plan, keeper, lockTime, { funding: { inputs, sign } })`: funder coins (sum
   exactly `topUp`) are inputs 1..n, the keeper's signer skips them, and `sign(tx, idx, coin)`
-  returns each unlocking script once the tx is final (SIGHASH_ALL by the funder). New
+  returns each unlocking script once the tx is final (SIGHASH_ALL by the funder). A funder that
+  signs later or in another process gets the final tx from
+  `buildFundedCycleTx(m, plan, keeper, lockTime, inputs)` (keeper inputs signed, funder inputs
+  empty, pre-sign checks run, nothing broadcast). The checks a funder must make before it signs
+  (lineage tip from a trusted outpoint, no second funder-key input, coin sum = `topUp`, output 0
+  by replay or interpreter) are in the `FunderSigner` doc comment. New
   template: machines deployed before this version cannot be topped up;
   `docs/K17-DEFENSIVE-PUBLICATION.md` describes the old rule.
 - `CyclePlan.leafAfter` (from `CycleOutcome.leafAfter`) reports the leaf the cycle wrote to the roster: the new 120-hex preimage after PAYLEAF or ADMIT, `''` after REMOVE, undefined otherwise. It is kept at a fault after the write, so it always matches the kept `rosterRoot`.
