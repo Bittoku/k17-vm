@@ -608,7 +608,8 @@ export interface CycleOverrides {
 /**
  * One coin of a third party (the funder) that pays a cycle's escrow
  * top-up. Only the funder can sign for it; the keeper never sees the
- * funder's key.
+ * funder's key. The coin must be P2PKH: the fee estimate does not count
+ * the unlocking-script size of any other script type.
  */
 export interface FunderInput {
     /** Txid of the coin (64 hex chars, display byte order). */
@@ -630,8 +631,13 @@ export interface FunderInput {
  * `<sig> <pubkey>`). The funder signs with SIGHASH_ALL | FORKID, so its
  * signature commits to the machine output value and to every other output
  * and input; any change after signing makes the signature invalid. The
- * funder should check, before it signs, that output 0 carries exactly
- * `remaining + topUp` for the machine it means to fund (replay planCycle).
+ * funder must check, before it signs, these four things. It computes
+ * `remaining` itself: it replays planCycle on the real machine UTXO and
+ * does not trust the builder's value. Then it checks that output 0 equals
+ * `remaining` plus the sum of the funder's own coins, and that the
+ * `topUp` argument of the machine input equals that sum. If it signs
+ * without these checks, a dishonest builder can move the excess of the
+ * funder's coin over `topUp` into the keeper's change.
  */
 export type FunderSigner = (
     tx: bsv.Transaction,
@@ -930,6 +936,37 @@ function skipInputsSigner(signer: Signer, skip: Set<number>): Signer {
 }
 
 /**
+ * Check a cycle transaction before it is signed by a funder or sent.
+ * Purpose: one place for the keeper's own checks, run before and after the
+ * funder callback of sendCycle.
+ * Input: the transaction, the plan, the overrides of the call and the
+ * indices of the inputs whose scripts must pass the script interpreter.
+ * Output: none. Throws when a live plan's output 0 does not carry
+ * `remaining + topUp` (or `overrides.stateValue`), when assertChangeOutput
+ * fails, or when an input script fails.
+ */
+function assertCycleTx(
+    tx: bsv.Transaction,
+    plan: CyclePlan,
+    overrides: CycleOverrides,
+    inputIndices: number[]
+): void {
+    if (!plan.halted) {
+        const want = overrides.stateValue ?? plan.remaining + plan.topUp
+        if (BigInt(tx.outputs[0].satoshis) !== want) {
+            throw new Error('machine output does not carry remaining + topUp')
+        }
+    }
+    assertChangeOutput(tx)
+    for (const idx of inputIndices) {
+        const verdict = tx.verifyInputScript(idx)
+        if (!verdict.success) {
+            throw new Error(`input ${idx} failed: ${verdict.error}`)
+        }
+    }
+}
+
+/**
  * Build, sign and (by default) broadcast one cycle of `m` from its plan,
  * with the plan's canonical `step` arguments. This is the keeper entry
  * point for an escrow top-up:
@@ -943,10 +980,13 @@ function skipInputsSigner(signer: Signer, skip: Set<number>): Signer {
  *     (SIGHASH_ALL by the funder). The callback may wait (for example for
  *     a signature from another process); nothing is broadcast before it
  *     returns.
- * Before it broadcasts, sendCycle checks: output 0 carries
- * `remaining + topUp` (live) and the transaction has a change output
- * (assertChangeOutput); the machine input and every funder input pass the
- * script interpreter.
+ * sendCycle checks: output 0 carries `remaining + topUp` (live), the
+ * transaction has a change output (assertChangeOutput) and the machine
+ * input passes the script interpreter. It runs these checks before it
+ * calls `funding.sign`, and again before it broadcasts (the callback can
+ * change the transaction), together with every funder input.
+ * Not safe for concurrent calls on the same machine instance: with
+ * `funding` it swaps `m.signer` for the duration of the call.
  * Input: instance (connected to the keeper's signer), plan, keeper
  * address, nLockTime, options. Output: SentCycle. Throws on any failed
  * check or a funder callback error; the machine UTXO is then unspent.
@@ -983,25 +1023,17 @@ export async function sendCycle(
         if (funding) await m.connect(keeperSigner)
     }
     if (funding) {
+        // Same checks before the funder signs. The machine input sighash
+        // does not depend on the funder's unlocking scripts.
+        assertCycleTx(tx, plan, overrides, [atInputIndex])
         for (const [i, idx] of funderInputIndices.entries()) {
             const coin = funding.inputs[i]
             const unlocking = await funding.sign(tx, idx, coin)
             tx.inputs[idx].setScript(bsv.Script.fromHex(unlocking))
         }
     }
-    if (!plan.halted) {
-        const want = overrides.stateValue ?? plan.remaining + plan.topUp
-        if (BigInt(tx.outputs[0].satoshis) !== want) {
-            throw new Error('machine output does not carry remaining + topUp')
-        }
-    }
-    assertChangeOutput(tx)
-    for (const idx of [atInputIndex, ...funderInputIndices]) {
-        const verdict = tx.verifyInputScript(idx)
-        if (!verdict.success) {
-            throw new Error(`input ${idx} failed: ${verdict.error}`)
-        }
-    }
+    // Again after the callback, because the callback can change tx.
+    assertCycleTx(tx, plan, overrides, [atInputIndex, ...funderInputIndices])
     if (broadcast) await m.provider.sendTransaction(tx)
     return {
         tx,

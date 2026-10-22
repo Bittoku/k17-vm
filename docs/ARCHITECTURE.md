@@ -154,7 +154,7 @@ Rules:
 Who supplies the extra inputs:
 
 - **The keeper (self-funded).** The keeper's wallet adds its own coins for the top-up and the fee. The change goes back to the keeper.
-- **A separate funder.** The keeper adds the funder's coins as inputs. Their sum must be exactly `topUp`. The funder waits until the transaction is final. It checks that the machine output holds `remaining + topUp`. Then it signs its own inputs with `SIGHASH_ALL`. The signature covers all outputs, so nobody can move the funder's coins to another output after it signs. The keeper can refuse to include a funder's coins. That delays the top-up, but the funder keeps its coins.
+- **A separate funder.** The keeper adds the funder's coins as inputs. Their sum must be exactly `topUp`. The funder waits until the transaction is final. The funder computes `remaining` itself: it replays `planCycle` on the real machine UTXO. It checks that output 0 equals `remaining` plus the sum of its own coins. It also checks that the `topUp` argument of the machine input equals that sum. Without these checks, a dishonest builder can move the excess of the funder's coin over `topUp` into the keeper's change. The funder coins must be P2PKH, because the fee estimate does not count other unlocking-script sizes. Then it signs its own inputs with `SIGHASH_ALL`. The signature covers all outputs, so nobody can move the funder's coins to another output after it signs. The keeper can refuse to include a funder's coins. That delays the top-up, but the funder keeps its coins.
 
 A blocked machine cannot get a top-up: no cycle runs until a witness arrives. A transaction that only sends coins to the same locking script creates a second, independent UTXO with the same state. The contract never merges the two.
 

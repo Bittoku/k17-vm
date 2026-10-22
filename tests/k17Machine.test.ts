@@ -4796,6 +4796,72 @@ describe('K17Machine on-chain', function () {
         ).to.be.rejectedWith(/input 1 failed/)
     })
 
+    it('top-up: the interpreter refuses a top-up on an unaffordable PAYSLOT or PAYLEAF cycle (cap fault halts)', async () => {
+        const v = 1000
+        // PAYSLOT 1000 of 1000 cannot leave one satoshi: the cycle halts.
+        const m = await deploy(
+            assemble(['LIT', v, 'LIT', 3, 'PAYSLOT', 'YIELD']),
+            v,
+            SLOT3_MEM
+        )
+        const plan = planCycle(m, BigInt(v), T0 + 60n, keeperA)
+        expect(plan.halted).to.be.true
+        const ok = await buildStepTx(m, plan, T0 + 60n, '')
+        expect(ok.verifyInputScript(0).success).to.equal(true)
+        expectScriptRefused(
+            await buildStepTx(m, plan, T0 + 60n, '', undefined, 1n)
+        )
+        // PAYLEAF of the whole balance: same cap fault.
+        const tree = twoMemberTree()
+        const lm = await deployTree(
+            assemble(['MEMBER', 'DROP', 'LIT', v, 'TIME', 'PAYLEAF', 'YIELD']),
+            tree,
+            v
+        )
+        const lp = planCycle(
+            lm,
+            BigInt(v),
+            T0 + 60n,
+            keeperA,
+            [],
+            NO_SIG,
+            {},
+            tree.proof(INDEX_A)
+        )
+        expect(lp.halted).to.be.true
+        expectScriptRefused(
+            await buildStepTx(lm, lp, T0 + 60n, '', undefined, 1n)
+        )
+    })
+
+    it('top-up (external funder): a bad plan or transaction is refused before the funder signer runs', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const plan = planCycle(m, v, t, keeperA, [], NO_SIG, {}, undefined, {
+            topUp: 7_000n,
+        })
+        let calls = 0
+        const spy = (tx: bsv.Transaction, idx: number) => {
+            calls += 1
+            return p2pkhUnlock(funderKey, tx, idx)
+        }
+        // Output 0 carries a wrong value (tampered state value).
+        await expect(
+            sendCycle(m, plan, keeperA, t, {
+                funding: { inputs: [funderCoin(7_000n)], sign: spy },
+                overrides: { stateValue: plan.remaining + 1n },
+            })
+        ).to.be.rejected
+        expect(calls).to.equal(0)
+        // The honest case still reaches the signer.
+        await sendCycle(m, plan, keeperA, t, {
+            funding: { inputs: [funderCoin(7_000n)], sign: spy },
+            broadcast: false,
+        })
+        expect(calls).to.equal(1)
+    })
+
     it('top-up: an old 10-argument step call fails loudly', async () => {
         const m = await deploy(heartbeatProgram())
         const plan = planCycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
@@ -4803,6 +4869,8 @@ describe('K17Machine on-chain', function () {
         const ten = stepArgs(plan, keeperA).slice(0, 10) as unknown[]
         const step = m.methods.step as (...a: unknown[]) => Promise<unknown>
         await expect(step(...ten)).to.be.rejectedWith(/argument count/)
-        await expect(step(...ten, opts)).to.be.rejected
+        await expect(step(...ten, opts)).to.be.rejectedWith(
+            /type of topUp is wrong/
+        )
     })
 })

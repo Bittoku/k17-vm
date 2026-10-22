@@ -311,8 +311,13 @@ cycle takes no top-up` before a transaction is built.
   the signer. For a third-party funder, pass `funding` to `sendCycle`: the
   funder's coins (their sum must be exactly `topUp`) become inputs 1..n,
   and a callback signs each of them with SIGHASH_ALL after the transaction
-  is final. The funder must check that output 0 carries `remaining + topUp`
-  before it signs. A keeper can refuse to include a funder's coins; that
+  is final. Before it signs, the funder must compute `remaining` itself: it
+  replays `planCycle` on the real machine UTXO. It must check that output 0
+  equals `remaining` plus the sum of its own coins. It must also check that
+  the `topUp` argument of the machine input equals that sum. Without these
+  checks, a dishonest builder can move the excess of the funder's coin over
+  `topUp` into the keeper's change. The funder coins must be P2PKH, because
+  the fee estimate does not count other unlocking-script sizes. A keeper can refuse to include a funder's coins; that
   delays the top-up but does not lose the funder's money.
 
 - Canonical unlocking script (v3.1). Every argument of `step` has one

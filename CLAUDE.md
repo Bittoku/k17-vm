@@ -148,8 +148,10 @@ publication belong in this repo.
   the round length (e.g. 30 days for daily rounds). `newMachine` refuses `0 < deadMan <
 DEAD_MAN_FLOOR` (6 h, exported from `src/keeper.ts`) unless `econ.allowShortDeadMan` is true
   (tests only), and always refuses `deadMan <= 60`.
-- `planCycle` error order: `lockTime before lastTime` (before the VM), then the VM's
-  `needs a witness` / `witness rejected`, then the MIN_STEP error.
+- `planCycle` error order: options TypeError / RangeError first (options not an object,
+  non-bigint or negative `topUp`), then `lockTime before lastTime` (before the VM), then the VM's
+  `needs a witness` / `witness rejected`, then the MIN_STEP error, then `a halting cycle takes
+no top-up` last.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
   4.6 KB per instruction with the current 43 handlers (183 012 bytes at K=40 with `topUp`,
   182 986 before; it was
