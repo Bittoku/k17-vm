@@ -48,13 +48,15 @@ publication belong in this repo.
   `"K17E" || instanceId || cell(TAG) || cell(NEWSLOT) || sha256(keyB) || payout`. SIGVERIFY
   keeps `"K17A" || cell(TAG) || cell(VAL)`. Attesters read `instanceId` from the deployed
   machine before they sign.
-- `step` has 10 parameters:
-  `step(keeper, witness, sigS, sigPad, keyA, keyB, payout, leafPre, proof, leafIndex)`. `keyA`
-  is the 384-byte key that signs for `ATTEST` or `ATTESTM`, sponsors for `ENDORSE`, or is the
+- `step` has 11 parameters:
+  `step(keeper, witness, sigS, sigPad, keyA, keyB, payout, leafPre, proof, leafIndex, topUp)`
+  (`stepArgs(plan, keeper)` in `src/keeper.ts` builds them from a plan; a 10-argument call
+  fails). `keyA` is the 384-byte key that signs for `ATTEST` or `ATTESTM`, sponsors for `ENDORSE`, or is the
   sponsor key for `ADMIT` and `REMOVE`; `keyB` the new member's key, `payout` the new member's
   20-byte payout hash (`ENDORSE`, `ADMIT`). `leafPre`, `proof` and `leafIndex` are the cycle's
   one tree proof (60-byte leaf preimage, or empty for `ADMIT`; 512 bytes of siblings, level 0
-  first; index in `[0, 65536)`). Pass empty byte strings and 0 when unused: this is required
+  first; index in `[0, 65536)`). `topUp` is the escrow top-up (see below). Pass empty byte
+  strings and 0 when unused: this is required
   (v3.1 canonical unlocking script). After the loop the contract asserts that unused arguments
   are empty or 0 (tree arguments when `treeOp == 0`; `sigS`, `sigPad`, `keyA`, `keyB`,
   `payout` when no signature was recorded; `keyA` for a `SIGVERIFY` signature; `keyB`/`payout`
@@ -66,6 +68,24 @@ publication belong in this repo.
   `canonicalSig` in `src/k17/attest.ts` wraps every `sign*` helper. The VM reports
   `treeOp: 'member'` for a `MEMBER` that faults on a full data stack, because the contract
   still checks that proof.
+- Escrow top-up: `topUp` (sats, 0 when unused) adds value to the machine; extra inputs of
+  the same tx pay for it and the next state output carries `remaining + topUp`. Contract
+  rule: `assert(topUp >= 0 && (topUp == 0 || !halted))` after the reward/PAYSLOT accounting
+  (halted includes HALT, faults, the dead-man and the PAYSLOT cap fault), so a top-up never
+  reaches the beneficiary. It changes nothing else: reward, payout, `PAYSLOT` cap, `MIN_STEP`
+  and dead-man use the input value and `lastTime`; `lastTime` moves to nLockTime as on any
+  live cycle (money alone never keeps a machine alive). Anyone may top up. `topUp` is a
+  parameter, not a loop-carried variable (+26 bytes). The VM knows nothing of it. Keeper:
+  `planCycle(..., tree, { topUp })` (`PlanOptions`; a non-object options argument throws)
+  gives `CyclePlan.topUp` (0 on halted plans) and throws `a halting cycle takes no top-up`
+  when the plan halts. `bindCycleBuilder` puts `remaining + plan.topUp` on output 0;
+  self-funded top-ups come from the signer's coins via scrypt-ts `autoPayfee` (change to the
+  signer). A third-party funder goes through
+  `sendCycle(m, plan, keeper, lockTime, { funding: { inputs, sign } })`: funder coins (sum
+  exactly `topUp`) are inputs 1..n, the keeper's signer skips them, and `sign(tx, idx, coin)`
+  returns each unlocking script once the tx is final (SIGHASH_ALL by the funder). New
+  template: machines deployed before this version cannot be topped up;
+  `docs/K17-DEFENSIVE-PUBLICATION.md` describes the old rule.
 - `CyclePlan.leafAfter` (from `CycleOutcome.leafAfter`) reports the leaf the cycle wrote to the roster: the new 120-hex preimage after PAYLEAF or ADMIT, `''` after REMOVE, undefined otherwise. It is kept at a fault after the write, so it always matches the kept `rosterRoot`.
 - `CyclePlan.outhCells` (from `CycleOutcome.outhCells`) lists the cells OUTH folded into `logHash` this cycle, in order (`[]` when none). Folding them as `sha256(prev || cell)` from the previous `logHash` gives `nextState.logHash`; a fault after an OUTH keeps the cell, as the state keeps the fold.
 - Keeper and change arguments (v3.1): `newMachine` refuses `rewardMin < 1n`, so a keeper
@@ -131,7 +151,8 @@ DEAD_MAN_FLOOR` (6 h, exported from `src/keeper.ts`) unless `econ.allowShortDead
 - `planCycle` error order: `lockTime before lastTime` (before the VM), then the VM's
   `needs a witness` / `witness rejected`, then the MIN_STEP error.
 - `K17Machine.K` is a compile-time constant; raising it multiplies script size by about
-  4.6 KB per instruction with the current 43 handlers (182 986 bytes at K=40; it was
+  4.6 KB per instruction with the current 43 handlers (183 012 bytes at K=40 with `topUp`,
+  182 986 before; it was
   470 098 bytes, about 12 KB per instruction, before the shallow-temporaries change). A cycle that
   keeps the machine alive is about twice that (the preimage plus the next state output).
 - The companion repository `../k17-dc4cd` depends on this package via `file:../k17-vm` and

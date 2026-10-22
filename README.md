@@ -18,7 +18,7 @@ Design notes are kept privately by the author.
 
 ## Architecture
 
-Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for these topics: the components, the cycle, long-running machines, the escrow top-up limit, and the comparison with Ethereum keeper contracts.
+Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for these topics: the components, the cycle, long-running machines, the escrow top-up, and the comparison with Ethereum keeper contracts.
 
 ## Layout
 
@@ -248,6 +248,17 @@ the transaction invalid.
 
 ### Rules for each cycle
 
+`step` has 11 arguments:
+
+```
+step(keeper, witness, sigS, sigPad, keyA, keyB, payout, leafPre, proof, leafIndex, topUp)
+```
+
+`stepArgs(plan, keeper)` in `src/keeper.ts` returns them in this order
+from a `CyclePlan`. A call with the earlier 10 arguments fails (argument
+count mismatch, or the options object goes into `topUp` and the call is
+refused).
+
 - One tree instruction. `MEMBER`, `ADMIT` and `REMOVE` share one proof. A
   second one in the cycle is a fault.
 - One signature. `SIGVERIFY`, `ATTEST`, `ENDORSE`, `ATTESTM`, `ADMIT` and
@@ -272,9 +283,41 @@ the transaction invalid.
 - Dead-man. When the machine has `deadMan` > 0 and nLockTime is at least
   `lastTime + deadMan`, the cycle halts before its first instruction (v3.1).
   See "Freeze escape" below.
+- Escrow top-up. `topUp` adds sats to the machine. Anyone can top up, and
+  no signature from the machine's parties is necessary. Extra inputs in the
+  same transaction supply the sats. The next state output then carries
+  `value - reward - payout + topUp`. The rules:
+
+  - `topUp` must be 0 or more. A negative value would move machine sats
+    into the change output.
+  - A cycle that does not keep the machine alive (`HALT`, a fault, the
+    dead-man, a `PAYSLOT` that the balance cannot cover) must have
+    `topUp` = 0. Otherwise the transaction is invalid. Thus a top-up never
+    goes to the beneficiary through a refund. `planCycle` throws `a halting
+cycle takes no top-up` before a transaction is built.
+  - A top-up does not change `lastTime`, the keeper reward, the payout,
+    `MIN_STEP` or the dead-man rule. They all use the input value and the
+    clock. `lastTime` moves to nLockTime as on every live cycle. Thus money
+    alone cannot keep a machine alive: a machine that waits for a witness
+    still halts at `lastTime + deadMan`, and the refund then includes the
+    earlier top-ups.
+  - `VALUE` sees the larger balance from the next cycle on.
+  - `topUp` is pinned by the value of output 0 on a live cycle, and it is 0
+    on a halting cycle, so it is not a free unlocking argument.
+
+  Keeper side: `planCycle(..., tree, { topUp })` returns `plan.topUp`. A
+  self-funded top-up needs nothing more: scrypt-ts adds coins of the
+  keeper's signer for the top-up and the fee, and the change goes back to
+  the signer. For a third-party funder, pass `funding` to `sendCycle`: the
+  funder's coins (their sum must be exactly `topUp`) become inputs 1..n,
+  and a callback signs each of them with SIGHASH_ALL after the transaction
+  is final. The funder must check that output 0 carries `remaining + topUp`
+  before it signs. A keeper can refuse to include a funder's coins; that
+  delays the top-up but does not lose the funder's money.
+
 - Canonical unlocking script (v3.1). Every argument of `step` has one
   valid value. An argument the cycle did not use must be empty, or 0 for
-  `sigS` and `leafIndex`. The witness must hold exactly the cells that `IN`
+  `sigS`, `leafIndex` and `topUp`. The witness must hold exactly the cells that `IN`
   consumed, also when the cycle halts. `keyA` is used only by `ATTEST`,
   `ENDORSE`, `ATTESTM`, `ADMIT` and `REMOVE` (not by `SIGVERIFY`); `keyB`
   and `payout` only by `ENDORSE` and `ADMIT`; the tree arguments only when a
@@ -409,17 +452,18 @@ Throughput is set by the clock as well as by size (v3.1): about one live
 cycle per block at nLockTime = MTP - 1, or up to about 10 per block with
 60-second steps at the cost of clock lag (see "Freeze escape").
 
-| K   | Handlers                                  | Locking script | Cycle transaction |
-| --- | ----------------------------------------- | -------------- | ----------------- |
-| 1   | 21                                        | 9 026 bytes    | 9 574 bytes       |
-| 4   | 21                                        | 16 247 bytes   | 16 802 bytes      |
-| 40  | 28                                        | 159 003 bytes  | about 160 KB      |
-| 40  | 32                                        | 202 468 bytes  | about 204 KB      |
-| 40  | 43                                        | 469 386 bytes  | about 470 KB      |
-| 40  | 43 (v3.1, second signature faults)        | 469 666 bytes  | about 470 KB      |
-| 40  | 43 (v3.1, plus dead-man and `MIN_STEP`)   | 469 918 bytes  | about 470 KB      |
-| 40  | 43 (v3.1, plus canonical unlocking)       | 470 098 bytes  | about 470 KB      |
-| 40  | 43 (shallow temporaries, compact records) | 182 986 bytes  | 183 626 bytes     |
+| K   | Handlers                                   | Locking script | Cycle transaction |
+| --- | ------------------------------------------ | -------------- | ----------------- |
+| 1   | 21                                         | 9 026 bytes    | 9 574 bytes       |
+| 4   | 21                                         | 16 247 bytes   | 16 802 bytes      |
+| 40  | 28                                         | 159 003 bytes  | about 160 KB      |
+| 40  | 32                                         | 202 468 bytes  | about 204 KB      |
+| 40  | 43                                         | 469 386 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, second signature faults)         | 469 666 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, plus dead-man and `MIN_STEP`)    | 469 918 bytes  | about 470 KB      |
+| 40  | 43 (v3.1, plus canonical unlocking)        | 470 098 bytes  | about 470 KB      |
+| 40  | 43 (shallow temporaries, compact records)  | 182 986 bytes  | 183 626 bytes     |
+| 40  | 43 (plus escrow top-up, `topUp` on `step`) | 183 012 bytes  | 183 652 bytes     |
 
 Roughly 2.4 KB (21 handlers) to 3.8 KB (28 handlers) to 4.9 KB (32 handlers,
 of which SIGVERIFY alone is about 0.8 KB) to 9 KB (36 handlers, with the
@@ -431,7 +475,10 @@ records) of script per unrolled instruction, plus a fixed part
 construction). The cycle transaction column is the final (halting) cycle.
 A cycle that continues also carries the next state output, so it is about
 twice the locking script: the enrolment cycle of `enrolAndAttestProgram` is
-366 514 bytes at K=40 (43 handlers; it was 940 739 bytes before the shrink). Set `K17_SIZES=1` to print these sizes during
+366 568 bytes at K=40 (43 handlers, with `topUp`; 366 513 bytes before
+`topUp`, 940 739 bytes before the shrink). A live heartbeat cycle that
+carries a self-funded top-up is 365 364 bytes. The top-up costs 26 bytes of
+locking script, so about 55 bytes on a live cycle. Set `K17_SIZES=1` to print these sizes during
 `npm test`. Fibonacci(10) is 247
 instructions: 62 cycles at K=4, 7 cycles at K=40. The dispatch chain is the
 obvious optimisation target.

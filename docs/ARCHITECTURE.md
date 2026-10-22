@@ -89,7 +89,7 @@ Three programs in this repository show the pattern. `heartbeatProgram` loops wit
 
 Three limits end a long-running machine.
 
-1. **The escrow.** Each cycle pays the keeper reward and any bounty, so the balance falls. A program can read the balance with `VALUE` and stop when it is too low. A `PAYSLOT` or `PAYLEAF` payout that the balance cannot cover (balance less 1 sat) is a fault. The machine then halts and refunds the beneficiary. A `BOUNTY` that is too large is not a fault. The contract caps the reward plus bounty at the balance less 1 sat. A program that must pay in full needs to check `VALUE` first.
+1. **The escrow.** Each cycle pays the keeper reward and any bounty, so the balance falls. A program can read the balance with `VALUE` and stop when it is too low. A `PAYSLOT` or `PAYLEAF` payout that the balance cannot cover (balance less 1 sat) is a fault. The machine then halts and refunds the beneficiary. A `BOUNTY` that is too large is not a fault. The contract caps the reward plus bounty at the balance less 1 sat. A program that must pay in full needs to check `VALUE` first. Anyone can add funds to a machine that is alive (section 5).
 2. **The program deadline.** The program reads `TIME` and halts after its own limit.
 3. **The dead-man interval.** A non-zero `deadMan` ends a machine that nobody advances (section 3).
 
@@ -138,32 +138,32 @@ The step list is a plan. Nobody has written, sized or run this program. The coun
 
 ## 5. Topping up the escrow
 
-**Top-up is not supported in the current contract.**
+**Top-up is supported from this version.** Anyone can add satoshis to a running machine. No signature from the machine's parties is necessary, so a machine can be crowd-funded.
 
-Each cycle must output a next machine UTXO that holds exactly `value - reward - payout` satoshis. The `remaining` variable in `src/contracts/k17Machine.ts` computes this. The contract checks the whole output set by hash (`hash256(outputs) == hashOutputs`). No transaction can add value to the machine.
+A top-up is part of a normal cycle. `step` has an 11th argument, `topUp`. Extra inputs of the same transaction supply the satoshis. The next machine output then holds `value - reward - payout + topUp` satoshis, where the contract computes `value - reward - payout` as before. The contract checks the whole output set by hash (`hash256(outputs) == hashOutputs`), so the top-up can go only into the machine output.
 
-A transaction can send coins to the same locking script. This creates a second, independent UTXO with the same state. The contract never merges the two.
+Rules:
 
-Today there are two options.
+- **Anyone can top up.** The contract does not check who supplies the extra inputs.
+- **`topUp` is 0 or more.** A negative value would move machine satoshis into the change output. The transaction is then not valid.
+- **A halting cycle takes no top-up.** Some cycles do not keep the machine alive: `HALT`, a fault, the dead-man, and a payout that the balance cannot cover. Such a cycle must have `topUp = 0`. Otherwise the transaction is not valid. Thus a top-up never goes to the beneficiary through a refund. The keeper helper `planCycle` refuses such a plan before it builds a transaction.
+- **A top-up does not change `lastTime`.** It also does not change the keeper reward, the payout, `MIN_STEP` or the dead-man rule. They all use the input value and the clock. The cycle moves `lastTime` to `nLockTime` as every live cycle does. Thus money alone cannot keep a machine alive. A machine that waits for a witness still halts at `lastTime + deadMan`, and the refund then includes the earlier top-ups.
+- **`VALUE` shows the top-up from the next cycle.** The cycle that carries the top-up reads the old balance.
+- **`topUp = 0` is the canonical value** when the cycle adds nothing. On a live cycle the value of the machine output pins `topUp`, so a relayer cannot change it.
 
-- Deploy with enough escrow for the intended life of the machine.
-- When the balance runs low, let the machine halt (or let the dead-man halt refund it). The beneficiary then deploys a new machine. The new deployment can carry over memory (the initial memory image) and a roster root. It cannot carry over the stacks, the output log or `logHash`.
+Who supplies the extra inputs:
 
-### 5.1 Possible future support
+- **The keeper (self-funded).** The keeper's wallet adds its own coins for the top-up and the fee. The change goes back to the keeper.
+- **A separate funder.** The keeper adds the funder's coins as inputs. Their sum must be exactly `topUp`. The funder waits until the transaction is final. It checks that the machine output holds `remaining + topUp`. Then it signs its own inputs with `SIGHASH_ALL`. The signature covers all outputs, so nobody can move the funder's coins to another output after it signs. The keeper can refuse to include a funder's coins. That delays the top-up, but the funder keeps its coins.
 
-This is a possible future change. It is not a plan of record. Two designs exist.
+A blocked machine cannot get a top-up: no cycle runs until a witness arrives. A transaction that only sends coins to the same locking script creates a second, independent UTXO with the same state. The contract never merges the two.
 
-- **A `topUp` cycle parameter.** The next machine output holds `remaining + topUp` satoshis. Extra inputs fund `topUp`. The canonical rule is `topUp = 0` when the cycle does not use it.
-- **A separate public `refill` method.** It leaves the state unchanged. It only raises the value.
+### 5.1 Compatibility
 
-Open design questions:
-
-- **Who may top up?** Anyone could, because a top-up only adds funds. Or only the beneficiary could, which needs a signature check.
-- **Does a refill reset the dead-man clock?** Probably not, because a refill is not progress. A refill that the beneficiary signs could reset it.
-- **What does it cost in script size?** Every cycle carries the full interpreter. Extra code makes every transaction larger.
-- **How does it affect existing machines?** Both designs change the contract template, which makes a new artifact. Existing machines cannot be upgraded. The published disclosure describes the current behavior.
-
-Proposed direction (under evaluation, not implemented): anyone may top up, so a machine can be crowd-funded. A top-up only adds value. It does not change `lastTime`, so the reward auction and the dead-man clock do not change. Only a real cycle moves them. An idle machine therefore still refunds at `lastTime + deadMan`, even after a top-up.
+- The top-up changes the locking script. It is a new contract template and a new artifact (`artifacts/k17Machine.json`). The script is 26 bytes larger (183 012 bytes at K = 40).
+- Machines deployed before this version cannot be topped up. Their code is fixed in their UTXO. They keep the earlier rule: the next machine output holds exactly `value - reward - payout`. For such a machine, deploy with enough escrow for its intended life. Or let it halt and deploy a new machine. A new deployment can carry over memory (the initial memory image) and a roster root. It cannot carry over the stacks, the output log or `logHash`.
+- Every caller of `step` must pass 11 arguments. A call with the earlier 10 arguments fails.
+- The published disclosures, including the [defensive publication](K17-DEFENSIVE-PUBLICATION.md), describe the earlier behaviour: one `step` method and exact value conservation. They do not describe the top-up.
 
 ## 6. K17 compared with Ethereum keeper contracts
 
