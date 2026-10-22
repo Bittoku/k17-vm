@@ -14,12 +14,11 @@ state advanced by exactly K instructions and the spender takes no more than
 the reward that the liveness Dutch auction permits at the transaction's
 nLockTime. Miners verify every cycle.
 
+Design notes are kept privately by the author.
+
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the components, the cycle, and how K17 compares with Ethereum keeper contracts.
-
-Design notes live in the Obsidian vault:
-`notes/projects/Stack Computers/utxo-stack-vm-brainstorm.md`.
 
 ## Layout
 

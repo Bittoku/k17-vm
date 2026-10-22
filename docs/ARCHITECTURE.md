@@ -4,7 +4,7 @@ This document explains how K17 is built and why. It is for a developer who is ne
 
 ## 1. What K17 is
 
-One UTXO holds one suspended stack-machine process. The locking script of that UTXO contains an interpreter, and the end of the script holds the state of the process. A spend runs up to K = 40 instructions. The spend is valid only if its first output recreates the UTXO with the state advanced by exactly those instructions. Anyone may spend the UTXO. The contract pays the spender a reward, up to an amount that it computes from the time since the last cycle. Miners check every cycle, so no off-chain party needs to be trusted for the result.
+One UTXO holds one suspended stack-machine process. The locking script of that UTXO contains an interpreter, and the end of the script holds the state of the process. A spend runs up to K = 40 instructions. The spend is valid only if its first output recreates the UTXO with the state advanced by exactly those instructions. Anyone may spend the UTXO. The contract pays the spender exactly the reward that it computes from the time since the last cycle (plus any `BOUNTY`, capped at the balance less 1 sat, and shrunk to make room for a payout). Miners check every cycle, so no off-chain party needs to be trusted to compute the result. A program that reads signed inputs still trusts the signer for those values.
 
 ## 2. System components
 
@@ -15,7 +15,7 @@ flowchart LR
         T["Cycle transaction"]
         N["Next machine UTXO"]
         R["Keeper reward output"]
-        P["Payout outputs"]
+        P["Payout output<br/>(at most one)"]
         C["Change output"]
         B["Beneficiary refund<br/>on halt"]
     end
@@ -35,10 +35,10 @@ flowchart LR
     T -.-> B
 ```
 
-The machine UTXO holds the interpreter and the state. The state is the program, `pc`, the data and return stacks, the memory, the output log, `lastTime`, the roster root and sequence number, and `logHash`. The interpreter code is the same in every cycle. Only the state tail changes.
+The machine UTXO holds the interpreter and the state. The immutable part fixes the program, the beneficiary, the economics, `deadMan`, the SIGVERIFY roster, `instanceId` and `sponsorKeyHash`. The state tail holds `pc`, the data and return stacks, the memory, the output log, `lastTime`, the roster root and sequence number, and `logHash`. The interpreter code is the same in every cycle. Only the state tail changes.
 
 - **Machine UTXO and sCrypt contract.** `src/contracts/k17Machine.ts` defines `K17Machine`. Its `step` method runs the K instructions, computes the keeper reward and builds the expected outputs. It then checks them against the transaction with the signature preimage.
-- **Cycle transaction.** It has two inputs: the machine UTXO (always input 0) and a fee input from the keeper. Its outputs are the next machine state, the keeper reward, any payout to a roster member, and change. `bindCycleBuilder` in `src/keeper.ts` builds it.
+- **Cycle transaction.** Its inputs are the machine UTXO (always input 0) and one or more fee inputs from the keeper. Its outputs are the next machine state, the keeper reward, any payout to a roster member, and change. `bindCycleBuilder` in `src/keeper.ts` builds it.
 - **Keeper.** The keeper is an off-chain program. `planCycle` in `src/keeper.ts` runs the reference VM and predicts the reward. `newMachine` in the same file creates a machine for deployment.
 - **Reference VM.** `src/k17/vm.ts` is an executable specification of the ISA in `src/k17/isa.ts`. The keeper uses it to compute the next state. The contract must give the same result.
 - **Witnesses and signers.** A program reads witness cells from the unlocking script with `IN`. Signed readings (Rabin signatures) come from sensor nodes or sponsors. `src/k17/attest.ts` has the signing helpers. The party that relays a witness need not be the party that made it.
@@ -66,16 +66,16 @@ The keeper chooses `nLockTime`, its own address and the witness cells. The refer
 
 There are two kinds of failure, and they must stay separate.
 
-- **Fault.** The program causes it: a stack underflow, a bad memory address, a full output log, a second signature instruction in one cycle. A fault acts like `HALT`. The machine stops and the balance goes to the beneficiary. The keeper still gets its reward. A fault never makes the transaction invalid, so no program can freeze its own escrow.
+- **Fault.** The program causes it: a stack underflow, a bad memory address, a full output log, a second signature instruction in one cycle. A fault acts like `HALT`. The machine stops and the balance goes to the beneficiary. The keeper still gets its reward. A fault never makes the transaction invalid, so a fault can never freeze the escrow.
 - **Invalid transaction.** The witness causes it: `IN` with no witness cell left, `VERIFY` of zero, a missing or wrong signature, key or Merkle proof. Miners reject the transaction, and the UTXO stays as it was. Another keeper can try again with a correct witness.
 
 A program that waits for a witness nobody has would never fault. For that case, a machine deployed with a non-zero `deadMan` interval halts before its first instruction once `nLockTime >= lastTime + deadMan`. The beneficiary is refunded and no witness is needed. See "Freeze escape" in the README.
 
 ## 4. K17 compared with Ethereum keeper contracts
 
-An Ethereum contract cannot run itself. A transaction must call it. Work that must happen on a schedule (a liquidation, an oracle update, a rebalance) therefore relies on keepers. Networks such as Chainlink Automation, Gelato and Keep3r supply them. The contract owner funds the keepers through a separate balance, subscription or registry. The contract then trusts whoever the network sends, or it checks `msg.sender` against a list.
+An Ethereum contract cannot run itself: a transaction must call it. Scheduled work (a liquidation, an oracle update, a rebalance) therefore relies on keepers. Networks such as Chainlink Automation, Gelato and Keep3r supply them. In the usual setup the job owner prepays the network through a balance, subscription or registry. The contract accepts any caller, or it checks `msg.sender` against the network's forwarder or a keeper list. Some protocols pay callers from the contract itself (liquidation bonuses, for example). K17 makes that pattern the only one and builds it into the interpreter.
 
-In K17 the contract pays for its own heartbeat out of its own escrow. The reward grows with the time since the last cycle, and the spender who advances the machine takes it. There is no registry and no privileged keeper.
+In K17 the contract pays for its own heartbeat out of its own escrow. The reward grows with the time since the last cycle, and the spender who advances the machine takes it. There is no registry and no privileged keeper. K17 still needs some off-chain party to run a keeper. It removes the separate funding and the registry, not the keeper.
 
 ```mermaid
 flowchart LR
@@ -89,17 +89,17 @@ flowchart LR
     end
 ```
 
-| Question | Ethereum keeper contracts | K17 |
-| --- | --- | --- |
-| Who pays the keeper? | A separate balance, subscription or registry, outside the contract. | The contract, from its own escrow. |
-| Who may advance the contract? | The network's nodes, or addresses on a list (`msg.sender` check). | Anyone who builds a valid spend. |
-| How is the price set? | By the network's fee rules or the owner's budget. | By competition. The reward is a Dutch auction on elapsed time. |
-| What if no keeper wants the job? | The job may not run until funding or fees change. | The reward keeps growing, up to `rewardMax`, until someone takes it. |
-| What ends the contract? | The owner stops funding it. | `HALT`, a fault, or the dead-man halt refunds the beneficiary. |
-| Conditions the work can check | Rich: any contract state, price feeds, arbitrary logic. | Limited: a 43-instruction machine, 32-cell stacks, 256 memory cells. |
-| Cost of one execution | Cheap gas for the computation. | High. Every cycle carries the full interpreter. |
+| Question                         | Ethereum keeper contracts                                                                                    | K17                                                                                         |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| Who pays the keeper?             | Usually a separate balance, subscription or registry outside the contract.                                   | The contract, from its own escrow.                                                          |
+| Who may advance the contract?    | Any caller, or only the network's forwarder or listed keepers (`msg.sender` check), as the contract chooses. | Anyone who builds a valid spend.                                                            |
+| How is the price set?            | By the network's fee rules or the owner's budget.                                                            | By competition. The reward is a Dutch auction on elapsed time.                              |
+| What if no keeper wants the job? | The job may not run until funding or fees change.                                                            | The reward keeps growing, up to `rewardMax`, until someone takes it.                        |
+| What ends the contract?          | The owner cancels the job or stops funding it.                                                               | `HALT`, a fault, or the dead-man halt refunds the beneficiary.                              |
+| Conditions the work can check    | Rich: any contract state, price feeds, arbitrary logic.                                                      | Limited: a 43-instruction machine, 32-cell stacks, 256 memory cells (152 for program data). |
+| Cost of one execution            | Gas for the computation, small per call compared with K17.                                                   | High. Every cycle carries the full interpreter.                                             |
 
-How the auction works. The contract computes `elapsed = nLockTime - lastTime` and allows the reward `min(rewardMin + slope * elapsed, rewardMax)`. Miners enforce `nLockTime` as a bound on the time of the block, so a keeper cannot claim a long wait without actually waiting. A cheap keeper moves early and takes a small reward. A costly keeper only wins when the cheap ones are gone. A live cycle must also advance the clock by at least `MIN_STEP` = 60 seconds. Without that rule, a keeper could hold `nLockTime` at `lastTime` and make the dead-man timer drift behind real time.
+How the auction works. The contract computes `elapsed = nLockTime - lastTime` and allows the reward `min(rewardMin + slope * elapsed, rewardMax)`. Miners enforce `nLockTime` as a bound on the time of the block, so a keeper cannot claim a long wait without actually waiting. A cheap keeper moves early and takes a small reward. A costly keeper only wins when the cheap ones are gone. A live cycle must also advance the clock by at least `MIN_STEP` = 60 seconds. Without that rule, a keeper could hold `nLockTime` at `lastTime` while it drives the machine. `lastTime` would then lag the chain clock, and the dead-man halt would come early.
 
 What Ethereum keepers do well. They can check complex conditions, and they run for little gas. K17 pays for its generality in size. The README measures the K = 40, 43-handler locking script at 182 986 bytes and the final (halting) cycle transaction at 183 626 bytes. A cycle that keeps the machine alive also carries the next state output, so it is about twice the locking script. The one measured live cycle is the enrolment cycle of `enrolAndAttestProgram`, at 366 514 bytes. The clock rule also limits speed. At `nLockTime` = MTP - 1, a keeper gets about one live cycle per block. K17 suits slow, valuable, trust-minimised work. It does not suit work that needs fast, cheap and frequent calls.
 
@@ -115,25 +115,25 @@ loop:  TIME  OUT  LIT 0  IF loop
 
 The economics are fixed at deployment in `Economics` (`src/keeper.ts`):
 
-| Parameter | Meaning | Example |
-| --- | --- | --- |
-| deposit | Satoshis in the machine UTXO | 100 000 |
-| `rewardMin` | Reward at zero elapsed time. `newMachine` refuses a value below 1. | 10 |
-| `slope` | Satoshis added per second of elapsed time | 2 |
-| `rewardMax` | Cap on the auction reward | 1 000 |
-| `deadMan` | Dead-man interval in seconds. 0 turns it off. At least 6 hours (`DEAD_MAN_FLOOR`) unless `allowShortDeadMan` is set. | 2 592 000 (30 days) |
+| Parameter   | Meaning                                                                                                              | Example             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| deposit     | Satoshis in the machine UTXO                                                                                         | 100 000             |
+| `rewardMin` | Reward at zero elapsed time. `newMachine` refuses a value below 1.                                                   | 10                  |
+| `slope`     | Satoshis added per second of elapsed time                                                                            | 2                   |
+| `rewardMax` | Cap on the auction reward                                                                                            | 1 000               |
+| `deadMan`   | Dead-man interval in seconds. 0 turns it off. At least 6 hours (`DEAD_MAN_FLOOR`) unless `allowShortDeadMan` is set. | 2 592 000 (30 days) |
 
 The example values are for illustration only. The reward is `min(rewardMin + slope * elapsed, rewardMax)`. Because of `MIN_STEP`, the smallest reward of a live cycle is `rewardMin + 60 * slope`. The contract also never lets the reward take the last satoshi of the machine.
 
-| Elapsed since last cycle | Reward |
-| --- | --- |
-| 60 s | 130 sats |
-| 120 s | 250 sats |
-| 300 s | 610 sats |
-| 600 s | 1 000 sats (cap; the formula gives 1 210) |
-| 3 600 s | 1 000 sats |
+| Elapsed since last cycle | Reward                                    |
+| ------------------------ | ----------------------------------------- |
+| 60 s                     | 130 sats                                  |
+| 120 s                    | 250 sats                                  |
+| 300 s                    | 610 sats                                  |
+| 600 s                    | 1 000 sats (cap; the formula gives 1 210) |
+| 3 600 s                  | 1 000 sats                                |
 
-`rewardMin` must be at least 1 sat so that every cycle pays a keeper output. That output fixes the `keeper` argument in the transaction, so a relayer cannot rewrite it. Choose `deadMan` as a multiple of the round length. It counts on the chain's median-time-past clock, not on wall time, and a jump of `deadMan` or more in that clock lets any keeper end a healthy machine.
+`rewardMin` must be at least 1 sat so that every cycle pays a keeper output. That output fixes the `keeper` argument in the transaction, so a relayer cannot rewrite it. One exception remains: a PAYSLOT or PAYLEAF payout, or a 1-sat balance, can clamp the reward to 0; then there is no keeper output and `keeper` is not pinned (see "Residual malleability" in the README). Choose `deadMan` as a multiple of the round length. It counts on the chain's median-time-past clock, not on wall time, and a jump of `deadMan` or more in that clock lets any keeper end a healthy machine.
 
 ## 6. Job bounties: a simple example
 
@@ -168,15 +168,15 @@ sequenceDiagram
     U-->>S: remaining escrow to the beneficiary
 ```
 
-The program starts with `YIELD`. The first cycle, which any keeper can run, ends there. The solver's cycle then starts at the instruction after it and runs the whole stage (by my count 31 instructions, below K = 40) in one transaction. `YIELD` is what makes the stage atomic. It ends a cycle early, so the checks and the payment cannot be split across two transactions. The party that supplies the witnesses is the party that is paid.
+The program starts with `YIELD`. The first cycle, which any keeper can run, ends there. The solver's cycle then starts at the instruction after it and runs the whole stage (31 instructions, below K = 40) in one transaction. `YIELD` is what makes the stage atomic. It ends a cycle early, so the checks and the payment cannot be split across two transactions. The party that supplies the witnesses is the party that is paid.
 
-Front-running is the weakness of any bounty. A bystander can read the solution from a pending transaction and send the same answer with their own address. `twoStageJobProgram` closes this gap with a commit-reveal step, bound to the payee. Stage 1 is the factoring bounty above and stores `p` in memory. Stage 2 asks for `x` such that `HASH(x XOR p) == target`. A solver first commits `c = HASH(x XOR WHO)`. `WHO` pushes the first four bytes of the spender's address, so the commitment names the payee. In the reveal, the machine checks `HASH(x XOR WHO) == c` with the current spender. Only the committer's address passes. A commit can be overwritten after `commitTtl` seconds, which stops a bogus commit from blocking the job. A `deadline` halts the machine and refunds the escrow if nobody finishes. The header comment of the function in `src/k17/programs.ts` gives the sizing rules for the TTL.
+Front-running is the weakness of any bounty. A bystander can read the solution from a pending transaction and send the same answer with their own address. `twoStageJobProgram` closes this gap for its second stage with a commit-reveal step bound to the payee. Its first stage, like the plain factoring bounty, can still be front-run. Stage 1 is the factoring bounty above and stores `p` in memory. Stage 2 asks for `x` such that `HASH(x XOR p) == target`. A solver first commits `c = HASH(x XOR WHO)`. `WHO` pushes the first four bytes of the spender's address, so the commitment names the payee. In the reveal, the machine checks `HASH(x XOR WHO) == c` with the current spender. Only the committer's address passes. A commit can be overwritten after `commitTtl` seconds, which stops a bogus commit from blocking the job. A `deadline`, checked at the start of every stage-2 cycle, halts the machine and refunds the escrow if stage 2 is not finished in time. Stage 1 has no deadline; deploy with a non-zero `deadMan` so that an unsolved stage 1 can still be refunded. The header comment of the function in `src/k17/programs.ts` gives the sizing rules for the TTL.
 
 ## 7. Where to go next
 
 - [`README.md`](../README.md): the layout, the commands, the rules for each cycle, the freeze escape and the measurements.
 - [`CLAUDE.md`](../CLAUDE.md): working rules for contributors, including why the contract keeps its loop variables small.
-- [`K17-DEFENSIVE-PUBLICATION.md`](K17-DEFENSIVE-PUBLICATION.md): the published description of the design and the prior art (sections 3 to 5). It is a frozen record. The code is newer, so where they differ, the code is correct. The disclosure is also at <https://www.tdcommons.org/dpubs_series/12327/>.
+- [`K17-DEFENSIVE-PUBLICATION.md`](K17-DEFENSIVE-PUBLICATION.md): the published description of the design (sections 4 and 5) and the acknowledged prior art (section 3). It is a frozen record. The code is newer, so where they differ, the code is correct. The disclosure is also at <https://www.tdcommons.org/dpubs_series/12327/>.
 - `src/k17/isa.ts`: the opcode table and the encoding.
 - `src/k17/programs.ts`: all example programs.
 - [`k17-dc4cd`](https://github.com/Bittoku/k17-dc4cd): the companion repository, with Forth tooling, sensor consortiums and Merkle rosters.
