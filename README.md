@@ -18,7 +18,7 @@ Design notes are kept privately by the author.
 
 ## Architecture
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the components, the cycle, and how K17 compares with Ethereum keeper contracts.
+Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for these topics: the components, the cycle, long-running machines, the escrow top-up limit, and the comparison with Ethereum keeper contracts.
 
 ## Layout
 
