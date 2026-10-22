@@ -458,10 +458,25 @@ export class K17Machine extends SmartContract {
      * @param leafIndex the leaf's position in [0, 65536); 0 when unused.
      *        The three tree arguments are only checked when the cycle ran a
      *        tree instruction (treeOp != 0).
+     * @param topUp escrow top-up: sats that this cycle adds to the
+     *        machine; 0 when unused (canonical value). Anyone may top up;
+     *        extra inputs of the same transaction pay for it. Never
+     *        negative (that would move machine sats into the change). On a
+     *        cycle that keeps the machine alive the next state output
+     *        carries remaining + topUp. A cycle that produces no next state
+     *        (HALT, a fault, the dead-man, a PAYSLOT the balance cannot
+     *        cover) must have topUp == 0, so a top-up never reaches the
+     *        beneficiary through a refund. The top-up does not change the
+     *        reward, the payout, MIN_STEP or the dead-man rule: all of them
+     *        use the input value and lastTime, and lastTime moves to
+     *        nLockTime as on every live cycle. topUp is pinned by the value
+     *        of output 0 on the live path and is 0 on the halted path, so it
+     *        adds no free unlocking argument.
      *
      * Canonical arguments (v3.1): an argument the cycle did not use must be
-     * empty (0 for sigS and leafIndex), the witness must hold exactly the
-     * cells IN consumed, and a used signature must have 0 < sigS < n/2.
+     * empty (0 for sigS, leafIndex and topUp), the witness must hold
+     * exactly the cells IN consumed, and a used signature must have
+     * 0 < sigS < n/2.
      * Otherwise the transaction is invalid, so a relayer cannot change the
      * txid of a cycle (and orphan its unconfirmed descendants) by
      * rewriting the unlocking script.
@@ -477,7 +492,8 @@ export class K17Machine extends SmartContract {
         payout: ByteString,
         leafPre: ByteString,
         proof: ByteString,
-        leafIndex: bigint
+        leafIndex: bigint,
+        topUp: bigint
     ) {
         // Tree-instruction bookkeeping is declared first so it sits deep on
         // the stack and the hot loop variables below stay shallow (cheaper
@@ -1401,6 +1417,16 @@ export class K17Machine extends SmartContract {
             }
         }
         const remaining = value - reward - payslotSats
+        // Escrow top-up: never negative (that would take sats out of the
+        // machine) and only on a cycle that keeps the machine alive (a
+        // halting cycle would pay it to the beneficiary). halted is final
+        // here: it includes the PAYSLOT cap fault above. topUp is a
+        // parameter, not a loop-carried variable, so the unrolled loop
+        // does not get deeper (see CLAUDE.md).
+        assert(
+            topUp >= 0n && (topUp == 0n || !halted),
+            'top-up must be 0 on a halting cycle and never negative'
+        )
 
         // ---- outputs -------------------------------------------------
         let outputs = toByteString('')
@@ -1424,7 +1450,7 @@ export class K17Machine extends SmartContract {
             this.lastTime = now
             this.logHash = logHash
             this.rosterSeq = rosterSeq
-            outputs = this.buildStateOutput(remaining)
+            outputs = this.buildStateOutput(remaining + topUp)
         }
         if (reward > 0n) {
             outputs += Utils.buildPublicKeyHashOutput(keeper, reward)

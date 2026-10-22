@@ -8,7 +8,7 @@
  * differential test: reference VM == on-chain interpreter for that step.
  */
 import { expect, use } from 'chai'
-import { createHash } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import chaiAsPromised from 'chai-as-promised'
 import { bsv, int2ByteString, toByteString } from 'scrypt-ts'
 import { RabinSig } from 'scrypt-ts-lib'
@@ -54,7 +54,11 @@ import {
     CycleOverrides,
     CycleTree,
     DEAD_MAN_FLOOR,
+    FunderInput,
+    PlanOptions,
     assertChangeOutput,
+    sendCycle,
+    stepArgs,
 } from '../src/keeper'
 import {
     EMPTY_HASHES,
@@ -175,7 +179,8 @@ interface CycleResult {
  * `witness`, `sig`, `keys` and `tree` are forwarded to planCycle; the plan's
  * key and payout byte strings (empty unless `keys` sets them) and its tree
  * proof (leafPre '', proof '', leafIndex 0 unless `tree` sets them) go to
- * `step`.
+ * `step`. `planOpts` (escrow top-up) is forwarded to planCycle, and the
+ * plan's topUp goes to `step` unless `topUpArg` overrides it.
  */
 async function cycle(
     m: K17Machine,
@@ -187,13 +192,26 @@ async function cycle(
         keeperArg?: bsv.Address
         /** Signature to put in the unlocking script instead of the plan's. */
         sigArg?: RabinSig
+        /** topUp argument to send instead of the plan's (tampering). */
+        topUpArg?: bigint
     } = {},
     witness: bigint[] = [],
     sig: RabinSig = NO_SIG,
     keys: CycleKeys = {},
-    tree?: CycleTree
+    tree?: CycleTree,
+    planOpts: PlanOptions = {}
 ): Promise<CycleResult> {
-    const plan = planCycle(m, value, lockTime, keeper, witness, sig, keys, tree)
+    const plan = planCycle(
+        m,
+        value,
+        lockTime,
+        keeper,
+        witness,
+        sig,
+        keys,
+        tree,
+        planOpts
+    )
     const opts = bindCycleBuilder(m, plan, keeper, lockTime, overrides)
     const sent = overrides.sigArg ?? plan.sig
     const { tx, atInputIndex } = await m.methods.step(
@@ -207,6 +225,7 @@ async function cycle(
         toByteString(plan.leafPre),
         toByteString(plan.proof),
         plan.leafIndex,
+        overrides.topUpArg ?? plan.topUp,
         opts
     )
     const verdict = tx.verifyInputScript(atInputIndex)
@@ -1214,6 +1233,7 @@ describe('K17Machine on-chain', function () {
             toByteString(plan.leafPre),
             toByteString(plan.proof),
             plan.leafIndex,
+            plan.topUp,
             opts
         )
     }
@@ -2306,16 +2326,23 @@ describe('K17Machine on-chain', function () {
      * interpreter.
      * Input: machine, plan (its halted/next/payslot/remaining decide the
      * outputs), lock time, witness hex for the unlocking script, optional
-     * next instance overriding plan.next. Output: the unverified tx.
+     * next instance overriding plan.next, optional topUp argument
+     * overriding plan.topUp, optional further builder overrides (for
+     * example `stateValue`). Output: the unverified tx.
      */
     async function buildStepTx(
         m: K17Machine,
         plan: CyclePlan,
         lockTime: bigint,
         witnessHex: string,
-        next?: K17Machine
+        next?: K17Machine,
+        topUpArg?: bigint,
+        overrides: CycleOverrides = {}
     ): Promise<bsv.Transaction> {
-        const opts = bindCycleBuilder(m, plan, keeperA, lockTime, { next })
+        const opts = bindCycleBuilder(m, plan, keeperA, lockTime, {
+            ...overrides,
+            next,
+        })
         const { tx } = await m.methods.step(
             addrOf(keeperA),
             toByteString(witnessHex),
@@ -2327,6 +2354,7 @@ describe('K17Machine on-chain', function () {
             toByteString(plan.leafPre),
             toByteString(plan.proof),
             plan.leafIndex,
+            topUpArg ?? plan.topUp,
             { ...opts, exec: false, partiallySigned: true }
         )
         return tx
@@ -4297,15 +4325,19 @@ describe('K17Machine on-chain', function () {
         expect(honest.outputs.length).to.be.greaterThan(1)
         for (const [name, bad] of tampers) {
             const tx = await buildStepTx(m, bad, T0 + 60n, '')
-            // outputs unchanged: only the unlocking script differs
+            // outputs unchanged: only the unlocking script differs. The
+            // change output is left out: its amount follows the fee
+            // estimate, which can round differently by 1 sat when the
+            // unlocking script size changes (the 11-argument step moved
+            // this test onto a rounding boundary).
             expect(
-                tx.outputs.map((o) =>
-                    o.toBufferWriter().toBuffer().toString('hex')
-                )
+                tx.outputs
+                    .slice(0, -1)
+                    .map((o) => o.toBufferWriter().toBuffer().toString('hex'))
             ).to.deep.equal(
-                honest.outputs.map((o) =>
-                    o.toBufferWriter().toBuffer().toString('hex')
-                )
+                honest.outputs
+                    .slice(0, -1)
+                    .map((o) => o.toBufferWriter().toBuffer().toString('hex'))
             )
             expect(tx.verifyInputScript(0).success, name).to.equal(false)
         }
@@ -4366,5 +4398,411 @@ describe('K17Machine on-chain', function () {
             satoshis: 1000,
         })
         expect(() => assertChangeOutput(single)).to.not.throw()
+    })
+
+    // ------------------------------------------------------------------
+    // Escrow top-up: the topUp argument of step
+    // ------------------------------------------------------------------
+
+    /**
+     * A funder's wallet that is not the keeper's signer: its key is not in
+     * the test signer, so only the funder's own callback can sign its coin.
+     */
+    const [funderKey, , , funderAddress] = randomPrivateKey()
+
+    /**
+     * A coin of the funder (a dummy txid; the interpreter only needs the
+     * locking script and the value).
+     * Input: value in sats. Output: FunderInput.
+     */
+    const funderCoin = (satoshis: bigint): FunderInput => ({
+        txId: randomBytes(32).toString('hex'),
+        outputIndex: 0,
+        satoshis,
+        script: bsv.Script.buildPublicKeyHashOut(funderAddress).toHex(),
+    })
+
+    /**
+     * Sign input `idx` of a final transaction as the owner of `key` with
+     * SIGHASH_ALL | FORKID (P2PKH unlocking script).
+     * Input: key, transaction, input index. Output: unlocking script hex.
+     */
+    function p2pkhUnlock(
+        key: bsv.PrivateKey,
+        tx: bsv.Transaction,
+        idx: number
+    ): string {
+        const sighashType =
+            bsv.crypto.Signature.SIGHASH_ALL |
+            bsv.crypto.Signature.SIGHASH_FORKID
+        const out = tx.inputs[idx].output as bsv.Transaction.Output
+        const sig = bsv.Transaction.Sighash.sign(
+            tx,
+            key,
+            sighashType,
+            idx,
+            out.script,
+            new bsv.crypto.BN(out.satoshis)
+        )
+        return new bsv.Script('')
+            .add(Buffer.concat([sig.toDER(), Buffer.from([sighashType])]))
+            .add(key.publicKey.toBuffer())
+            .toHex()
+    }
+
+    /**
+     * Sum of the input values of `tx` from input `from` on.
+     * Input: transaction, first index. Output: sats.
+     */
+    const inputsFrom = (tx: bsv.Transaction, from: number): bigint =>
+        tx.inputs
+            .slice(from)
+            .reduce((a, i) => a + BigInt(i.output?.satoshis ?? 0), 0n)
+
+    it('top-up (self-funded): the next value grows by exactly topUp; reward, state and lastTime as without', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const topUp = 20_000n
+        const plain = planCycle(m, v, T0 + 60n, keeperA)
+        expect(plain.topUp).to.equal(0n)
+        const r = await cycle(
+            m,
+            v,
+            T0 + 60n,
+            keeperA,
+            {},
+            [],
+            NO_SIG,
+            {},
+            undefined,
+            { topUp }
+        )
+        expect(r.plan.topUp).to.equal(topUp)
+        expect(r.plan.reward).to.equal(plain.reward)
+        expect(r.plan.remaining).to.equal(plain.remaining)
+        expect(r.plan.nextState).to.deep.equal(plain.nextState)
+        expect(BigInt(r.tx.outputs[0].satoshis)).to.equal(
+            plain.remaining + topUp
+        )
+        expect(r.tx.outputs[0].script.toHex()).to.equal(
+            (plain.next as K17Machine).lockingScript.toHex()
+        )
+        // The keeper reward output is the same as without the top-up.
+        expect(BigInt(r.tx.outputs[1].satoshis)).to.equal(plain.reward)
+        expect((r.next as K17Machine).lastTime).to.equal(T0 + 60n)
+        // Self-funded: the signer's own coins pay the top-up and the fee,
+        // and the rest returns to the signer as change.
+        const change = r.tx.getChangeOutput() as bsv.Transaction.Output
+        expect(change.script.toHex()).to.equal(
+            bsv.Script.buildPublicKeyHashOut(
+                await m.signer.getDefaultAddress()
+            ).toHex()
+        )
+        expect(inputsFrom(r.tx, 1) - BigInt(change.satoshis)).to.equal(
+            topUp + BigInt(r.tx.getFee())
+        )
+        logSize(`      top-up live cycle tx: ${r.tx.toBuffer().length} bytes`)
+        // The next cycle's reward follows the clock only, as without.
+        const v2 = plain.remaining + topUp
+        const r2 = await cycle(r.next as K17Machine, v2, T0 + 120n, keeperA)
+        const p2 = planCycle(
+            plain.next as K17Machine,
+            plain.remaining,
+            T0 + 120n,
+            keeperA
+        )
+        expect(r2.plan.reward).to.equal(p2.reward)
+        expect(r2.plan.remaining).to.equal(v2 - p2.reward)
+    })
+
+    it('top-up: sendCycle sends a self-funded top-up and a cycle without one', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const plan = planCycle(
+            m,
+            v,
+            T0 + 60n,
+            keeperA,
+            [],
+            NO_SIG,
+            {},
+            undefined,
+            { topUp: 3_000n }
+        )
+        const s = await sendCycle(m, plan, keeperA, T0 + 60n)
+        expect(s.funderInputIndices).to.deep.equal([])
+        expect(BigInt(s.tx.outputs[0].satoshis)).to.equal(
+            plan.remaining + 3_000n
+        )
+        const n = s.next as K17Machine
+        const v2 = plan.remaining + 3_000n
+        const p2 = planCycle(n, v2, T0 + 120n, keeperA)
+        const s2 = await sendCycle(n, p2, keeperA, T0 + 120n)
+        expect(BigInt(s2.tx.outputs[0].satoshis)).to.equal(p2.remaining)
+        // stepArgs gives the 11 canonical arguments, topUp last.
+        const args = stepArgs(plan, keeperA)
+        expect(args.length).to.equal(11)
+        expect(args[10]).to.equal(3_000n)
+    })
+
+    it('top-up: a negative topUp is refused (planner, builder, interpreter); a bare bigint option fails loudly', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const opt = (o: unknown) =>
+            planCycle(
+                m,
+                v,
+                t,
+                keeperA,
+                [],
+                NO_SIG,
+                {},
+                undefined,
+                o as PlanOptions
+            )
+        expect(() => opt({ topUp: -1n })).to.throw(RangeError, /negative/)
+        expect(() => opt(5_000n)).to.throw(TypeError, /options/)
+        expect(() => opt({ topUp: 5_000 })).to.throw(TypeError, /bigint/)
+        const plan = opt({})
+        expect(() =>
+            bindCycleBuilder(m, { ...plan, topUp: -100n }, keeperA, t)
+        ).to.throw(RangeError, /negative/)
+        // A negative argument with a machine output 100 sats short (the
+        // 100 sats would go to the change) is refused on chain; the same
+        // build with topUp 0 and the full output passes.
+        const ok = await buildStepTx(m, plan, t, '')
+        expect(ok.verifyInputScript(0).success).to.equal(true)
+        expectScriptRefused(
+            await buildStepTx(m, plan, t, '', undefined, -100n, {
+                stateValue: plan.remaining - 100n,
+            })
+        )
+    })
+
+    it('top-up: a halting cycle (dead-man, HALT, fault) refuses a top-up in the planner, the builder and the interpreter', async () => {
+        const m = await deployDeadMan(WAIT_IN, DEAD_MAN)
+        const v = BigInt(FUNDING)
+        const withTopUp = (
+            mm: K17Machine,
+            t: bigint,
+            topUp: bigint,
+            witness: bigint[] = []
+        ) =>
+            planCycle(mm, v, t, keeperA, witness, NO_SIG, {}, undefined, {
+                topUp,
+            })
+        // Blocked on IN: no cycle runs without the witness, top-up or not.
+        expect(() => withTopUp(m, T0 + 600n, 5_000n)).to.throw(
+            /needs a witness/
+        )
+        // Dead-man: the planner refuses the top-up.
+        expect(() => withTopUp(m, T0 + DEAD_MAN, 5_000n)).to.throw(
+            /halting cycle takes no top-up.*dead-man/
+        )
+        const honest = planCycle(m, v, T0 + DEAD_MAN, keeperA)
+        expect(honest.halted).to.be.true
+        expect(honest.topUp).to.equal(0n)
+        expect(() =>
+            bindCycleBuilder(
+                m,
+                { ...honest, topUp: 5_000n },
+                keeperA,
+                T0 + DEAD_MAN
+            )
+        ).to.throw(/halting cycle takes no top-up/)
+        // The interpreter refuses topUp 5 000 with the honest refund
+        // outputs and with the refund raised by 5 000.
+        const ok = await buildStepTx(m, honest, T0 + DEAD_MAN, '')
+        expect(ok.verifyInputScript(0).success).to.equal(true)
+        expectScriptRefused(
+            await buildStepTx(m, honest, T0 + DEAD_MAN, '', undefined, 5_000n)
+        )
+        expectScriptRefused(
+            await buildStepTx(
+                m,
+                { ...honest, remaining: honest.remaining + 5_000n },
+                T0 + DEAD_MAN,
+                '',
+                undefined,
+                5_000n
+            )
+        )
+        // HALT: planner and interpreter.
+        const h = await deploy(assemble(['HALT']))
+        expect(() => withTopUp(h, T0 + 60n, 1n)).to.throw(
+            /halting cycle takes no top-up.*halts or faults/
+        )
+        const hp = planCycle(h, v, T0 + 60n, keeperA)
+        expect(hp.halted).to.be.true
+        const hOk = await buildStepTx(h, hp, T0 + 60n, '')
+        expect(hOk.verifyInputScript(0).success).to.equal(true)
+        expectScriptRefused(
+            await buildStepTx(h, hp, T0 + 60n, '', undefined, 1n)
+        )
+        // A fault (DROP on an empty stack): planner and interpreter.
+        const f = await deploy(assemble(['DROP']))
+        const fp = planCycle(f, v, T0 + 60n, keeperA)
+        expect(fp.halted).to.be.true
+        expect(() => withTopUp(f, T0 + 60n, 1n)).to.throw(
+            /halting cycle takes no top-up/
+        )
+        expectScriptRefused(
+            await buildStepTx(f, fp, T0 + 60n, '', undefined, 1n)
+        )
+    })
+
+    it('top-up: the interpreter refuses a topUp that does not match the output, top-up value moved to the keeper, and a moved lastTime', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const plan = planCycle(m, v, t, keeperA, [], NO_SIG, {}, undefined, {
+            topUp: 5_000n,
+        })
+        const ok = await buildStepTx(m, plan, t, '')
+        expect(ok.verifyInputScript(0).success).to.equal(true)
+        for (const arg of [4_999n, 5_001n, 0n]) {
+            expectScriptRefused(
+                await buildStepTx(m, plan, t, '', undefined, arg)
+            )
+        }
+        // The top-up moved into the keeper output: the machine output
+        // carries only `remaining`, the keeper takes reward + 5 000. With
+        // topUp 5 000 or 0 as the argument, the contract refuses it.
+        const moved = { reward: plan.reward + 5_000n }
+        expect(
+            BigInt(
+                (await buildStepTx(m, plan, t, '', undefined, undefined, moved))
+                    .outputs[0].satoshis
+            )
+        ).to.equal(plan.remaining)
+        for (const arg of [5_000n, 0n]) {
+            expectScriptRefused(
+                await buildStepTx(m, plan, t, '', undefined, arg, moved)
+            )
+        }
+        // The state must still move lastTime to nLockTime exactly.
+        const later = (plan.next as K17Machine).next()
+        later.lastTime = t + 1n
+        expectScriptRefused(await buildStepTx(m, plan, t, '', later))
+    })
+
+    it('top-up (external funder): the funder signs its own coin after the tx is final; the coin only fills the machine output', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const topUp = 7_000n
+        const plan = planCycle(m, v, t, keeperA, [], NO_SIG, {}, undefined, {
+            topUp,
+        })
+        const coin = funderCoin(topUp)
+        const keeperSigner = m.signer
+        let seen: bsv.Transaction | undefined
+        const s = await sendCycle(m, plan, keeperA, t, {
+            funding: {
+                inputs: [coin],
+                sign: (tx, idx, c) => {
+                    // A funder's own check before it signs: its coin is the
+                    // input, the machine output carries remaining + topUp.
+                    expect(c).to.equal(coin)
+                    expect(
+                        Buffer.from(tx.inputs[idx].prevTxId).toString('hex')
+                    ).to.equal(coin.txId)
+                    expect(BigInt(tx.outputs[0].satoshis)).to.equal(
+                        plan.remaining + topUp
+                    )
+                    // Every other input is signed already.
+                    tx.inputs.forEach((inp, i) => {
+                        if (i !== idx)
+                            expect(inp.script.toHex()).to.not.equal('')
+                    })
+                    seen = tx
+                    return p2pkhUnlock(funderKey, tx, idx)
+                },
+            },
+        })
+        expect(seen).to.equal(s.tx)
+        expect(m.signer).to.equal(keeperSigner)
+        expect(s.funderInputIndices).to.deep.equal([1])
+        expect(s.tx.verifyInputScript(0).success).to.equal(true)
+        expect(s.tx.verifyInputScript(1).success).to.equal(true)
+        expect(s.tx.verify()).to.equal(true)
+        // Outputs: machine (remaining + topUp), keeper reward as planned,
+        // change to the keeper's signer. Nothing goes to the funder or
+        // anywhere else.
+        expect(s.tx.outputs.length).to.equal(3)
+        expect(BigInt(s.tx.outputs[0].satoshis)).to.equal(
+            plan.remaining + topUp
+        )
+        expect(BigInt(s.tx.outputs[1].satoshis)).to.equal(plan.reward)
+        // The keeper's fee inputs (after the funder's coin) less the change
+        // is exactly the fee: no funder sats reach the change.
+        const change = s.tx.getChangeOutput() as bsv.Transaction.Output
+        expect(inputsFrom(s.tx, 2) - BigInt(change.satoshis)).to.equal(
+            BigInt(s.tx.getFee())
+        )
+        // The chain continues on the topped-up machine.
+        const n = s.next as K17Machine
+        const p2 = planCycle(n, plan.remaining + topUp, t + 60n, keeperA)
+        const s2 = await sendCycle(n, p2, keeperA, t + 60n)
+        expect(s2.tx.verifyInputScript(0).success).to.equal(true)
+    })
+
+    it('top-up (external funder): wrong coin totals and a wrong funder signature are refused before broadcast', async () => {
+        const m = await deploy(heartbeatProgram())
+        const v = BigInt(FUNDING)
+        const t = T0 + 60n
+        const plan = planCycle(m, v, t, keeperA, [], NO_SIG, {}, undefined, {
+            topUp: 7_000n,
+        })
+        const sign = (tx: bsv.Transaction, idx: number) =>
+            p2pkhUnlock(funderKey, tx, idx)
+        // A coin larger than topUp would leak the excess to the change.
+        await expect(
+            sendCycle(m, plan, keeperA, t, {
+                funding: { inputs: [funderCoin(7_001n)], sign },
+            })
+        ).to.be.rejectedWith(/exactly plan.topUp/)
+        await expect(
+            sendCycle(m, plan, keeperA, t, {
+                funding: { inputs: [funderCoin(6_999n)], sign },
+            })
+        ).to.be.rejectedWith(/exactly plan.topUp/)
+        const none = planCycle(m, v, t, keeperA)
+        await expect(
+            sendCycle(m, none, keeperA, t, {
+                funding: { inputs: [], sign },
+            })
+        ).to.be.rejectedWith(/exactly plan.topUp/)
+        // Two coins that add up to topUp are fine.
+        const two = await sendCycle(m, plan, keeperA, t, {
+            funding: {
+                inputs: [funderCoin(3_000n), funderCoin(4_000n)],
+                sign,
+            },
+            broadcast: false,
+        })
+        expect(two.funderInputIndices).to.deep.equal([1, 2])
+        expect(two.tx.verifyInputScript(2).success).to.equal(true)
+        // A signature by another key does not unlock the funder's coin.
+        const [otherKey] = randomPrivateKey()
+        await expect(
+            sendCycle(m, plan, keeperA, t, {
+                funding: {
+                    inputs: [funderCoin(7_000n)],
+                    sign: (tx, idx) => p2pkhUnlock(otherKey, tx, idx),
+                },
+            })
+        ).to.be.rejectedWith(/input 1 failed/)
+    })
+
+    it('top-up: an old 10-argument step call fails loudly', async () => {
+        const m = await deploy(heartbeatProgram())
+        const plan = planCycle(m, BigInt(FUNDING), T0 + 60n, keeperA)
+        const opts = bindCycleBuilder(m, plan, keeperA, T0 + 60n)
+        const ten = stepArgs(plan, keeperA).slice(0, 10) as unknown[]
+        const step = m.methods.step as (...a: unknown[]) => Promise<unknown>
+        await expect(step(...ten)).to.be.rejectedWith(/argument count/)
+        await expect(step(...ten, opts)).to.be.rejected
     })
 })
