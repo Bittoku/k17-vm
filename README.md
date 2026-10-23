@@ -20,6 +20,25 @@ Design notes are kept privately by the author.
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for these topics: the components, the cycle, long-running machines, the escrow top-up, and the comparison with Ethereum keeper contracts.
 
+## Disclosures
+
+The K17 design is published as a defensive publication on Technical Disclosure Commons, with two addenda. On-chain anchors on BSV mainnet record the SHA-256 of each document.
+
+| Document                                                              | Status                                                   | On-chain anchor (BSV mainnet)                                                                                   |
+| --------------------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| K17 defensive publication                                             | Published: https://www.tdcommons.org/dpubs_series/12327/ | [`cce1d64f…0250`](https://whatsonchain.com/tx/cce1d64fb3a81326945c2f3e6bf79a3aad99ca048a72e026a893debc7cdc0250) |
+| Addendum 1: signed-attestation rosters, Merkle rosters, freeze escape | Submitted 2026-10-22, publication pending                | the same transaction as the publication                                                                         |
+| Addendum 2: escrow top-up and third-party funder protocol             | Submitted 2026-10-23, publication pending                | [`862827c3…3094`](https://whatsonchain.com/tx/862827c37bd27161533a1aac512404ce316788b662bd69c55e184be57d933094) |
+
+Each anchor is a zero-value `OP_FALSE OP_RETURN` output. It pushes the text `K17-ANCHOR`, then a compact JSON object. The JSON holds the SHA-256 of the markdown and PDF of each document, and the source commits in this organisation.
+
+To verify a document:
+
+1. Compute the SHA-256 of the file you downloaded.
+2. Open the anchor transaction.
+3. Decode the second push of the zero-value output.
+4. Compare your hash with the hash in the JSON.
+
 ## Layout
 
 | Path                          | Purpose                                                                                                                                                  |
