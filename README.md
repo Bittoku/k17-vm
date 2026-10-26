@@ -28,7 +28,7 @@ The K17 design is published as a defensive publication on Technical Disclosure C
 | --------------------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | K17 defensive publication                                             | Published: https://www.tdcommons.org/dpubs_series/12327/ | [`cce1d64f…0250`](https://whatsonchain.com/tx/cce1d64fb3a81326945c2f3e6bf79a3aad99ca048a72e026a893debc7cdc0250) |
 | Addendum 1: signed-attestation rosters, Merkle rosters, freeze escape | Published: https://www.tdcommons.org/dpubs_series/12395/ | the same transaction as the publication                                                                         |
-| Addendum 2: escrow top-up and third-party funder protocol             | Submitted 2026-10-23, publication pending                | [`862827c3…3094`](https://whatsonchain.com/tx/862827c37bd27161533a1aac512404ce316788b662bd69c55e184be57d933094) |
+| Addendum 2: escrow top-up and third-party funder protocol             | Published: https://www.tdcommons.org/dpubs_series/12417/ | [`862827c3…3094`](https://whatsonchain.com/tx/862827c37bd27161533a1aac512404ce316788b662bd69c55e184be57d933094) |
 
 Each anchor is a zero-value `OP_FALSE OP_RETURN` output. It pushes the text `K17-ANCHOR`, then a compact JSON object. The JSON holds the SHA-256 of the markdown and PDF of each document, and the source commits in this organisation.
 
